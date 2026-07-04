@@ -1,0 +1,33 @@
+{
+  "name": "@nexus-mcp/similarity-search-api",
+  "version": "1.0.0",
+  "description": "Computes hybrid NMI+Cosine similarity over raw text, categorical, or discrete time-series data on-the-fly, without requiring pre-built vector indexes or embedding pipelines, using entropy-weighted scoring to surface statistically dependent items that cosine similarity misses.",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "similarity-search-api-mcp-server": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "start:http": "TRANSPORT=http node dist/index.js",
+    "dev": "tsx watch src/index.ts",
+    "inspector": "npx @modelcontextprotocol/inspector node dist/index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "zod": "^3.23.8",
+    "express": "^4.21.1",
+    "undici": "^6.19.8",
+    "dotenv": "^16.4.5"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.21",
+    "@types/node": "^20.14.10",
+    "typescript": "^5.5.4",
+    "tsx": "^4.16.2"
+  },
+  "engines": {
+    "node": ">=18.17.0"
+  }
+}
