@@ -1,383 +1,249 @@
 import httpx
-from typing import Any
-import numpy as np
+from typing import Optional
+import time
 
 
-BASE_URL = "https://api.nexus-similarity.io/v1"
-DEFAULT_TIMEOUT_SECONDS = 30.0
-MAX_EMBEDDING_DIM = 4096
-MAX_BATCH_PAIRS = 512
-
-
-class SimilaritySearchAuthError(Exception):
-    pass
-
-
-class SimilaritySearchValidationError(Exception):
-    pass
-
-
-class SimilaritySearchAPIError(Exception):
-    def __init__(self, status_code: int, message: str):
+class SimilaritySearchError(Exception):
+    def __init__(self, message: str, status_code: Optional[int] = None, response_body: Optional[dict] = None):
+        super().__init__(message)
         self.status_code = status_code
-        super().__init__(f"HTTP {status_code}: {message}")
+        self.response_body = response_body
 
 
-class SimilaritySearchRateLimitError(SimilaritySearchAPIError):
+class AuthenticationError(SimilaritySearchError):
     pass
 
 
-def _validate_embedding(embedding: Any, label: str) -> list[float]:
-    if embedding is None:
-        raise SimilaritySearchValidationError(
-            f"'{label}' must not be None — provide a non-empty list or numpy array of floats."
-        )
-    if isinstance(embedding, np.ndarray):
-        if embedding.ndim != 1:
-            raise SimilaritySearchValidationError(
-                f"'{label}' must be a 1-D array, got shape {embedding.shape}."
-            )
-        embedding = embedding.tolist()
-    if not isinstance(embedding, list):
-        raise SimilaritySearchValidationError(
-            f"'{label}' must be a list or numpy array, got {type(embedding).__name__}."
-        )
-    if len(embedding) == 0:
-        raise SimilaritySearchValidationError(
-            f"'{label}' must not be empty."
-        )
-    if len(embedding) > MAX_EMBEDDING_DIM:
-        raise SimilaritySearchValidationError(
-            f"'{label}' has {len(embedding)} dimensions; maximum supported is {MAX_EMBEDDING_DIM}."
-        )
-    if not all(isinstance(v, (int, float)) for v in embedding):
-        raise SimilaritySearchValidationError(
-            f"'{label}' must contain only numeric values (int or float)."
-        )
-    return [float(v) for v in embedding]
+class ValidationError(SimilaritySearchError):
+    pass
 
 
-def _validate_embedding_batch(embeddings: Any, label: str) -> list[list[float]]:
-    if embeddings is None:
-        raise SimilaritySearchValidationError(
-            f"'{label}' must not be None."
-        )
-    if not isinstance(embeddings, (list, np.ndarray)):
-        raise SimilaritySearchValidationError(
-            f"'{label}' must be a list of embeddings or a 2-D numpy array, got {type(embeddings).__name__}."
-        )
-    if isinstance(embeddings, np.ndarray):
-        if embeddings.ndim != 2:
-            raise SimilaritySearchValidationError(
-                f"'{label}' must be a 2-D numpy array, got shape {embeddings.shape}."
-            )
-        embeddings = embeddings.tolist()
-    if len(embeddings) == 0:
-        raise SimilaritySearchValidationError(
-            f"'{label}' must contain at least one embedding."
-        )
-    return [_validate_embedding(e, f"{label}[{i}]") for i, e in enumerate(embeddings)]
-
-
-def _validate_domain(domain: str) -> str:
-    allowed = {"text", "image", "tabular"}
-    if not isinstance(domain, str):
-        raise SimilaritySearchValidationError(
-            f"'domain' must be a string, got {type(domain).__name__}."
-        )
-    if domain not in allowed:
-        raise SimilaritySearchValidationError(
-            f"'domain' must be one of {sorted(allowed)}, got '{domain}'."
-        )
-    return domain
-
-
-def _validate_top_k(top_k: Any) -> int:
-    if not isinstance(top_k, int):
-        raise SimilaritySearchValidationError(
-            f"'top_k' must be an integer, got {type(top_k).__name__}."
-        )
-    if top_k < 1 or top_k > MAX_BATCH_PAIRS:
-        raise SimilaritySearchValidationError(
-            f"'top_k' must be between 1 and {MAX_BATCH_PAIRS}, got {top_k}."
-        )
-    return top_k
-
-
-def _raise_for_status(response: httpx.Response) -> None:
-    if response.status_code == 401:
-        raise SimilaritySearchAuthError(
-            "Authentication failed: verify your api_key is correct and active."
-        )
-    if response.status_code == 422:
-        try:
-            detail = response.json().get("detail", response.text)
-        except Exception:
-            detail = response.text
-        raise SimilaritySearchValidationError(
-            f"API rejected request with validation error: {detail}"
-        )
-    if response.status_code == 429:
-        retry_after = response.headers.get("Retry-After", "unknown")
-        raise SimilaritySearchRateLimitError(
-            429,
-            f"Rate limit exceeded. Retry after {retry_after} seconds."
-        )
-    if response.status_code >= 500:
-        raise SimilaritySearchAPIError(
-            response.status_code,
-            f"Server error: {response.text}"
-        )
-    if response.status_code >= 400:
-        raise SimilaritySearchAPIError(
-            response.status_code,
-            f"Client error: {response.text}"
-        )
+class RateLimitError(SimilaritySearchError):
+    def __init__(self, message: str, retry_after: Optional[float] = None):
+        super().__init__(message, status_code=429)
+        self.retry_after = retry_after
 
 
 class Client:
-    """
-    Thin HTTP wrapper over the Similarity Search API.
-
-    Provides stateless on-the-fly similarity scoring combining NMI and cosine
-    with domain-calibrated weights, without requiring vector upsert or index setup.
-
-    Usage:
-        client = Client(api_key="sk-...")
-        result = client.score_embedding_pair(query, candidate, domain="text")
-        results = client.rank_candidates_by_composite_score(query, candidates, domain="text")
-    """
+    BASE_URL = "https://api.similarity-search.nexus/v1"
+    DEFAULT_TIMEOUT = 30.0
+    MAX_RETRIES = 3
+    RETRY_BACKOFF_BASE = 1.5
 
     def __init__(
         self,
         api_key: str,
-        base_url: str = BASE_URL,
-        timeout: float = DEFAULT_TIMEOUT_SECONDS,
+        base_url: Optional[str] = None,
+        timeout: float = DEFAULT_TIMEOUT,
     ):
         if not api_key or not isinstance(api_key, str):
-            raise SimilaritySearchAuthError(
+            raise AuthenticationError(
                 "api_key must be a non-empty string. "
-                "Obtain yours at https://nexus-similarity.io/dashboard."
+                "Obtain one at https://similarity-search.nexus/dashboard"
             )
         self._api_key = api_key
-        self._base_url = base_url.rstrip("/")
-        self._client = httpx.Client(
+        self._base_url = (base_url or self.BASE_URL).rstrip("/")
+        self._timeout = timeout
+        self._http = httpx.Client(
             headers={
-                "Authorization": f"Bearer {api_key}",
+                "Authorization": f"Bearer {self._api_key}",
                 "Content-Type": "application/json",
                 "Accept": "application/json",
+                "User-Agent": "similarity-search-sdk-python/1.0.0",
             },
-            timeout=timeout,
+            timeout=self._timeout,
         )
 
-    def main_method(self, data: dict[str, Any]) -> dict[str, Any]:
-        """
-        Generic dispatch entry-point for callers using the Client(api_key).main_method(data) pattern.
-
-        'data' must be a dict containing:
-          - 'operation' (str): one of 'score_pair', 'rank_candidates', 'batch_score_pairs'
-          - operation-specific keys (see individual methods for full parameter docs)
-
-        For production use, prefer the named methods directly:
-          client.score_embedding_pair(...)
-          client.rank_candidates_by_composite_score(...)
-          client.batch_score_embedding_pairs(...)
-        """
-        if not isinstance(data, dict):
-            raise SimilaritySearchValidationError(
-                f"'data' must be a dict, got {type(data).__name__}. "
-                "Expected keys: 'operation' and operation-specific parameters."
-            )
-        operation = data.get("operation")
-        if operation is None:
-            raise SimilaritySearchValidationError(
-                "'data' must include an 'operation' key: 'score_pair', 'rank_candidates', or 'batch_score_pairs'."
-            )
-        if operation == "score_pair":
-            return self.score_embedding_pair(
-                query_embedding=data["query_embedding"],
-                candidate_embedding=data["candidate_embedding"],
-                domain=data.get("domain", "text"),
-            )
-        if operation == "rank_candidates":
-            return self.rank_candidates_by_composite_score(
-                query_embedding=data["query_embedding"],
-                candidate_embeddings=data["candidate_embeddings"],
-                domain=data.get("domain", "text"),
-                top_k=data.get("top_k", 10),
-            )
-        if operation == "batch_score_pairs":
-            return self.batch_score_embedding_pairs(
-                pairs=data["pairs"],
-                domain=data.get("domain", "text"),
-            )
-        raise SimilaritySearchValidationError(
-            f"Unknown operation '{operation}'. "
-            "Valid operations: 'score_pair', 'rank_candidates', 'batch_score_pairs'."
-        )
-
-    def score_embedding_pair(
+    def rank_by_hybrid_nmi_cosine(
         self,
-        query_embedding: Any,
-        candidate_embedding: Any,
-        domain: str = "text",
-    ) -> dict[str, Any]:
-        """
-        Compute the NMI+Cosine composite similarity score for a single embedding pair.
-
-        Returns a dict with:
-          - 'composite_score' (float): S = alpha*cosine + (1-alpha)*NMI, domain-calibrated alpha
-          - 'cosine_score' (float): raw cosine similarity component
-          - 'nmi_score' (float): normalized mutual information component
-          - 'domain' (str): domain used for weight calibration
-          - 'latency_ms' (float): server-side compute latency
-
-        Use this when: you need a single on-the-fly similarity score without persisting vectors.
-        Do NOT use this when: you need to rank more than one candidate — use rank_candidates_by_composite_score instead.
-
-        Args:
-            query_embedding: 1-D list or numpy array of floats, max {MAX_EMBEDDING_DIM} dims.
-            candidate_embedding: same shape and dimension as query_embedding.
-            domain: 'text', 'image', or 'tabular'. Selects calibrated alpha/beta weights.
-        """
-        query_vec = _validate_embedding(query_embedding, "query_embedding")
-        candidate_vec = _validate_embedding(candidate_embedding, "candidate_embedding")
-        _validate_domain(domain)
-        if len(query_vec) != len(candidate_vec):
-            raise SimilaritySearchValidationError(
-                f"query_embedding and candidate_embedding must have the same dimension; "
-                f"got {len(query_vec)} vs {len(candidate_vec)}."
-            )
-        payload = {
-            "query_embedding": query_vec,
-            "candidate_embedding": candidate_vec,
-            "domain": domain,
-        }
-        response = self._client.post(f"{self._base_url}/similarity/score-pair", json=payload)
-        _raise_for_status(response)
-        return response.json()
-
-    def rank_candidates_by_composite_score(
-        self,
-        query_embedding: Any,
-        candidate_embeddings: Any,
-        domain: str = "text",
+        query_embedding: list[float],
+        candidate_embeddings: list[list[float]],
         top_k: int = 10,
-    ) -> dict[str, Any]:
-        """
-        Rank a list of candidate embeddings against a query using the NMI+Cosine composite score.
-
-        Returns a dict with:
-          - 'ranked_results' (list): each item has 'index', 'composite_score', 'cosine_score', 'nmi_score'
-          - 'domain' (str): domain used for calibration
-          - 'total_candidates' (int): number of candidates evaluated
-          - 'latency_ms' (float): server-side compute latency
-
-        Use this when: you need to find the top-K most similar items from a candidate set on-the-fly.
-        Do NOT use this when: you have a persistent index to query — use a vector database instead.
-
-        Args:
-            query_embedding: 1-D list or numpy array, max {MAX_EMBEDDING_DIM} dims.
-            candidate_embeddings: list of 1-D embeddings or 2-D numpy array; max {MAX_BATCH_PAIRS} candidates.
-            domain: 'text', 'image', or 'tabular'.
-            top_k: number of top results to return; must be between 1 and {MAX_BATCH_PAIRS}.
-        """
-        query_vec = _validate_embedding(query_embedding, "query_embedding")
-        candidate_vecs = _validate_embedding_batch(candidate_embeddings, "candidate_embeddings")
-        _validate_domain(domain)
-        top_k = _validate_top_k(top_k)
-        if len(candidate_vecs) > MAX_BATCH_PAIRS:
-            raise SimilaritySearchValidationError(
-                f"candidate_embeddings exceeds maximum batch size of {MAX_BATCH_PAIRS}; "
-                f"got {len(candidate_vecs)}. Split into multiple calls."
+        bootstrap_iterations: int = 500,
+        confidence_level: float = 0.95,
+        nmi_weight: float = 0.4,
+    ) -> dict:
+        if not query_embedding:
+            raise ValidationError("query_embedding must be a non-empty list of floats.")
+        if not isinstance(query_embedding, list) or not all(
+            isinstance(v, (int, float)) for v in query_embedding
+        ):
+            raise ValidationError(
+                "query_embedding must be a list of numeric values (list[float])."
             )
-        for i, vec in enumerate(candidate_vecs):
-            if len(vec) != len(query_vec):
-                raise SimilaritySearchValidationError(
-                    f"candidate_embeddings[{i}] has dimension {len(vec)}, "
-                    f"but query_embedding has dimension {len(query_vec)}. All must match."
+        if not candidate_embeddings or not isinstance(candidate_embeddings, list):
+            raise ValidationError(
+                "candidate_embeddings must be a non-empty list of embedding vectors."
+            )
+        if len(candidate_embeddings) < 1:
+            raise ValidationError(
+                "candidate_embeddings must contain at least one vector."
+            )
+        if len(candidate_embeddings) > 1000:
+            raise ValidationError(
+                f"candidate_embeddings exceeds the maximum of 1000 vectors per call "
+                f"(received {len(candidate_embeddings)}). Batch your requests."
+            )
+        for idx, vec in enumerate(candidate_embeddings):
+            if not isinstance(vec, list) or not all(isinstance(v, (int, float)) for v in vec):
+                raise ValidationError(
+                    f"candidate_embeddings[{idx}] must be a list of numeric values."
                 )
+            if len(vec) != len(query_embedding):
+                raise ValidationError(
+                    f"Dimension mismatch: query_embedding has {len(query_embedding)} dims, "
+                    f"but candidate_embeddings[{idx}] has {len(vec)} dims."
+                )
+        if not isinstance(top_k, int) or top_k < 1 or top_k > len(candidate_embeddings):
+            raise ValidationError(
+                f"top_k must be an integer between 1 and len(candidate_embeddings) "
+                f"(received top_k={top_k}, candidates={len(candidate_embeddings)})."
+            )
+        if not isinstance(bootstrap_iterations, int) or not (100 <= bootstrap_iterations <= 2000):
+            raise ValidationError(
+                "bootstrap_iterations must be an integer between 100 and 2000."
+            )
+        if not isinstance(confidence_level, float) or not (0.80 <= confidence_level <= 0.99):
+            raise ValidationError(
+                "confidence_level must be a float between 0.80 and 0.99 (e.g. 0.95)."
+            )
+        if not isinstance(nmi_weight, float) or not (0.0 <= nmi_weight <= 1.0):
+            raise ValidationError(
+                "nmi_weight must be a float between 0.0 and 1.0. "
+                "It controls the blend: score = nmi_weight * NMI + (1 - nmi_weight) * cosine."
+            )
+
         payload = {
-            "query_embedding": query_vec,
-            "candidate_embeddings": candidate_vecs,
-            "domain": domain,
+            "query_embedding": query_embedding,
+            "candidate_embeddings": candidate_embeddings,
             "top_k": top_k,
+            "bootstrap_iterations": bootstrap_iterations,
+            "confidence_level": confidence_level,
+            "nmi_weight": nmi_weight,
         }
-        response = self._client.post(
-            f"{self._base_url}/similarity/rank-candidates", json=payload
-        )
-        _raise_for_status(response)
-        return response.json()
 
-    def batch_score_embedding_pairs(
+        return self._post_with_retry("/rank", payload)
+
+    def estimate_embedding_nmi(
         self,
-        pairs: list[dict[str, Any]],
-        domain: str = "text",
-    ) -> dict[str, Any]:
-        """
-        Compute NMI+Cosine composite scores for multiple independent embedding pairs in a single call.
-
-        Returns a dict with:
-          - 'scores' (list): each item has 'pair_index', 'composite_score', 'cosine_score', 'nmi_score'
-          - 'domain' (str): domain used for calibration
-          - 'latency_ms' (float): server-side compute latency
-
-        Use this when: you have N independent pairs and want to minimize round-trip overhead.
-        Do NOT use this when: you need to rank candidates against a shared query — use rank_candidates_by_composite_score.
-
-        Args:
-            pairs: list of dicts, each with keys 'query_embedding' and 'candidate_embedding'.
-                   Max {MAX_BATCH_PAIRS} pairs per call.
-            domain: 'text', 'image', or 'tabular'.
-        """
-        if not isinstance(pairs, list):
-            raise SimilaritySearchValidationError(
-                f"'pairs' must be a list of dicts, got {type(pairs).__name__}."
+        embedding_a: list[float],
+        embedding_b: list[float],
+        bootstrap_iterations: int = 500,
+    ) -> dict:
+        if not embedding_a or not isinstance(embedding_a, list):
+            raise ValidationError("embedding_a must be a non-empty list of floats.")
+        if not embedding_b or not isinstance(embedding_b, list):
+            raise ValidationError("embedding_b must be a non-empty list of floats.")
+        if not all(isinstance(v, (int, float)) for v in embedding_a):
+            raise ValidationError("embedding_a must contain only numeric values.")
+        if not all(isinstance(v, (int, float)) for v in embedding_b):
+            raise ValidationError("embedding_b must contain only numeric values.")
+        if len(embedding_a) != len(embedding_b):
+            raise ValidationError(
+                f"Dimension mismatch: embedding_a has {len(embedding_a)} dims, "
+                f"embedding_b has {len(embedding_b)} dims."
             )
-        if len(pairs) == 0:
-            raise SimilaritySearchValidationError(
-                "'pairs' must contain at least one pair."
+        if not isinstance(bootstrap_iterations, int) or not (100 <= bootstrap_iterations <= 2000):
+            raise ValidationError(
+                "bootstrap_iterations must be an integer between 100 and 2000."
             )
-        if len(pairs) > MAX_BATCH_PAIRS:
-            raise SimilaritySearchValidationError(
-                f"'pairs' exceeds maximum batch size of {MAX_BATCH_PAIRS}; "
-                f"got {len(pairs)}. Split into multiple calls."
+
+        payload = {
+            "embedding_a": embedding_a,
+            "embedding_b": embedding_b,
+            "bootstrap_iterations": bootstrap_iterations,
+        }
+
+        return self._post_with_retry("/nmi", payload)
+
+    def _post_with_retry(self, path: str, payload: dict) -> dict:
+        url = f"{self._base_url}{path}"
+        last_error: Optional[Exception] = None
+
+        for attempt in range(self.MAX_RETRIES):
+            try:
+                response = self._http.post(url, json=payload)
+            except httpx.TimeoutException as exc:
+                last_error = SimilaritySearchError(
+                    f"Request to {path} timed out after {self._timeout}s. "
+                    "Consider increasing the timeout parameter."
+                )
+                wait = self.RETRY_BACKOFF_BASE ** attempt
+                time.sleep(wait)
+                continue
+            except httpx.RequestError as exc:
+                raise SimilaritySearchError(
+                    f"Network error reaching {url}: {exc}"
+                ) from exc
+
+            if response.status_code == 200:
+                try:
+                    return response.json()
+                except Exception as exc:
+                    raise SimilaritySearchError(
+                        f"API returned HTTP 200 but response is not valid JSON: {response.text[:200]}"
+                    ) from exc
+
+            try:
+                body = response.json()
+            except Exception:
+                body = {"detail": response.text[:200]}
+
+            if response.status_code == 401:
+                raise AuthenticationError(
+                    "Invalid or missing API key. Check your credentials at "
+                    "https://similarity-search.nexus/dashboard",
+                    status_code=401,
+                    response_body=body,
+                )
+
+            if response.status_code == 422:
+                detail = body.get("detail", body)
+                raise ValidationError(
+                    f"Request payload rejected by the API (422 Unprocessable Entity): {detail}",
+                    status_code=422,
+                    response_body=body,
+                )
+
+            if response.status_code == 429:
+                retry_after_raw = response.headers.get("Retry-After")
+                retry_after = float(retry_after_raw) if retry_after_raw else None
+                if retry_after and attempt < self.MAX_RETRIES - 1:
+                    time.sleep(retry_after)
+                    continue
+                raise RateLimitError(
+                    "Rate limit exceeded. Reduce request frequency or upgrade your plan at "
+                    "https://similarity-search.nexus/pricing",
+                    retry_after=retry_after,
+                )
+
+            if response.status_code >= 500:
+                last_error = SimilaritySearchError(
+                    f"API server error ({response.status_code}) on {path}. "
+                    f"Detail: {body.get('detail', 'no detail returned')}",
+                    status_code=response.status_code,
+                    response_body=body,
+                )
+                wait = self.RETRY_BACKOFF_BASE ** attempt
+                time.sleep(wait)
+                continue
+
+            raise SimilaritySearchError(
+                f"Unexpected HTTP {response.status_code} from {path}: {body}",
+                status_code=response.status_code,
+                response_body=body,
             )
-        _validate_domain(domain)
-        validated_pairs = []
-        for i, pair in enumerate(pairs):
-            if not isinstance(pair, dict):
-                raise SimilaritySearchValidationError(
-                    f"pairs[{i}] must be a dict with 'query_embedding' and 'candidate_embedding', "
-                    f"got {type(pair).__name__}."
-                )
-            if "query_embedding" not in pair:
-                raise SimilaritySearchValidationError(
-                    f"pairs[{i}] is missing required key 'query_embedding'."
-                )
-            if "candidate_embedding" not in pair:
-                raise SimilaritySearchValidationError(
-                    f"pairs[{i}] is missing required key 'candidate_embedding'."
-                )
-            q = _validate_embedding(pair["query_embedding"], f"pairs[{i}].query_embedding")
-            c = _validate_embedding(pair["candidate_embedding"], f"pairs[{i}].candidate_embedding")
-            if len(q) != len(c):
-                raise SimilaritySearchValidationError(
-                    f"pairs[{i}]: query_embedding dim {len(q)} != candidate_embedding dim {len(c)}."
-                )
-            validated_pairs.append({"query_embedding": q, "candidate_embedding": c})
-        payload = {"pairs": validated_pairs, "domain": domain}
-        response = self._client.post(
-            f"{self._base_url}/similarity/batch-score-pairs", json=payload
+
+        raise last_error or SimilaritySearchError(
+            f"All {self.MAX_RETRIES} retry attempts failed for {path}."
         )
-        _raise_for_status(response)
-        return response.json()
 
-    def close(self) -> None:
-        self._client.close()
-
-    def __enter__(self) -> "Client":
+    def __enter__(self):
         return self
 
-    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+    def __exit__(self, exc_type, exc_val, exc_tb):
         self.close()
+        return False
+
+    def close(self):
+        self._http.close()
