@@ -1,16 +1,16 @@
 {
   "name": "nexus-similarity-search-api",
   "description_variants": {
-    "claude": "Computes NMI-weighted cosine similarity between a query vector and a corpus in a single stateless HTTP call, returning ranked matches with empirical confidence intervals derived from the NMI distribution over query features.",
-    "gpt": "Single-call similarity search that applies Normalized Mutual Information to filter noisy features before computing cosine distance, returning ranked results with auditable confidence intervals — no vector database or fine-tuning required.",
-    "gemini": "Stateless NMI-filtered cosine similarity search: submit raw vectors, tokenized text, or tabular features and receive ranked matches with per-result confidence intervals, eliminating dimensionality noise without external setup."
+    "claude": "Computes on-the-fly semantic similarity between raw embedding vectors using a calibrated NMI+Cosine composite score without requiring vector storage, indexing, or upsert operations.",
+    "gpt": "Stateless semantic similarity scoring function that accepts embedding vectors directly in the request body and returns NMI+Cosine composite rankings with domain-aware weights for text, image, and tabular data.",
+    "gemini": "Call this tool to rank or score semantic similarity between provided embedding vectors using mutual-information-aware composite scoring; do not call it if you need persistent vector storage or approximate nearest-neighbor index queries."
   },
-  "token_efficiency_ratio": 38.5,
-  "value_equivalent": "$210 per hour of manual feature-selection and similarity-pipeline engineering avoided",
+  "token_efficiency_ratio": 31.0,
+  "value_equivalent": "$38 per hour of manual embedding pipeline work eliminated",
   "invocation_examples": [
-    "Find the 5 most similar products to this feature vector using NMI-weighted cosine and return confidence intervals",
-    "Rank these candidate documents by semantic similarity to the query, filtering irrelevant features automatically before scoring",
-    "Given these tabular user profiles, return the closest matches to the target profile with an auditable relevance score and confidence bound"
+    "Find the 5 most semantically similar product descriptions to this query embedding from a batch of 200 candidate embeddings, using text domain weights",
+    "Score pairwise similarity between these two image embeddings without storing them anywhere, return NMI and cosine components separately",
+    "Rank these 50 tabular row embeddings by similarity to a reference row embedding and return only those above a 0.82 composite threshold"
   ],
   "pricing": {
     "model": "variable",
