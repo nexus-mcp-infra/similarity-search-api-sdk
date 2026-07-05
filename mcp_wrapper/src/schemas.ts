@@ -1,40 +1,35 @@
 import { z } from "zod";
 
-export const RankVectorsByNmiCosineInputSchema = z.object({
-  query_vector: z.array(z.number()).min(2).max(8192).describe("Query vector as a flat list of floats. Must match dimensionality of all corpus vectors."),
-  corpus_vectors: z.array(z.array(z.number())).describe("List of candidate vectors to rank. Each inner list must have the same length as query_vector. Maximum 50,000 rows."),
-  nmi_threshold: z.number().min(0.0).max(1.0).default(0.1).describe("Minimum NMI score [0.0\u20131.0] a feature dimension must achieve to be included in cosine computation. Higher values are more aggressive at dropping noisy features. Recommended range 0.05\u20130.30."),
-  top_k: z.number().min(1).max(50000).default(10).describe("Number of top-ranked results to return. Must be between 1 and the corpus size."),
-  confidence_level: z.number().min(0.8).max(0.99).default(0.95).describe("Confidence level for the returned similarity score interval, derived from empirical NMI distribution. Typical values: 0.90, 0.95, 0.99."),
+export const RankEmbeddingsByNmiCosineInputSchema = z.object({
+  query_embedding: z.array(z.number()).min(32).max(4096).describe("Dense float vector representing the query. Must match dimensionality of all candidate_embeddings."),
+  candidate_embeddings: z.array(z.array(z.number())).describe("List of dense float vectors to rank against the query. Each inner array must have the same length as query_embedding."),
+  domain: z.string().min(4).max(8).describe("Embedding domain that controls the learned NMI/cosine weight mix. Accepted values: 'text', 'image', 'tabular'. Determines alpha_nmi and alpha_cosine from pretrained domain calibration."),
+  top_k: z.number().min(1).max(2048).default(10).describe("Number of top-ranked candidates to return. Must be <= len(candidate_embeddings)."),
+  return_scores: z.boolean().default(true).describe("If true, includes composite score, nmi_component, and cosine_component for each result. Set false to reduce payload size when only rank order matters."),
 }).strict();
 
-export const ComputeTokenizedCorpusSimilarityInputSchema = z.object({
-  query_token_features: z.array(z.number()).min(2).max(131072).describe("Query document represented as a feature vector over vocabulary (e.g., TF-IDF weights or binary term presence). Length defines vocabulary size."),
-  corpus_token_features: z.array(z.array(z.number())).describe("Corpus documents as feature vectors over the same vocabulary as query_token_features. All rows must share vocabulary length."),
-  nmi_bins: z.number().min(5).max(50).default(10).describe("Number of histogram bins used when discretizing continuous feature values to compute NMI. Higher bins increase NMI resolution but add compute cost. Meaningful range: 5\u201350."),
-  top_k: z.number().min(1).max(20000).default(10).describe("Number of top-ranked results to return."),
-  confidence_level: z.number().min(0.8).max(0.99).default(0.95).describe("Confidence level for the returned per-result similarity confidence interval."),
+export const ComputePairwiseNmiCosineMatrixInputSchema = z.object({
+  embeddings: z.array(z.array(z.number())).describe("Set of dense float vectors for which to compute all pairwise composite scores. All vectors must share the same dimensionality."),
+  domain: z.string().min(4).max(8).describe("Embedding domain controlling the NMI/cosine weight calibration. Accepted values: 'text', 'image', 'tabular'."),
+  normalize_output: z.boolean().default(false).describe("If true, min-max normalizes the composite matrix to [0, 1] per row. Set false to preserve raw composite scores for downstream calibration."),
 }).strict();
 
-export const ExtractNmiFeatureWeightsInputSchema = z.object({
-  query_vector: z.array(z.number()).min(2).max(8192).describe("Query vector defining the reference distribution for NMI computation across corpus dimensions."),
-  corpus_vectors: z.array(z.array(z.number())).describe("Corpus used to estimate the empirical feature distributions needed for NMI. Same shape constraints as rank_vectors_by_nmi_cosine."),
-  nmi_bins: z.number().min(5).max(50).default(10).describe("Number of histogram bins for NMI discretization. Consistent with the bins used in downstream ranking calls."),
-  return_top_n_dimensions: z.number().min(1).max(8192).optional().describe("Return only the top-N highest-NMI feature indices and their scores, sorted descending. Returns all dimensions if omitted."),
+export const ScoreEmbeddingPairNmiCosineInputSchema = z.object({
+  embedding_a: z.array(z.number()).min(32).max(4096).describe("First dense float vector of the pair."),
+  embedding_b: z.array(z.number()).min(32).max(4096).describe("Second dense float vector of the pair. Must match dimensionality of embedding_a."),
+  domain: z.string().min(4).max(8).describe("Embedding domain controlling calibrated weight mix. Accepted values: 'text', 'image', 'tabular'."),
 }).strict();
 
-export const CompareTabularRowSimilarityInputSchema = z.object({
-  query_row: z.array(z.number()).min(2).max(4096).describe("Single query row as a list of numerically encoded feature values. Length must equal number of columns in corpus_rows."),
-  corpus_rows: z.array(z.array(z.number())).describe("Tabular corpus where each row is a candidate record with the same feature schema as query_row."),
-  column_names: z.array(z.string()).optional().describe("Optional column labels for each feature position. Used only for interpretability in the response payload \u2014 does not affect computation. Must match query_row length if provided."),
-  nmi_threshold: z.number().min(0.0).max(1.0).default(0.05).describe("Minimum NMI score for a column to participate in cosine similarity. For tabular data with many correlated columns, values of 0.05\u20130.15 are typical."),
-  top_k: z.number().min(1).max(50000).default(10).describe("Number of most-similar rows to return, ranked by NMI-weighted cosine score."),
-  confidence_level: z.number().min(0.8).max(0.99).default(0.95).describe("Confidence level for similarity score intervals."),
+export const CalibrateDomainNmiCosineWeightsInputSchema = z.object({
+  anchor_embeddings: z.array(z.array(z.number())).describe("Query-side embeddings for each relevance pair. Index-aligned with positive_embeddings and negative_embeddings."),
+  positive_embeddings: z.array(z.array(z.number())).describe("Embeddings of items labeled as relevant/similar to the corresponding anchor. Same length as anchor_embeddings."),
+  negative_embeddings: z.array(z.array(z.number())).describe("Embeddings of items labeled as non-relevant to the corresponding anchor. Same length as anchor_embeddings."),
+  domain_label: z.string().min(3).max(64).describe("Identifier for the custom domain profile to be created. Used to reference this calibration in subsequent ranking calls via the domain parameter."),
 }).strict();
 
-export const EstimateSimilarityConfidenceBandInputSchema = z.object({
-  similarity_scores: z.array(z.number()).min(1).max(50000).describe("List of raw NMI-weighted cosine similarity scores from a prior ranking call, in [\u22121.0, 1.0]."),
-  nmi_weight_distribution: z.array(z.number()).min(2).max(131072).describe("Per-dimension NMI weights used to produce the scores. Returned by extract_nmi_feature_weights or included in rank_vectors_by_nmi_cosine response."),
-  confidence_level: z.number().min(0.8).max(0.99).default(0.95).describe("Target confidence level for the output bands. Can differ from the level used in the original ranking call."),
-  bootstrap_iterations: z.number().min(100).max(5000).default(500).describe("Number of bootstrap resampling iterations for band estimation. Higher values reduce Monte Carlo variance at compute cost. Range 100\u20135000."),
+export const ExplainNmiCosineRankDivergenceInputSchema = z.object({
+  query_embedding: z.array(z.number()).min(32).max(4096).describe("Dense float vector representing the query."),
+  candidate_embeddings: z.array(z.array(z.number())).describe("Candidate dense float vectors to compare under both ranking methods."),
+  domain: z.string().min(3).max(64).describe("Embedding domain for composite weight calibration. Accepted values: 'text', 'image', 'tabular', or a custom domain_label from calibrate_domain_nmi_cosine_weights."),
+  top_k: z.number().min(2).max(256).default(10).describe("Number of candidates to include in the divergence report, taken from the top of the composite ranking."),
 }).strict();
