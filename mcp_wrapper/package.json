@@ -1,7 +1,7 @@
 {
   "name": "@nexus-mcp/similarity-search-api",
   "version": "1.0.0",
-  "description": "Computes on-the-fly semantic similarity between raw embedding vectors using a calibrated NMI+Cosine composite score without requiring vector storage, indexing, or upsert operations.",
+  "description": "Ejecuta b\u00fasqueda de similitud coseno con filtro NMI e intervalo de confianza bootstrap por llamada, devolviendo p-value de significancia estad\u00edstica por par para distinguir patrones reales de correlaciones aleatorias en embeddings.",
   "type": "module",
   "main": "dist/index.js",
   "bin": {
