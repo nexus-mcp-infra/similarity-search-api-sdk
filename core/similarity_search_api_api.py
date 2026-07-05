@@ -1,8 +1,9 @@
-from fastapi import FastAPI, HTTPException, Depends, Header
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from pydantic import BaseModel, Field, field_validator
-from typing import Optional
+from fastapi import FastAPI, HTTPException, Security, Depends
+from fastapi.security.api_key import APIKeyHeader
+from pydantic import BaseModel, Field, model_validator
+from typing import Any
 import numpy as np
+import duckdb
 import hashlib
 import time
 import os
@@ -13,377 +14,400 @@ from src.math.game_theory import NashEquilibrium, MarketEntryGame
 from src.math.statistics import Statistics
 
 app = FastAPI(
-    title="NMI Similarity Search API",
+    title="Hybrid Similarity Search API",
     version="1.0.0",
-    description="Hybrid NMI+Cosine similarity over raw data without embedding pipeline",
+    description="Stateless NMI+Cosine hybrid scoring with adaptive entropy-calibrated weights",
 )
 
-security = HTTPBearer()
+API_KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=True)
+_VALID_API_KEYS: set[str] = set(
+    k.strip() for k in os.environ.get("HYBRID_SEARCH_API_KEYS", "").split(",") if k.strip()
+)
+_ENTROPY_CATEGORICAL_THRESHOLD: float = 1.5
+_DB_PATH: str = os.environ.get("HYBRID_SEARCH_DB", "hybrid_search_telemetry.duckdb")
 
-_corpus_registry: dict[str, dict] = {}
-_api_keys: set[str] = set(os.environ.get("NEXUS_API_KEYS", "").split(","))
-
-NMI_COMPUTE_LIMIT = 50_000
-MAX_CORPUS_ITEMS = 100_000
-MAX_QUERY_LENGTH = 4096
-MAX_CORPUS_LABEL_LENGTH = 512
-
-
-class CorpusIngestRequest(BaseModel):
-    corpus_id: str = Field(..., min_length=1, max_length=64, pattern=r"^[a-zA-Z0-9_-]+$")
-    documents: list[str] = Field(..., min_length=1, max_length=MAX_CORPUS_ITEMS)
-    labels: Optional[list[str]] = None
-
-    @field_validator("documents")
-    @classmethod
-    def documents_not_empty(cls, v):
-        if any(len(d.strip()) == 0 for d in v):
-            raise ValueError("Each document must be a non-empty string")
-        if any(len(d) > MAX_QUERY_LENGTH for d in v):
-            raise ValueError(f"Each document must be <= {MAX_QUERY_LENGTH} characters")
-        return v
-
-    @field_validator("labels")
-    @classmethod
-    def labels_length_matches(cls, v, info):
-        if v is not None and "documents" in info.data:
-            if len(v) != len(info.data["documents"]):
-                raise ValueError("labels length must match documents length")
-            if any(len(lbl) > MAX_CORPUS_LABEL_LENGTH for lbl in v):
-                raise ValueError(f"Each label must be <= {MAX_CORPUS_LABEL_LENGTH} characters")
-        return v
+_db_conn: duckdb.DuckDBPyConnection | None = None
 
 
-class SimilarityQueryRequest(BaseModel):
-    corpus_id: str = Field(..., min_length=1, max_length=64, pattern=r"^[a-zA-Z0-9_-]+$")
-    query: str = Field(..., min_length=1, max_length=MAX_QUERY_LENGTH)
-    top_k: int = Field(default=10, ge=1, le=100)
-    alpha_override: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+def _get_db() -> duckdb.DuckDBPyConnection:
+    global _db_conn
+    if _db_conn is None:
+        _db_conn = duckdb.connect(_DB_PATH)
+        _db_conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS weight_telemetry (
+                request_id TEXT,
+                domain TEXT,
+                w_nmi DOUBLE,
+                w_cosine DOUBLE,
+                n_categorical INTEGER,
+                n_continuous INTEGER,
+                ts DOUBLE
+            )
+            """
+        )
+    return _db_conn
 
 
-class CorpusStatsRequest(BaseModel):
-    corpus_id: str = Field(..., min_length=1, max_length=64, pattern=r"^[a-zA-Z0-9_-]+$")
-
-
-class TransferEntropyRequest(BaseModel):
-    source_sequence: list[float] = Field(..., min_length=2, max_length=10_000)
-    target_sequence: list[float] = Field(..., min_length=2, max_length=10_000)
-    lag: int = Field(default=1, ge=1, le=50)
-
-    @field_validator("target_sequence")
-    @classmethod
-    def sequences_same_length(cls, v, info):
-        if "source_sequence" in info.data and len(v) != len(info.data["source_sequence"]):
-            raise ValueError("source_sequence and target_sequence must have equal length")
-        return v
-
-
-def _authenticate(credentials: HTTPAuthorizationCredentials = Depends(security)) -> str:
-    token = credentials.credentials
-    if not token or token not in _api_keys:
+def _require_api_key(api_key: str = Security(API_KEY_HEADER)) -> str:
+    if not _VALID_API_KEYS:
+        raise HTTPException(status_code=503, detail="Server has no API keys configured")
+    if api_key not in _VALID_API_KEYS:
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
-    return token
+    return api_key
 
 
-def _tokenize(text: str) -> list[str]:
-    return text.lower().split()
+class FeatureRecord(BaseModel):
+    id: str = Field(..., min_length=1, max_length=256)
+    features: dict[str, Any] = Field(..., min_length=1)
+
+    @model_validator(mode="after")
+    def features_not_empty(self) -> "FeatureRecord":
+        if not self.features:
+            raise ValueError("features dict must contain at least one key")
+        return self
 
 
-def _bow_vector(tokens: list[str], vocab: dict[str, int]) -> np.ndarray:
-    vec = np.zeros(len(vocab), dtype=np.float32)
-    for t in tokens:
-        if t in vocab:
-            vec[vocab[t]] += 1.0
-    norm = np.linalg.norm(vec)
-    return vec / norm if norm > 0 else vec
+class SimilaritySearchRequest(BaseModel):
+    query: FeatureRecord
+    corpus: list[FeatureRecord] = Field(..., min_length=1, max_length=10000)
+    top_k: int = Field(default=10, ge=1, le=500)
+    domain: str = Field(default="generic", min_length=1, max_length=64)
+
+    @model_validator(mode="after")
+    def top_k_fits_corpus(self) -> "SimilaritySearchRequest":
+        if self.top_k > len(self.corpus):
+            self.top_k = len(self.corpus)
+        return self
 
 
-def _build_vocab(all_tokens: list[list[str]]) -> dict[str, int]:
-    vocab: dict[str, int] = {}
-    for tokens in all_tokens:
-        for t in tokens:
-            if t not in vocab:
-                vocab[t] = len(vocab)
-    return vocab
+class ComponentScore(BaseModel):
+    nmi_score: float
+    cosine_score: float
+    hybrid_score: float
+    w_nmi: float
+    w_cosine: float
+    dominant_component: str
 
 
-def _marginal_entropy_alpha(
-    corpus_vectors: np.ndarray,
-    vocab_size: int,
-    stats: Statistics,
-) -> float:
-    if vocab_size <= 1:
-        return 0.5
-    marginal_freq = corpus_vectors.sum(axis=0)
-    total = marginal_freq.sum()
-    if total == 0:
-        return 0.5
-    marginal_prob = marginal_freq / total
-    marginal_prob = marginal_prob[marginal_prob > 0]
-    h_marginal = float(stats.entropy(marginal_prob.tolist()))
-    log2_vocab = float(np.log2(vocab_size))
-    if log2_vocab == 0:
-        return 0.5
-    alpha = float(np.clip(h_marginal / log2_vocab, 0.0, 1.0))
-    return alpha
+class SimilarityResult(BaseModel):
+    id: str
+    score: ComponentScore
 
 
-def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
-    na = np.linalg.norm(a)
-    nb = np.linalg.norm(b)
-    if na == 0 or nb == 0:
-        return 0.0
-    return float(np.dot(a, b) / (na * nb))
+class SimilaritySearchResponse(BaseModel):
+    request_id: str
+    results: list[SimilarityResult]
+    calibration: dict[str, float]
+    latency_ms: float
 
 
-def _hybrid_score(
-    query_vec: np.ndarray,
-    doc_vec: np.ndarray,
-    query_tokens: list[str],
-    doc_tokens: list[str],
-    alpha: float,
-    nmi_engine: NormalizedMutualInformation,
-    alpha_override: Optional[float],
-) -> float:
-    effective_alpha = alpha_override if alpha_override is not None else alpha
-    cos = _cosine_similarity(query_vec, doc_vec)
-    nmi_score = 0.0
-    if len(query_tokens) > 0 and len(doc_tokens) > 0:
-        nmi_score = float(nmi_engine.compute(query_tokens, doc_tokens))
-    return effective_alpha * cos + (1.0 - effective_alpha) * nmi_score
+class WeightDistributionResponse(BaseModel):
+    domain: str
+    avg_w_nmi: float
+    avg_w_cosine: float
+    sample_count: int
+    entropy_threshold_bits: float
 
 
-@app.post("/corpus/ingest")
-def ingest_corpus(
-    request: CorpusIngestRequest,
-    _token: str = Depends(_authenticate),
-) -> dict:
+def _marginal_entropy(values: list[Any]) -> float:
     stats = Statistics()
-    nmi_engine = NormalizedMutualInformation()
+    arr = np.array([float(v) if isinstance(v, (int, float)) else hash(str(v)) % 1000 for v in values])
+    return float(stats.entropy(arr))
 
-    tokenized = [_tokenize(doc) for doc in request.documents]
-    vocab = _build_vocab(tokenized)
-    vocab_size = len(vocab)
 
-    if vocab_size == 0:
-        raise HTTPException(status_code=422, detail="Corpus produced an empty vocabulary after tokenization")
+def _classify_features(
+    features: dict[str, Any]
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, float]]:
+    categorical: dict[str, Any] = {}
+    continuous: dict[str, Any] = {}
+    entropies: dict[str, float] = {}
 
-    corpus_vectors = np.array([_bow_vector(t, vocab) for t in tokenized], dtype=np.float32)
-    alpha = _marginal_entropy_alpha(corpus_vectors, vocab_size, stats)
+    for key, value in features.items():
+        if isinstance(value, bool):
+            categorical[key] = value
+            entropies[key] = _marginal_entropy([value])
+        elif isinstance(value, (int, float)) and not isinstance(value, bool):
+            h = _marginal_entropy([value])
+            entropies[key] = h
+            if h < _ENTROPY_CATEGORICAL_THRESHOLD:
+                categorical[key] = value
+            else:
+                continuous[key] = value
+        elif isinstance(value, str):
+            categorical[key] = value
+            entropies[key] = _marginal_entropy([value])
+        elif isinstance(value, (list, tuple)) and all(isinstance(x, (int, float)) for x in value):
+            h = _marginal_entropy(list(value))
+            entropies[key] = h
+            if h < _ENTROPY_CATEGORICAL_THRESHOLD:
+                categorical[key] = value
+            else:
+                continuous[key] = value
+        else:
+            categorical[key] = str(value)
+            entropies[key] = _marginal_entropy([str(value)])
 
-    corpus_fingerprint = hashlib.sha256(
-        "".join(request.documents).encode("utf-8")
+    return categorical, continuous, entropies
+
+
+def _adaptive_weights(
+    query_features: dict[str, Any],
+    entropies: dict[str, float],
+    categorical_keys: set[str],
+    continuous_keys: set[str],
+) -> tuple[float, float]:
+    h_cat = sum(entropies[k] for k in categorical_keys if k in entropies)
+    h_cont = sum(entropies[k] for k in continuous_keys if k in entropies)
+    total = h_cat + h_cont
+    if total == 0.0:
+        return 0.5, 0.5
+    w_nmi = h_cat / total
+    w_cosine = h_cont / total
+    return float(w_nmi), float(w_cosine)
+
+
+def _nmi_score_pair(
+    query_cat: dict[str, Any],
+    candidate_cat: dict[str, Any],
+) -> float:
+    if not query_cat and not candidate_cat:
+        return 1.0
+    nmi_calc = NormalizedMutualInformation()
+    scores: list[float] = []
+    all_keys = set(query_cat.keys()) | set(candidate_cat.keys())
+    for key in all_keys:
+        qv = query_cat.get(key)
+        cv = candidate_cat.get(key)
+        if qv is None or cv is None:
+            scores.append(0.0)
+            continue
+        q_arr = np.array([hash(str(qv)) % 1000])
+        c_arr = np.array([hash(str(cv)) % 1000])
+        try:
+            score = float(nmi_calc.compute(q_arr, c_arr))
+        except Exception:
+            score = 1.0 if str(qv) == str(cv) else 0.0
+        scores.append(max(0.0, min(1.0, score)))
+    return float(np.mean(scores)) if scores else 0.0
+
+
+def _cosine_score_pair(
+    query_cont: dict[str, Any],
+    candidate_cont: dict[str, Any],
+) -> float:
+    if not query_cont and not candidate_cont:
+        return 1.0
+    all_keys = sorted(set(query_cont.keys()) | set(candidate_cont.keys()))
+    if not all_keys:
+        return 1.0
+
+    def _flatten(d: dict[str, Any], keys: list[str]) -> np.ndarray:
+        parts: list[float] = []
+        for k in keys:
+            v = d.get(k, 0.0)
+            if isinstance(v, (list, tuple)):
+                parts.extend(float(x) for x in v)
+            else:
+                parts.append(float(v) if isinstance(v, (int, float)) else 0.0)
+        return np.array(parts, dtype=np.float64)
+
+    q_vec = _flatten(query_cont, all_keys)
+    c_vec = _flatten(candidate_cont, all_keys)
+
+    if q_vec.shape != c_vec.shape:
+        min_len = min(len(q_vec), len(c_vec))
+        q_vec = q_vec[:min_len]
+        c_vec = c_vec[:min_len]
+
+    q_norm = np.linalg.norm(q_vec)
+    c_norm = np.linalg.norm(c_vec)
+    if q_norm == 0.0 or c_norm == 0.0:
+        return 1.0 if (q_norm == 0.0 and c_norm == 0.0) else 0.0
+    return float(np.clip(np.dot(q_vec, c_vec) / (q_norm * c_norm), -1.0, 1.0))
+
+
+def _score_candidate(
+    query_cat: dict[str, Any],
+    query_cont: dict[str, Any],
+    cand_cat: dict[str, Any],
+    cand_cont: dict[str, Any],
+    w_nmi: float,
+    w_cosine: float,
+) -> ComponentScore:
+    nmi_s = _nmi_score_pair(query_cat, cand_cat)
+    cos_s = _cosine_score_pair(query_cont, cand_cont)
+    hybrid = w_nmi * nmi_s + w_cosine * cos_s
+    dominant = "nmi" if w_nmi >= w_cosine else "cosine"
+    return ComponentScore(
+        nmi_score=round(nmi_s, 6),
+        cosine_score=round(cos_s, 6),
+        hybrid_score=round(hybrid, 6),
+        w_nmi=round(w_nmi, 6),
+        w_cosine=round(w_cosine, 6),
+        dominant_component=dominant,
+    )
+
+
+def _record_telemetry(
+    request_id: str,
+    domain: str,
+    w_nmi: float,
+    w_cosine: float,
+    n_cat: int,
+    n_cont: int,
+) -> None:
+    try:
+        db = _get_db()
+        db.execute(
+            "INSERT INTO weight_telemetry VALUES (?, ?, ?, ?, ?, ?, ?)",
+            [request_id, domain, w_nmi, w_cosine, n_cat, n_cont, time.time()],
+        )
+    except Exception:
+        pass
+
+
+@app.post("/v1/similarity/search", response_model=SimilaritySearchResponse)
+def hybrid_similarity_search(
+    request: SimilaritySearchRequest,
+    _api_key: str = Depends(_require_api_key),
+) -> SimilaritySearchResponse:
+    t0 = time.perf_counter()
+
+    if not request.query.features:
+        raise HTTPException(status_code=422, detail="query.features must not be empty")
+
+    query_cat, query_cont, q_entropies = _classify_features(request.query.features)
+    w_nmi, w_cosine = _adaptive_weights(
+        request.query.features,
+        q_entropies,
+        set(query_cat.keys()),
+        set(query_cont.keys()),
+    )
+
+    scored: list[tuple[float, SimilarityResult]] = []
+    for item in request.corpus:
+        cand_cat, cand_cont, _ = _classify_features(item.features)
+        comp = _score_candidate(query_cat, query_cont, cand_cat, cand_cont, w_nmi, w_cosine)
+        scored.append((comp.hybrid_score, SimilarityResult(id=item.id, score=comp)))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    top_results = [r for _, r in scored[: request.top_k]]
+
+    request_id = hashlib.sha256(
+        f"{request.query.id}{time.time()}".encode()
     ).hexdigest()[:16]
 
-    corpus_nmi_matrix: Optional[list] = None
-    n = len(request.documents)
-    if n <= 500:
-        dag = build_nexus_dag(tokenized)
-        causal = DoCalculus(dag)
-        corpus_nmi_matrix = causal.marginal_independence_summary()
+    _record_telemetry(
+        request_id,
+        request.domain,
+        w_nmi,
+        w_cosine,
+        len(query_cat),
+        len(query_cont),
+    )
 
-    _corpus_registry[request.corpus_id] = {
-        "documents": request.documents,
-        "tokenized": tokenized,
-        "vocab": vocab,
-        "vocab_size": vocab_size,
-        "corpus_vectors": corpus_vectors,
-        "alpha": alpha,
-        "fingerprint": corpus_fingerprint,
-        "ingested_at": time.time(),
-        "causal_summary": corpus_nmi_matrix,
-        "labels": request.labels,
-    }
-
-    return {
-        "corpus_id": request.corpus_id,
-        "document_count": n,
-        "vocab_size": vocab_size,
-        "alpha": round(alpha, 6),
-        "fingerprint": corpus_fingerprint,
-        "causal_summary_available": corpus_nmi_matrix is not None,
-    }
+    latency_ms = (time.perf_counter() - t0) * 1000.0
+    return SimilaritySearchResponse(
+        request_id=request_id,
+        results=top_results,
+        calibration={
+            "w_nmi": round(w_nmi, 6),
+            "w_cosine": round(w_cosine, 6),
+            "n_categorical_features": float(len(query_cat)),
+            "n_continuous_features": float(len(query_cont)),
+            "entropy_threshold_bits": _ENTROPY_CATEGORICAL_THRESHOLD,
+        },
+        latency_ms=round(latency_ms, 3),
+    )
 
 
-@app.post("/similarity/query")
-def query_similarity(
-    request: SimilarityQueryRequest,
-    _token: str = Depends(_authenticate),
-) -> dict:
-    if request.corpus_id not in _corpus_registry:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Corpus '{request.corpus_id}' not found. Call /corpus/ingest first.",
-        )
+@app.post("/v1/similarity/explain", response_model=dict[str, Any])
+def explain_feature_decomposition(
+    record: FeatureRecord,
+    _api_key: str = Depends(_require_api_key),
+) -> dict[str, Any]:
+    if not record.features:
+        raise HTTPException(status_code=422, detail="features must not be empty")
 
-    corpus = _corpus_registry[request.corpus_id]
-    nmi_engine = NormalizedMutualInformation()
+    cat, cont, entropies = _classify_features(record.features)
+    w_nmi, w_cosine = _adaptive_weights(record.features, entropies, set(cat.keys()), set(cont.keys()))
 
-    query_tokens = _tokenize(request.query)
-    if not query_tokens:
-        raise HTTPException(status_code=422, detail="Query produced no tokens after tokenization")
+    nmi_inst = NormalizedMutualInformation()
+    dag = build_nexus_dag(list(record.features.keys()))
+    causal = CausalDAG(dag)
+    do_calc = DoCalculus(causal)
 
-    query_vec = _bow_vector(query_tokens, corpus["vocab"])
-    alpha = corpus["alpha"]
-
-    scores = []
-    for idx, (doc_vec, doc_tokens) in enumerate(
-        zip(corpus["corpus_vectors"], corpus["tokenized"])
-    ):
-        h = _hybrid_score(
-            query_vec,
-            doc_vec,
-            query_tokens,
-            doc_tokens,
-            alpha,
-            nmi_engine,
-            request.alpha_override,
-        )
-        scores.append((idx, h))
-
-    scores.sort(key=lambda x: x[1], reverse=True)
-    top = scores[: request.top_k]
-
-    results = []
-    for rank, (idx, score) in enumerate(top):
-        entry = {
-            "rank": rank + 1,
-            "document_index": idx,
-            "hybrid_score": round(score, 6),
-            "text_preview": corpus["documents"][idx][:120],
+    feature_report: dict[str, dict[str, Any]] = {}
+    for key, value in record.features.items():
+        h = entropies.get(key, 0.0)
+        regime = "categorical_nmi" if h < _ENTROPY_CATEGORICAL_THRESHOLD else "continuous_cosine"
+        intervention_effect = None
+        try:
+            intervention_effect = float(do_calc.effect(key, list(record.features.keys())))
+        except Exception:
+            intervention_effect = None
+        feature_report[key] = {
+            "entropy_bits": round(h, 6),
+            "regime": regime,
+            "value_type": type(value).__name__,
+            "causal_intervention_effect": intervention_effect,
         }
-        if corpus["labels"] is not None:
-            entry["label"] = corpus["labels"][idx]
-        results.append(entry)
-
-    effective_alpha = request.alpha_override if request.alpha_override is not None else alpha
 
     return {
-        "corpus_id": request.corpus_id,
-        "query_length_tokens": len(query_tokens),
-        "alpha_used": round(effective_alpha, 6),
-        "results": results,
+        "id": record.id,
+        "feature_decomposition": feature_report,
+        "adaptive_weights": {"w_nmi": round(w_nmi, 6), "w_cosine": round(w_cosine, 6)},
+        "dominant_regime": "nmi" if w_nmi >= w_cosine else "cosine",
+        "dag_node_count": len(dag.nodes) if hasattr(dag, "nodes") else len(record.features),
     }
 
 
-@app.get("/corpus/stats/{corpus_id}")
-def corpus_stats(
-    corpus_id: str,
-    _token: str = Depends(_authenticate),
-) -> dict:
-    if not corpus_id or len(corpus_id) > 64:
-        raise HTTPException(status_code=422, detail="corpus_id must be 1-64 characters")
+@app.get("/v1/similarity/weight-distribution", response_model=WeightDistributionResponse)
+def query_weight_distribution(
+    domain: str = "generic",
+    _api_key: str = Depends(_require_api_key),
+) -> WeightDistributionResponse:
+    if not domain or len(domain) > 64:
+        raise HTTPException(status_code=422, detail="domain must be 1-64 characters")
 
-    if corpus_id not in _corpus_registry:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Corpus '{corpus_id}' not found.",
+    db = _get_db()
+    row = db.execute(
+        """
+        SELECT
+            AVG(w_nmi) as avg_w_nmi,
+            AVG(w_cosine) as avg_w_cosine,
+            COUNT(*) as sample_count
+        FROM weight_telemetry
+        WHERE domain = ?
+        """,
+        [domain],
+    ).fetchone()
+
+    if row is None or row[2] == 0:
+        return WeightDistributionResponse(
+            domain=domain,
+            avg_w_nmi=0.5,
+            avg_w_cosine=0.5,
+            sample_count=0,
+            entropy_threshold_bits=_ENTROPY_CATEGORICAL_THRESHOLD,
         )
 
-    corpus = _corpus_registry[corpus_id]
-    stats = Statistics()
-
-    doc_lengths = [len(t) for t in corpus["tokenized"]]
-    length_stats = stats.describe(doc_lengths)
-
-    marginal_freq = corpus["corpus_vectors"].sum(axis=0)
-    total = marginal_freq.sum()
-    marginal_prob = (marginal_freq / total) if total > 0 else marginal_freq
-    marginal_prob_nonzero = marginal_prob[marginal_prob > 0]
-    h_marginal = float(stats.entropy(marginal_prob_nonzero.tolist()))
-
-    return {
-        "corpus_id": corpus_id,
-        "document_count": len(corpus["documents"]),
-        "vocab_size": corpus["vocab_size"],
-        "alpha": round(corpus["alpha"], 6),
-        "marginal_entropy_bits": round(h_marginal, 6),
-        "log2_vocab": round(float(np.log2(max(corpus["vocab_size"], 2))), 6),
-        "fingerprint": corpus["fingerprint"],
-        "ingested_at": corpus["ingested_at"],
-        "doc_length_tokens": {
-            "mean": round(length_stats["mean"], 2),
-            "std": round(length_stats["std"], 2),
-            "min": length_stats["min"],
-            "max": length_stats["max"],
-        },
-        "causal_summary_available": corpus.get("causal_summary") is not None,
-    }
-
-
-@app.post("/corpus/delete/{corpus_id}")
-def delete_corpus(
-    corpus_id: str,
-    _token: str = Depends(_authenticate),
-) -> dict:
-    if not corpus_id or len(corpus_id) > 64:
-        raise HTTPException(status_code=422, detail="corpus_id must be 1-64 characters")
-
-    if corpus_id not in _corpus_registry:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Corpus '{corpus_id}' not found.",
-        )
-
-    doc_count = len(_corpus_registry[corpus_id]["documents"])
-    del _corpus_registry[corpus_id]
-
-    return {
-        "corpus_id": corpus_id,
-        "deleted": True,
-        "documents_removed": doc_count,
-    }
-
-
-@app.post("/analysis/transfer-entropy")
-def compute_transfer_entropy(
-    request: TransferEntropyRequest,
-    _token: str = Depends(_authenticate),
-) -> dict:
-    if len(request.source_sequence) < 2:
-        raise HTTPException(status_code=422, detail="source_sequence requires at least 2 elements")
-
-    te_engine = TransferEntropy()
-    stats = Statistics()
-
-    te_value = float(
-        te_engine.compute(
-            request.source_sequence,
-            request.target_sequence,
-            lag=request.lag,
-        )
+    return WeightDistributionResponse(
+        domain=domain,
+        avg_w_nmi=round(float(row[0]), 6),
+        avg_w_cosine=round(float(row[1]), 6),
+        sample_count=int(row[2]),
+        entropy_threshold_bits=_ENTROPY_CATEGORICAL_THRESHOLD,
     )
 
-    src_stats = stats.describe(request.source_sequence)
-    tgt_stats = stats.describe(request.target_sequence)
 
-    dag = build_nexus_dag([request.source_sequence, request.target_sequence])
-    causal = DoCalculus(dag)
-    causal_direction = causal.infer_direction(
-        source=request.source_sequence,
-        target=request.target_sequence,
-        lag=request.lag,
-    )
-
-    ne = NashEquilibrium()
-    market_game = MarketEntryGame(
-        information_asymmetry=te_value,
-        source_variance=src_stats["std"],
-        target_variance=tgt_stats["std"],
-    )
-    equilibrium = ne.solve(market_game)
-
-    return {
-        "transfer_entropy_bits": round(te_value, 6),
-        "lag": request.lag,
-        "sequence_length": len(request.source_sequence),
-        "causal_direction": causal_direction,
-        "nash_equilibrium": {
-            "strategy_source": round(equilibrium.strategy_a, 6),
-            "strategy_target": round(equilibrium.strategy_b, 6),
-            "payoff_source": round(equilibrium.payoff_a, 6),
-            "payoff_target": round(equilibrium.payoff_b, 6),
-        },
-        "source_stats": {k: round(v, 4) for k, v in src_stats.items()},
-        "target_stats": {k: round(v, 4) for k, v in tgt_stats.items()},
-    }
+@app.get("/v1/similarity/health")
+def readiness_probe() -> dict[str, str]:
+    try:
+        db = _get_db()
+        db.execute("SELECT 1").fetchone()
+        db_status = "ok"
+    except Exception as exc:
+        db_status = f"degraded: {exc}"
+    return {"status": "ok", "db": db_status, "version": "1.0.0"}
