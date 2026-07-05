@@ -1,11 +1,6 @@
-crewai_tools
 fastapi
-langchain_core
-mcp
 numpy
 pydantic
-requests
 scikit-learn
 scipy
-src
 uvicorn
