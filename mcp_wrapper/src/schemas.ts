@@ -1,35 +1,29 @@
 import { z } from "zod";
 
-export const RankByNmiCosineHybridInputSchema = z.object({
-  query: z.string().min(1).max(8192).describe("Raw query item: plain text, a comma-separated categorical sequence, or a JSON-encoded integer array representing a discrete time series. Must be non-empty and consistent in type with corpus items."),
-  corpus: z.array(z.string()).describe("Array of raw corpus items to rank. Each item must be the same type as query. Minimum 2 items required to compute marginal entropy weighting. Maximum 10,000 items per call."),
-  data_modality: z.string().min(4).max(20).describe("Declares the semantic type of query and corpus items for tokenization and joint distribution estimation. One of: 'text' (whitespace-tokenized), 'categorical' (comma-separated discrete labels), 'discrete_timeseries' (JSON int array, binned by Sturges rule). Required \u2014 do not guess."),
-  top_k: z.number().min(1).max(500).default(10).describe("Number of top-ranked results to return, sorted descending by hybrid score. Must be between 1 and min(corpus length, 500)."),
-  nmi_weight_override: z.number().min(0.0).max(1.0).optional().describe("Fixed weight for the NMI component in [0.0, 1.0]; cosine weight becomes 1 - nmi_weight_override. If null, weight is computed adaptively from corpus marginal entropy: high-entropy corpora increase NMI weight. Provide a value only when you have a domain-specific reason to override entropy-based calibration."),
+export const RankHybridSimilarityInputSchema = z.object({
+  query: z.string().min(2).max(102400).describe("JSON-encoded object representing the query record. Keys are feature names; values are strings (categorical) or numbers (continuous). Must share at least one key with corpus records."),
+  corpus: z.string().min(2).max(10485760).describe("JSON-encoded array of objects. Each object is a candidate record with the same schema as query. Minimum 2 records, maximum 50000 records per call."),
+  top_k: z.number().min(1).max(1000).default(10).describe("Number of top-ranked results to return. Must be between 1 and the corpus size. Defaults to 10."),
+  score_breakdown: z.boolean().default(false).describe("If true, each result includes per-component scores: nmi_score, cosine_score, nmi_weight, cosine_weight, and per-feature NMI contributions. Adds latency proportional to feature count. Defaults to false."),
 }).strict();
 
-export const ComputePairwiseNmiMatrixInputSchema = z.object({
-  items: z.array(z.string()).describe("Array of raw items for which to compute pairwise NMI. All items must share the same modality. Minimum 2, maximum 500."),
-  data_modality: z.string().min(4).max(20).describe("Tokenization and binning strategy: 'text', 'categorical', or 'discrete_timeseries'. Must match the actual format of items."),
-  return_marginal_entropies: z.boolean().default(true).describe("If true, includes per-item marginal entropy H(X_i) in the response alongside the NMI matrix. Useful for identifying low-entropy items that may distort similarity scores."),
+export const ComputePairwiseHybridMatrixInputSchema = z.object({
+  records: z.string().min(2).max(5242880).describe("JSON-encoded array of objects. Each object is a record with string (categorical) or numeric (continuous) values. All records must share at least 2 common keys. Maximum 2000 records."),
+  include_diagonal: z.boolean().default(true).describe("If true, diagonal entries (self-similarity = 1.0) are included in the output matrix. Set to false when passing the matrix directly to clustering algorithms that assume zero diagonal. Defaults to true."),
 }).strict();
 
-export const EstimateCorpusEntropyProfileInputSchema = z.object({
-  corpus: z.array(z.string()).describe("Raw corpus items to profile. Same format constraints as rank_by_nmi_cosine_hybrid. Minimum 2, maximum 10,000."),
-  data_modality: z.string().min(4).max(20).describe("Tokenization strategy: 'text', 'categorical', or 'discrete_timeseries'."),
+export const ExplainFeatureWeightCalibrationInputSchema = z.object({
+  sample_records: z.string().min(2).max(2097152).describe("JSON-encoded array of at least 10 representative records from your dataset. Used to estimate marginal entropies and variance. Maximum 5000 records."),
 }).strict();
 
-export const ScoreCandidatePairNmiCosineInputSchema = z.object({
-  item_a: z.string().min(1).max(8192).describe("First raw item of the pair. Non-empty, same modality as item_b."),
-  item_b: z.string().min(1).max(8192).describe("Second raw item of the pair. Non-empty, same modality as item_a."),
-  data_modality: z.string().min(4).max(20).describe("Tokenization strategy: 'text', 'categorical', or 'discrete_timeseries'."),
-  nmi_weight_override: z.number().min(0.0).max(1.0).optional().describe("Fixed NMI weight in [0.0, 1.0]. If null, inferred from pair-level joint entropy (less accurate than corpus-level; prefer explicit override for isolated pair scoring)."),
+export const FilterByHybridThresholdInputSchema = z.object({
+  query: z.string().min(2).max(102400).describe("JSON-encoded object representing the query record. Keys are feature names; values are strings (categorical) or numbers (continuous)."),
+  corpus: z.string().min(2).max(10485760).describe("JSON-encoded array of candidate records. Maximum 50000 records per call."),
+  min_hybrid_score: z.number().min(0.0).max(1.0).describe("Minimum hybrid similarity score [0.0, 1.0] a record must exceed to be included in the result. Values below 0.05 risk returning the full corpus."),
+  score_breakdown: z.boolean().default(false).describe("If true, each returned record includes nmi_score, cosine_score, and component weights alongside the hybrid_score. Defaults to false."),
 }).strict();
 
-export const BatchRankMultiqueryNmiCosineInputSchema = z.object({
-  queries: z.array(z.string()).describe("Array of raw query items, all of the same modality. Minimum 2, maximum 50 queries per batch call."),
-  corpus: z.array(z.string()).describe("Shared corpus to rank against all queries. Minimum 2, maximum 10,000 items."),
-  data_modality: z.string().min(4).max(20).describe("Tokenization strategy applied uniformly to all queries and corpus items: 'text', 'categorical', or 'discrete_timeseries'."),
-  top_k: z.number().min(1).max(500).default(10).describe("Number of top-ranked corpus items returned per query. Applied uniformly across all queries. Between 1 and min(corpus length, 500)."),
-  nmi_weight_override: z.number().min(0.0).max(1.0).optional().describe("Fixed NMI weight in [0.0, 1.0] applied to all queries. If null, corpus marginal entropy determines the weight once and reuses it across all queries in the batch."),
+export const DetectFeatureTypeSchemaInputSchema = z.object({
+  sample_records: z.string().min(2).max(2097152).describe("JSON-encoded array of at least 5 representative records. More records yield more reliable type detection for low-frequency categorical values. Maximum 5000 records."),
+  override_types: z.string().min(2).max(4096).optional().describe("Optional JSON-encoded object mapping feature names to forced types: 'categorical' or 'continuous'. Use to correct misclassifications on ambiguous integer-coded fields. Example: {\"zip_code\": \"categorical\"}. Pass null to skip."),
 }).strict();
