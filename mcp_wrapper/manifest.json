@@ -1,16 +1,16 @@
 {
   "name": "nexus-similarity-search-api",
   "description_variants": {
-    "claude": "Ejecuta búsqueda híbrida stateless sobre colecciones arbitrarias fusionando NMI para features categóricas y coseno para features continuas en un score único con desglose por componente, sin índices ni infraestructura persistente.",
-    "gpt": "Hybrid similarity search endpoint that auto-detects feature types and computes entropy-weighted NMI+cosine scores across arbitrary JSON payloads, returning ranked results with per-component score breakdown in a single stateless call.",
-    "gemini": "Busca los registros más similares a un query en una colección JSON arbitraria usando NMI ponderado por entropía para campos categóricos y similitud coseno para campos numéricos, fusionados adaptativamente sin configuración manual de pesos."
+    "claude": "Computes stateless NMI-weighted cosine similarity between two collections of heterogeneous records (text + numeric + categorical) and returns ranked results in a single HTTP call, no index or prior setup required.",
+    "gpt": "Call this function to rank a query record against a candidate collection using NMI-weighted cosine similarity; pass both collections in the request body and receive sorted similarity scores instantly with zero infrastructure.",
+    "gemini": "Use this tool to perform per-call similarity search over mixed-type feature vectors using normalized mutual information as a weighting layer on cosine distance; returns ranked candidates with NMI contribution scores per feature dimension."
   },
   "token_efficiency_ratio": 31.0,
-  "value_equivalent": "$94 por hora de trabajo manual ahorrado",
+  "value_equivalent": "$38 per hour of manual feature-weighting and similarity ranking work avoided",
   "invocation_examples": [
-    "Encuentra los 5 productos más similares a este SKU considerando categoría, marca y vector de atributos numéricos sin montar índice",
-    "Busca los clientes más parecidos a este perfil híbrido con campos como segmento, región y métricas de comportamiento continuas",
-    "Dado este log de evento con campos categóricos y numéricos mixtos, encuentra los 10 registros históricos más cercanos para detección de anomalías"
+    "Find the 5 most similar products to this query item from a catalog that mixes price, category, and description fields",
+    "Rank these 200 candidate customer profiles by similarity to a target profile containing numeric, categorical, and free-text attributes",
+    "Given a support ticket with mixed structured and unstructured fields, find the 10 most similar resolved tickets from a historical batch without storing any index"
   ],
   "pricing": {
     "model": "variable",
