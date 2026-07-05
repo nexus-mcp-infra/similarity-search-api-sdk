@@ -1,490 +1,505 @@
-import hashlib
-import json
+from __future__ import annotations
+
 import time
+import logging
+from typing import Any, Optional, Union
 from dataclasses import dataclass, field
-from typing import Any
 
 import numpy as np
 import requests
 
-from src.math.causal import CausalDAG, DoCalculus
-from src.math.game_theory import NashEquilibrium
 from src.math.information import NormalizedMutualInformation, TransferEntropy
+from src.math.causal import DoCalculus, CausalDAG
+from src.math.game_theory import NashEquilibrium
+
+logger = logging.getLogger("similarity_search_sdk")
+
+_DEFAULT_BASE_URL = "https://api.similaritysearch.io/v1"
+_DEFAULT_TIMEOUT_SECONDS = 30.0
+_DEFAULT_TOP_K = 10
+_MAX_COLLECTION_SIZE = 10_000
+_MIN_COLLECTION_SIZE = 1
+_MAX_FEATURES = 4_096
+_MIN_TOP_K = 1
+_MAX_TOP_K = 500
 
 
-@dataclass
-class FeaturePartition:
-    categorical_keys: list[str]
-    continuous_keys: list[str]
-    marginal_entropies: dict[str, float]
-    w_nmi: float
-    w_cosine: float
+class SimilaritySearchError(Exception):
+    pass
 
 
-@dataclass
-class ComponentScore:
-    nmi_score: float
-    cosine_score: float
-    hybrid_score: float
-    w_nmi: float
-    w_cosine: float
-    dominant_component: str
-    feature_partition: dict[str, list[str]]
+class AuthenticationError(SimilaritySearchError):
+    pass
 
 
-@dataclass
-class SimilarityMatch:
-    candidate_id: str
-    candidate_payload: dict[str, Any]
-    score: ComponentScore
-    rank: int
+class ValidationError(SimilaritySearchError):
+    pass
 
 
-@dataclass
-class HybridSearchResult:
-    query_id: str
-    matches: list[SimilarityMatch]
-    latency_ms: float
-    payload_signature: str
-    calibration_metadata: dict[str, Any]
+class RateLimitError(SimilaritySearchError):
+    def __init__(self, message: str, retry_after: Optional[float] = None):
+        super().__init__(message)
+        self.retry_after = retry_after
 
 
-class FeatureTypeClassifier:
-    ENTROPY_THRESHOLD_BITS: float = 1.5
-
-    def __init__(self):
-        self._nmi_calculator = NormalizedMutualInformation()
-        self._transfer_entropy = TransferEntropy()
-
-    def _compute_marginal_entropy(self, values: list[Any]) -> float:
-        if not values:
-            return 0.0
-        try:
-            numeric = np.array([float(v) for v in values], dtype=np.float64)
-            if np.all(np.isnan(numeric)):
-                raise ValueError("all nan")
-            bins = max(2, min(int(np.sqrt(len(numeric))), 50))
-            hist, _ = np.histogram(numeric[~np.isnan(numeric)], bins=bins, density=False)
-            hist = hist[hist > 0].astype(np.float64)
-            hist /= hist.sum()
-            return float(-np.sum(hist * np.log2(hist + 1e-12)))
-        except (ValueError, TypeError):
-            unique, counts = np.unique([str(v) for v in values], return_counts=True)
-            probs = counts.astype(np.float64) / counts.sum()
-            return float(-np.sum(probs * np.log2(probs + 1e-12)))
-
-    def partition_payload_features(
-        self,
-        query_payload: dict[str, Any],
-        candidates: list[dict[str, Any]],
-    ) -> FeaturePartition:
-        all_keys = set(query_payload.keys())
-        for c in candidates:
-            all_keys.update(c.keys())
-        all_keys = sorted(all_keys)
-
-        marginal_entropies: dict[str, float] = {}
-        for key in all_keys:
-            all_values = [query_payload.get(key)] + [c.get(key) for c in candidates]
-            all_values = [v for v in all_values if v is not None]
-            if not all_values:
-                marginal_entropies[key] = 0.0
-                continue
-            marginal_entropies[key] = self._compute_marginal_entropy(all_values)
-
-        categorical_keys = [
-            k for k, h in marginal_entropies.items()
-            if h < self.ENTROPY_THRESHOLD_BITS
-        ]
-        continuous_keys = [
-            k for k, h in marginal_entropies.items()
-            if h >= self.ENTROPY_THRESHOLD_BITS
-        ]
-
-        sum_h_cat = sum(marginal_entropies[k] for k in categorical_keys)
-        sum_h_cont = sum(marginal_entropies[k] for k in continuous_keys)
-        total = sum_h_cat + sum_h_cont
-
-        if total < 1e-12:
-            w_nmi, w_cosine = 0.5, 0.5
-        else:
-            w_nmi = sum_h_cat / total
-            w_cosine = sum_h_cont / total
-
-        return FeaturePartition(
-            categorical_keys=categorical_keys,
-            continuous_keys=continuous_keys,
-            marginal_entropies=marginal_entropies,
-            w_nmi=w_nmi,
-            w_cosine=w_cosine,
-        )
-
-
-class HybridSimilarityScorer:
-    def __init__(self):
-        self._nmi_calculator = NormalizedMutualInformation()
-        self._causal_dag = CausalDAG()
-        self._do_calculus = DoCalculus(dag=self._causal_dag)
-        self._nash = NashEquilibrium()
-
-    def _extract_categorical_vectors(
-        self,
-        query: dict[str, Any],
-        candidate: dict[str, Any],
-        keys: list[str],
-    ) -> tuple[list[Any], list[Any]]:
-        q_vals = [str(query.get(k, "")) for k in keys]
-        c_vals = [str(candidate.get(k, "")) for k in keys]
-        return q_vals, c_vals
-
-    def _extract_continuous_vectors(
-        self,
-        query: dict[str, Any],
-        candidate: dict[str, Any],
-        keys: list[str],
-    ) -> tuple[np.ndarray, np.ndarray]:
-        q_vec, c_vec = [], []
-        for k in keys:
-            try:
-                q_vec.append(float(query.get(k, 0.0) or 0.0))
-                c_vec.append(float(candidate.get(k, 0.0) or 0.0))
-            except (TypeError, ValueError):
-                q_vec.append(0.0)
-                c_vec.append(0.0)
-        return np.array(q_vec, dtype=np.float64), np.array(c_vec, dtype=np.float64)
-
-    def _nmi_score_from_categorical_vectors(
-        self,
-        q_vals: list[Any],
-        c_vals: list[Any],
-    ) -> float:
-        if not q_vals:
-            return 0.0
-        all_cats = list(set(q_vals) | set(c_vals))
-        if len(all_cats) == 1:
-            return 1.0 if q_vals == c_vals else 0.0
-        cat_to_idx = {c: i for i, c in enumerate(all_cats)}
-        q_enc = np.array([cat_to_idx[v] for v in q_vals], dtype=np.int32)
-        c_enc = np.array([cat_to_idx[v] for v in c_vals], dtype=np.int32)
-        try:
-            return float(self._nmi_calculator.compute(q_enc, c_enc))
-        except Exception:
-            matches = sum(1 for a, b in zip(q_vals, c_vals) if a == b)
-            return matches / len(q_vals)
-
-    def _cosine_score(self, q_vec: np.ndarray, c_vec: np.ndarray) -> float:
-        if q_vec.size == 0:
-            return 0.0
-        q_norm = np.linalg.norm(q_vec)
-        c_norm = np.linalg.norm(c_vec)
-        if q_norm < 1e-12 or c_norm < 1e-12:
-            return 0.0
-        raw = float(np.dot(q_vec, c_vec) / (q_norm * c_norm))
-        return (raw + 1.0) / 2.0
-
-    def _resolve_weight_conflict_via_nash(
-        self,
-        w_nmi_entropy: float,
-        w_cosine_entropy: float,
-        nmi_raw: float,
-        cosine_raw: float,
-    ) -> tuple[float, float]:
-        payoff_matrix = np.array([
-            [nmi_raw * w_nmi_entropy, cosine_raw * w_cosine_entropy],
-            [cosine_raw * w_nmi_entropy, nmi_raw * w_cosine_entropy],
-        ])
-        try:
-            eq = self._nash.compute_mixed_strategy(payoff_matrix)
-            w1 = float(eq[0])
-            w2 = float(eq[1])
-            total = w1 + w2
-            if total < 1e-12:
-                return w_nmi_entropy, w_cosine_entropy
-            return w1 / total, w2 / total
-        except Exception:
-            return w_nmi_entropy, w_cosine_entropy
-
-    def score(
-        self,
-        query: dict[str, Any],
-        candidate: dict[str, Any],
-        partition: FeaturePartition,
-    ) -> ComponentScore:
-        q_cat, c_cat = self._extract_categorical_vectors(
-            query, candidate, partition.categorical_keys
-        )
-        nmi_raw = self._nmi_score_from_categorical_vectors(q_cat, c_cat)
-
-        q_cont, c_cont = self._extract_continuous_vectors(
-            query, candidate, partition.continuous_keys
-        )
-        cosine_raw = self._cosine_score(q_cont, c_cont)
-
-        w_nmi, w_cosine = self._resolve_weight_conflict_via_nash(
-            partition.w_nmi,
-            partition.w_cosine,
-            nmi_raw,
-            cosine_raw,
-        )
-
-        hybrid = w_nmi * nmi_raw + w_cosine * cosine_raw
-        dominant = "nmi" if w_nmi >= w_cosine else "cosine"
-
-        return ComponentScore(
-            nmi_score=nmi_raw,
-            cosine_score=cosine_raw,
-            hybrid_score=hybrid,
-            w_nmi=w_nmi,
-            w_cosine=w_cosine,
-            dominant_component=dominant,
-            feature_partition={
-                "categorical": partition.categorical_keys,
-                "continuous": partition.continuous_keys,
-            },
-        )
-
-
-def _payload_signature(payload: dict[str, Any]) -> str:
-    canonical = json.dumps(payload, sort_keys=True, default=str)
-    return hashlib.sha256(canonical.encode()).hexdigest()[:16]
-
-
-class SimilaritySearchAPIError(Exception):
-    def __init__(self, message: str, status_code: int | None = None, response_body: str | None = None):
+class UpstreamAPIError(SimilaritySearchError):
+    def __init__(self, message: str, status_code: int, response_body: Any = None):
         super().__init__(message)
         self.status_code = status_code
         self.response_body = response_body
 
 
-class Client:
-    BASE_URL: str = "https://api.similaritysearch.io/v1"
-    DEFAULT_TIMEOUT_SECONDS: float = 30.0
-    MAX_CANDIDATES: int = 10_000
-    MIN_CANDIDATES: int = 1
-    MAX_TOP_K: int = 500
+@dataclass
+class SimilarityMatch:
+    index: int
+    score: float
+    item: dict[str, Any]
+    nmi_weights: list[float] = field(default_factory=list)
 
+
+@dataclass
+class SimilaritySearchResult:
+    matches: list[SimilarityMatch]
+    query_item: dict[str, Any]
+    nmi_weight_vector: list[float]
+    computation_ms: float
+    model_version: str
+    transfer_entropy_signal: float
+    nash_equilibrium_threshold: float
+
+
+def _validate_nonempty_list(value: Any, name: str) -> list:
+    if value is None:
+        raise ValidationError(f"'{name}' must not be None.")
+    if not isinstance(value, list):
+        raise ValidationError(
+            f"'{name}' must be a list, got {type(value).__name__}."
+        )
+    if len(value) == 0:
+        raise ValidationError(f"'{name}' must contain at least one item.")
+    return value
+
+
+def _validate_collection_size(collection: list, name: str) -> None:
+    if len(collection) < _MIN_COLLECTION_SIZE:
+        raise ValidationError(
+            f"'{name}' must have at least {_MIN_COLLECTION_SIZE} item(s)."
+        )
+    if len(collection) > _MAX_COLLECTION_SIZE:
+        raise ValidationError(
+            f"'{name}' exceeds maximum allowed size of {_MAX_COLLECTION_SIZE} items."
+        )
+
+
+def _validate_item_structure(item: Any, index: int, collection_name: str) -> None:
+    if not isinstance(item, dict):
+        raise ValidationError(
+            f"Item at index {index} in '{collection_name}' must be a dict, "
+            f"got {type(item).__name__}."
+        )
+    if "features" not in item:
+        raise ValidationError(
+            f"Item at index {index} in '{collection_name}' missing required key 'features'."
+        )
+    features = item["features"]
+    if not isinstance(features, (list, np.ndarray)):
+        raise ValidationError(
+            f"Item at index {index} in '{collection_name}': 'features' must be a list "
+            f"or numpy array, got {type(features).__name__}."
+        )
+    if len(features) == 0:
+        raise ValidationError(
+            f"Item at index {index} in '{collection_name}': 'features' must be non-empty."
+        )
+    if len(features) > _MAX_FEATURES:
+        raise ValidationError(
+            f"Item at index {index} in '{collection_name}': 'features' length {len(features)} "
+            f"exceeds maximum of {_MAX_FEATURES}."
+        )
+
+
+def _extract_feature_matrix(collection: list[dict[str, Any]]) -> np.ndarray:
+    arrays = []
+    reference_dim = len(collection[0]["features"])
+    for idx, item in enumerate(collection):
+        feat = item["features"]
+        arr = np.array(feat, dtype=np.float64)
+        if arr.ndim != 1:
+            raise ValidationError(
+                f"Item at index {idx}: 'features' must be a 1-D array, "
+                f"got shape {arr.shape}."
+            )
+        if len(arr) != reference_dim:
+            raise ValidationError(
+                f"Item at index {idx}: 'features' length {len(arr)} does not match "
+                f"reference dimensionality {reference_dim}. All items must share the same "
+                f"feature dimension."
+            )
+        arrays.append(arr)
+    return np.stack(arrays, axis=0)
+
+
+def _compute_nmi_weight_vector(
+    query_vec: np.ndarray,
+    collection_matrix: np.ndarray,
+    nmi_calculator: NormalizedMutualInformation,
+) -> np.ndarray:
+    n_items, n_dims = collection_matrix.shape
+    weights = np.zeros(n_dims, dtype=np.float64)
+    for dim_idx in range(n_dims):
+        feature_column = collection_matrix[:, dim_idx]
+        target_column = np.full(n_items, query_vec[dim_idx], dtype=np.float64)
+        nmi_value = nmi_calculator.compute(feature_column, target_column)
+        weights[dim_idx] = max(float(nmi_value), 0.0)
+    weight_sum = weights.sum()
+    if weight_sum > 0.0:
+        weights = weights / weight_sum
+    else:
+        weights = np.ones(n_dims, dtype=np.float64) / n_dims
+    return weights
+
+
+def _nmi_weighted_cosine_scores(
+    query_vec: np.ndarray,
+    collection_matrix: np.ndarray,
+    weights: np.ndarray,
+) -> np.ndarray:
+    weighted_query = weights * query_vec
+    weighted_collection = collection_matrix * weights[np.newaxis, :]
+    query_norm = np.linalg.norm(weighted_query)
+    collection_norms = np.linalg.norm(weighted_collection, axis=1)
+    if query_norm == 0.0:
+        raise ValidationError(
+            "Query feature vector is all-zeros after NMI weighting; "
+            "cosine similarity is undefined."
+        )
+    zero_mask = collection_norms == 0.0
+    scores = np.zeros(len(collection_matrix), dtype=np.float64)
+    nonzero = ~zero_mask
+    if nonzero.any():
+        dot_products = weighted_collection[nonzero] @ weighted_query
+        scores[nonzero] = dot_products / (collection_norms[nonzero] * query_norm)
+    return scores
+
+
+def _compute_transfer_entropy_signal(
+    query_vec: np.ndarray,
+    collection_matrix: np.ndarray,
+    te_calculator: TransferEntropy,
+) -> float:
+    mean_collection = collection_matrix.mean(axis=0)
+    te_value = te_calculator.compute(
+        source=query_vec,
+        target=mean_collection,
+        lag=1,
+    )
+    return float(te_value)
+
+
+def _derive_nash_threshold(
+    scores: np.ndarray,
+    nash_solver: NashEquilibrium,
+) -> float:
+    if len(scores) < 2:
+        return float(scores[0]) if len(scores) == 1 else 0.0
+    unique_scores = np.unique(scores)
+    if len(unique_scores) < 2:
+        return float(unique_scores[0])
+    payoff_matrix = np.array([
+        [float(unique_scores[-1]), float(unique_scores[0])],
+        [float(unique_scores[0]), float(unique_scores[-1])],
+    ])
+    equilibrium = nash_solver.solve(payoff_matrix)
+    threshold = float(equilibrium.mixed_strategy_value)
+    return threshold
+
+
+def _build_causal_feature_dag(
+    n_dims: int,
+    do_calculus: DoCalculus,
+    causal_dag: CausalDAG,
+) -> np.ndarray:
+    if n_dims <= 1:
+        return np.ones(n_dims, dtype=np.float64)
+    edges = [(i, i + 1) for i in range(min(n_dims - 1, 8))]
+    dag = causal_dag.build(n_nodes=n_dims, edges=edges)
+    causal_weights = do_calculus.compute_feature_relevance(dag)
+    arr = np.array(causal_weights, dtype=np.float64)
+    if arr.shape[0] != n_dims:
+        arr = np.ones(n_dims, dtype=np.float64)
+    w_sum = arr.sum()
+    if w_sum > 0.0:
+        arr = arr / w_sum
+    return arr
+
+
+class Client:
     def __init__(
         self,
         api_key: str,
-        base_url: str | None = None,
-        timeout: float = DEFAULT_TIMEOUT_SECONDS,
+        base_url: str = _DEFAULT_BASE_URL,
+        timeout: float = _DEFAULT_TIMEOUT_SECONDS,
+        enable_local_precompute: bool = True,
     ):
         if not api_key or not isinstance(api_key, str):
-            raise ValueError("api_key must be a non-empty string")
-        if len(api_key.strip()) == 0:
-            raise ValueError("api_key must not be blank")
-        self._api_key = api_key.strip()
-        self._base_url = (base_url or self.BASE_URL).rstrip("/")
+            raise AuthenticationError(
+                "A valid non-empty 'api_key' string is required to initialize the Client."
+            )
+        self._api_key = api_key
+        self._base_url = base_url.rstrip("/")
         self._timeout = timeout
+        self._enable_local_precompute = enable_local_precompute
         self._session = requests.Session()
         self._session.headers.update({
-            "X-API-Key": self._api_key,
+            "Authorization": f"Bearer {self._api_key}",
             "Content-Type": "application/json",
-            "Accept": "application/json",
-            "User-Agent": "similarity-search-sdk-python/1.0.0",
+            "X-SDK-Version": "1.0.0",
         })
-        self._classifier = FeatureTypeClassifier()
-        self._scorer = HybridSimilarityScorer()
+        self._nmi = NormalizedMutualInformation()
+        self._te = TransferEntropy()
+        self._do = DoCalculus()
+        self._dag_builder = CausalDAG()
+        self._nash = NashEquilibrium()
 
-    def _post(self, endpoint: str, body: dict[str, Any]) -> dict[str, Any]:
-        url = f"{self._base_url}{endpoint}"
-        try:
-            response = self._session.post(url, json=body, timeout=self._timeout)
-        except requests.exceptions.Timeout:
-            raise SimilaritySearchAPIError(
-                f"Request to {endpoint} timed out after {self._timeout}s"
-            )
-        except requests.exceptions.ConnectionError as exc:
-            raise SimilaritySearchAPIError(
-                f"Connection error reaching {url}: {exc}"
-            )
-        if response.status_code == 401:
-            raise SimilaritySearchAPIError(
-                "Authentication failed: invalid or missing api_key",
-                status_code=401,
-                response_body=response.text,
-            )
-        if response.status_code == 429:
-            retry_after = response.headers.get("Retry-After", "unknown")
-            raise SimilaritySearchAPIError(
-                f"Rate limit exceeded. Retry after {retry_after}s",
-                status_code=429,
-                response_body=response.text,
-            )
-        if not response.ok:
-            raise SimilaritySearchAPIError(
-                f"API error {response.status_code} at {endpoint}",
-                status_code=response.status_code,
-                response_body=response.text,
-            )
-        try:
-            return response.json()
-        except ValueError:
-            raise SimilaritySearchAPIError(
-                f"Non-JSON response from {endpoint}",
-                status_code=response.status_code,
-                response_body=response.text,
-            )
-
-    def _validate_search_inputs(
+    def nmi_ranked_search(
         self,
         query: dict[str, Any],
-        candidates: list[dict[str, Any]],
-        top_k: int,
-    ) -> None:
+        collection: list[dict[str, Any]],
+        top_k: int = _DEFAULT_TOP_K,
+        use_causal_reweighting: bool = False,
+    ) -> SimilaritySearchResult:
         if query is None or not isinstance(query, dict):
-            raise TypeError("query must be a non-None dict")
-        if not query:
-            raise ValueError("query must not be an empty dict")
-        if candidates is None or not isinstance(candidates, list):
-            raise TypeError("candidates must be a non-None list of dicts")
-        if len(candidates) < self.MIN_CANDIDATES:
-            raise ValueError(
-                f"candidates must contain at least {self.MIN_CANDIDATES} item"
+            raise ValidationError(
+                "'query' must be a non-None dict with a 'features' key, "
+                f"got {type(query).__name__}."
             )
-        if len(candidates) > self.MAX_CANDIDATES:
-            raise ValueError(
-                f"candidates exceeds maximum of {self.MAX_CANDIDATES} items; "
-                f"got {len(candidates)}"
-            )
-        for i, c in enumerate(candidates):
-            if not isinstance(c, dict):
-                raise TypeError(
-                    f"candidates[{i}] must be a dict, got {type(c).__name__}"
-                )
+        _validate_item_structure(query, 0, "query")
+        _validate_nonempty_list(collection, "collection")
+        _validate_collection_size(collection, "collection")
+        for idx, item in enumerate(collection):
+            _validate_item_structure(item, idx, "collection")
         if not isinstance(top_k, int) or isinstance(top_k, bool):
-            raise TypeError("top_k must be an integer")
-        if top_k < 1 or top_k > self.MAX_TOP_K:
-            raise ValueError(
-                f"top_k must be between 1 and {self.MAX_TOP_K}; got {top_k}"
+            raise ValidationError(
+                f"'top_k' must be an integer, got {type(top_k).__name__}."
             )
+        if top_k < _MIN_TOP_K or top_k > _MAX_TOP_K:
+            raise ValidationError(
+                f"'top_k' must be between {_MIN_TOP_K} and {_MAX_TOP_K}, got {top_k}."
+            )
+
+        if self._enable_local_precompute:
+            return self._local_nmi_ranked_search(
+                query=query,
+                collection=collection,
+                top_k=top_k,
+                use_causal_reweighting=use_causal_reweighting,
+            )
+        return self._remote_nmi_ranked_search(
+            query=query,
+            collection=collection,
+            top_k=top_k,
+            use_causal_reweighting=use_causal_reweighting,
+        )
 
     def main_method(
         self,
         data: dict[str, Any],
-    ) -> HybridSearchResult:
+        top_k: int = _DEFAULT_TOP_K,
+    ) -> SimilaritySearchResult:
         if data is None or not isinstance(data, dict):
-            raise TypeError("data must be a non-None dict")
-        query = data.get("query")
-        candidates = data.get("candidates")
-        top_k = data.get("top_k", 10)
-        candidate_ids = data.get("candidate_ids")
-
-        if query is None:
-            raise ValueError("data must contain key 'query' (dict)")
-        if candidates is None:
-            raise ValueError("data must contain key 'candidates' (list of dicts)")
-
-        return self.hybrid_search(
-            query=query,
-            candidates=candidates,
+            raise ValidationError(
+                "'data' must be a dict with keys 'query' (item) and 'collection' (list of items). "
+                f"Got {type(data).__name__}."
+            )
+        if "query" not in data:
+            raise ValidationError(
+                "'data' dict missing required key 'query'."
+            )
+        if "collection" not in data:
+            raise ValidationError(
+                "'data' dict missing required key 'collection'."
+            )
+        return self.nmi_ranked_search(
+            query=data["query"],
+            collection=data["collection"],
             top_k=top_k,
-            candidate_ids=candidate_ids,
+            use_causal_reweighting=data.get("use_causal_reweighting", False),
         )
 
-    def hybrid_search(
+    def _local_nmi_ranked_search(
         self,
         query: dict[str, Any],
-        candidates: list[dict[str, Any]],
-        top_k: int = 10,
-        candidate_ids: list[str] | None = None,
-    ) -> HybridSearchResult:
-        self._validate_search_inputs(query, candidates, top_k)
-
-        if candidate_ids is not None:
-            if len(candidate_ids) != len(candidates):
-                raise ValueError(
-                    f"candidate_ids length ({len(candidate_ids)}) must match "
-                    f"candidates length ({len(candidates)})"
-                )
-            ids = candidate_ids
-        else:
-            ids = [str(i) for i in range(len(candidates))]
-
+        collection: list[dict[str, Any]],
+        top_k: int,
+        use_causal_reweighting: bool,
+    ) -> SimilaritySearchResult:
         t0 = time.perf_counter()
-
-        partition = self._classifier.partition_payload_features(query, candidates)
-
-        scores: list[tuple[int, ComponentScore]] = []
-        for idx, candidate in enumerate(candidates):
-            cs = self._scorer.score(query, candidate, partition)
-            scores.append((idx, cs))
-
-        scores.sort(key=lambda x: x[1].hybrid_score, reverse=True)
-        top_scores = scores[:top_k]
-
+        query_vec = np.array(query["features"], dtype=np.float64)
+        collection_matrix = _extract_feature_matrix(collection)
+        n_dims = query_vec.shape[0]
+        nmi_weights = _compute_nmi_weight_vector(
+            query_vec=query_vec,
+            collection_matrix=collection_matrix,
+            nmi_calculator=self._nmi,
+        )
+        if use_causal_reweighting and n_dims > 1:
+            causal_weights = _build_causal_feature_dag(
+                n_dims=n_dims,
+                do_calculus=self._do,
+                causal_dag=self._dag_builder,
+            )
+            combined = nmi_weights * causal_weights
+            w_sum = combined.sum()
+            nmi_weights = combined / w_sum if w_sum > 0.0 else nmi_weights
+        scores = _nmi_weighted_cosine_scores(
+            query_vec=query_vec,
+            collection_matrix=collection_matrix,
+            weights=nmi_weights,
+        )
+        te_signal = _compute_transfer_entropy_signal(
+            query_vec=query_vec,
+            collection_matrix=collection_matrix,
+            te_calculator=self._te,
+        )
+        nash_threshold = _derive_nash_threshold(
+            scores=scores,
+            nash_solver=self._nash,
+        )
+        ranked_indices = np.argsort(scores)[::-1]
+        k = min(top_k, len(collection))
+        top_indices = ranked_indices[:k]
         matches = [
             SimilarityMatch(
-                candidate_id=ids[idx],
-                candidate_payload=candidates[idx],
-                score=component_score,
-                rank=rank + 1,
+                index=int(idx),
+                score=float(scores[idx]),
+                item=collection[int(idx)],
+                nmi_weights=nmi_weights.tolist(),
             )
-            for rank, (idx, component_score) in enumerate(top_scores)
+            for idx in top_indices
         ]
-
-        latency_ms = (time.perf_counter() - t0) * 1000.0
-        sig = _payload_signature(query)
-
-        calibration_metadata = {
-            "entropy_threshold_bits": FeatureTypeClassifier.ENTROPY_THRESHOLD_BITS,
-            "w_nmi_entropy_derived": partition.w_nmi,
-            "w_cosine_entropy_derived": partition.w_cosine,
-            "n_categorical_features": len(partition.categorical_keys),
-            "n_continuous_features": len(partition.continuous_keys),
-            "marginal_entropies": partition.marginal_entropies,
-            "total_candidates_scored": len(candidates),
-        }
-
-        return HybridSearchResult(
-            query_id=sig,
+        elapsed_ms = (time.perf_counter() - t0) * 1_000.0
+        return SimilaritySearchResult(
             matches=matches,
-            latency_ms=round(latency_ms, 3),
-            payload_signature=sig,
-            calibration_metadata=calibration_metadata,
+            query_item=query,
+            nmi_weight_vector=nmi_weights.tolist(),
+            computation_ms=round(elapsed_ms, 3),
+            model_version="nmi-cosine-hybrid-v1",
+            transfer_entropy_signal=te_signal,
+            nash_equilibrium_threshold=nash_threshold,
         )
 
-    def explain_score(
+    def _remote_nmi_ranked_search(
         self,
         query: dict[str, Any],
-        candidate: dict[str, Any],
-    ) -> ComponentScore:
-        if query is None or not isinstance(query, dict):
-            raise TypeError("query must be a non-None dict")
-        if not query:
-            raise ValueError("query must not be empty")
-        if candidate is None or not isinstance(candidate, dict):
-            raise TypeError("candidate must be a non-None dict")
-        if not candidate:
-            raise ValueError("candidate must not be empty")
-
-        partition = self._classifier.partition_payload_features(query, [candidate])
-        return self._scorer.score(query, candidate, partition)
-
-    def batch_hybrid_search(
-        self,
-        queries: list[dict[str, Any]],
-        candidates: list[dict[str, Any]],
-        top_k: int = 10,
-        candidate_ids: list[str] | None = None,
-    ) -> list[HybridSearchResult]:
-        if queries is None or not isinstance(queries, list):
-            raise TypeError("queries must be a non-None list of dicts")
-        if not queries:
-            raise ValueError("queries must not be empty")
-        if len(queries) > 100:
-            raise ValueError(
-                f"batch_hybrid_search supports at most 100 queries per call; "
-                f"got {len(queries)}"
+        collection: list[dict[str, Any]],
+        top_k: int,
+        use_causal_reweighting: bool,
+    ) -> SimilaritySearchResult:
+        payload = {
+            "query": {
+                "features": [float(f) for f in query["features"]],
+                **{k: v for k, v in query.items() if k != "features"},
+            },
+            "collection": [
+                {
+                    "features": [float(f) for f in item["features"]],
+                    **{k: v for k, v in item.items() if k != "features"},
+                }
+                for item in collection
+            ],
+            "top_k": top_k,
+            "use_causal_reweighting": use_causal_reweighting,
+        }
+        try:
+            response = self._session.post(
+                f"{self._base_url}/search/nmi-ranked",
+                json=payload,
+                timeout=self._timeout,
             )
-        results = []
-        for q in queries:
-            results.append(
-                self.hybrid_search(
-                    query=q,
-                    candidates=candidates,
-                    top_k=top_k,
-                    candidate_ids=candidate_ids,
+        except requests.exceptions.Timeout:
+            raise UpstreamAPIError(
+                f"Request timed out after {self._timeout}s. "
+                "Consider reducing collection size or increasing timeout.",
+                status_code=408,
+            )
+        except requests.exceptions.ConnectionError as exc:
+            raise UpstreamAPIError(
+                f"Connection error reaching {self._base_url}: {exc}",
+                status_code=503,
+            )
+        self._raise_for_status(response)
+        body = response.json()
+        return self._parse_remote_response(body)
+
+    def _raise_for_status(self, response: requests.Response) -> None:
+        status = response.status_code
+        if status == 200:
+            return
+        try:
+            body = response.json()
+        except Exception:
+            body = {"raw": response.text}
+        if status == 401:
+            raise AuthenticationError(
+                "API key rejected (HTTP 401). Verify the key passed to Client()."
+            )
+        if status == 429:
+            retry_after = None
+            try:
+                retry_after = float(response.headers.get("Retry-After", 1.0))
+            except (TypeError, ValueError):
+                retry_after = 1.0
+            raise RateLimitError(
+                f"Rate limit exceeded (HTTP 429). Retry after {retry_after}s.",
+                retry_after=retry_after,
+            )
+        if status == 422:
+            raise ValidationError(
+                f"Server rejected payload (HTTP 422): {body}"
+            )
+        if 400 <= status < 500:
+            raise UpstreamAPIError(
+                f"Client error (HTTP {status}): {body}",
+                status_code=status,
+                response_body=body,
+            )
+        if status >= 500:
+            raise UpstreamAPIError(
+                f"Server error (HTTP {status}): {body}",
+                status_code=status,
+                response_body=body,
+            )
+
+    def _parse_remote_response(self, body: dict[str, Any]) -> SimilaritySearchResult:
+        if not isinstance(body, dict):
+            raise UpstreamAPIError(
+                f"Unexpected response shape: expected dict, got {type(body).__name__}.",
+                status_code=200,
+                response_body=body,
+            )
+        raw_matches = body.get("matches", [])
+        if not isinstance(raw_matches, list):
+            raise UpstreamAPIError(
+                "Response 'matches' field must be a list.",
+                status_code=200,
+                response_body=body,
+            )
+        matches = []
+        for m in raw_matches:
+            matches.append(
+                SimilarityMatch(
+                    index=int(m.get("index", -1)),
+                    score=float(m.get("score", 0.0)),
+                    item=m.get("item", {}),
+                    nmi_weights=m.get("nmi_weights", []),
                 )
             )
-        return results
+        return SimilaritySearchResult(
+            matches=matches,
+            query_item=body.get("query_item", {}),
+            nmi_weight_vector=body.get("nmi_weight_vector", []),
+            computation_ms=float(body.get("computation_ms", 0.0)),
+            model_version=str(body.get("model_version", "unknown")),
+            transfer_entropy_signal=float(body.get("transfer_entropy_signal", 0.0)),
+            nash_equilibrium_threshold=float(body.get("nash_equilibrium_threshold", 0.0)),
+        )
