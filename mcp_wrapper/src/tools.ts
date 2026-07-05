@@ -9,19 +9,19 @@ import { callCore } from "./coreClient.js";
 import { CoreServiceError } from "./types.js";
 import { CHARACTER_LIMIT } from "./constants.js";
 import {
-  RankByNmiWeightedCosineInputSchema,   ComputePairwiseNmiMatrixInputSchema,   ScoreHeterogeneousPairInputSchema,   FilterCandidatesByNmiThresholdInputSchema,   BenchmarkNmiVsCosineDeltaInputSchema,
+  RankVectorsByNmiCosineInputSchema,   ComputeTokenizedCorpusSimilarityInputSchema,   ExtractNmiFeatureWeightsInputSchema,   CompareTabularRowSimilarityInputSchema,   EstimateSimilarityConfidenceBandInputSchema,
 } from "./schemas.js";
 import type {
-  RankByNmiWeightedCosineInput,   ComputePairwiseNmiMatrixInput,   ScoreHeterogeneousPairInput,   FilterCandidatesByNmiThresholdInput,   BenchmarkNmiVsCosineDeltaInput,
+  RankVectorsByNmiCosineInput,   ComputeTokenizedCorpusSimilarityInput,   ExtractNmiFeatureWeightsInput,   CompareTabularRowSimilarityInput,   EstimateSimilarityConfidenceBandInput,
 } from "./types.js";
 
 export function registerTools(server: McpServer): void {
 
   server.registerTool(
-    "nexus_similarity_search_api_rank_by_nmi_weighted_cosine",
+    "nexus_similarity_search_api_rank_vectors_by_nmi_cosine",
     {
-      title: "NMI-Weighted Cosine Ranking",
-      description: `Computes NMI-weighted cosine similarity between a query vector and a candidate collection, returning ranked results in a single stateless HTTP call. Use when the feature space is heterogeneous (mixed numeric, categorical, or multimodal) and standard cosine underperforms due to non-linear dependencies. Do NOT use for pure text embeddings where cosine is sufficient, or when you need approximate nearest-neighbor at >1M candidates per call (latency will degrade beyond practical limits).
+      title: "NMI-Weighted Vector Ranking",
+      description: `Ranks a corpus of vectors against a query vector using NMI-filtered cosine similarity. NMI is computed per-feature across the corpus to suppress noisy dimensions before distance calculation. Use this when you have raw numerical feature vectors and want ranked similarity with confidence intervals. Do NOT use for text inputs (use tokenized_corpus_similarity instead), and do NOT use when corpus size exceeds 50,000 vectors per call — batch instead.
 
 Returns (JSON):
 {
@@ -33,7 +33,7 @@ Error handling:
   - Throws with a clear message if the core service is unreachable, times out,
     or returns a non-2xx status. The message includes the upstream request_id
     when available, for support correlation.`,
-      inputSchema: RankByNmiWeightedCosineInputSchema,
+      inputSchema: RankVectorsByNmiCosineInputSchema,
       annotations: {
         readOnlyHint: true,
         destructiveHint: false,
@@ -41,12 +41,12 @@ Error handling:
         openWorldHint: false,
       },
     },
-    async ({ query_vector, candidate_vectors, candidate_ids, nmi_bins, top_k }: RankByNmiWeightedCosineInput) => {
+    async ({ query_vector, corpus_vectors, nmi_threshold, top_k, confidence_level }: RankVectorsByNmiCosineInput) => {
       try {
         const output = await callCore<Record<string, unknown>>(
-          "/v1/similarity/rank-nmi-cosine",
+          "/v1/similarity/rank-vectors",
           "POST",
-          { query_vector, candidate_vectors, candidate_ids, nmi_bins, top_k },
+          { query_vector, corpus_vectors, nmi_threshold, top_k, confidence_level },
         );
 
         const text = JSON.stringify(output, null, 2);
@@ -66,7 +66,7 @@ Error handling:
           return {
             content: [{
               type: "text" as const,
-              text: `Error calling nexus_similarity_search_api_rank_by_nmi_weighted_cosine (${err.code}): ${err.message}` +
+              text: `Error calling nexus_similarity_search_api_rank_vectors_by_nmi_cosine (${err.code}): ${err.message}` +
                 (err.requestId ? ` [request_id=${err.requestId}]` : ""),
             }],
             isError: true,
@@ -77,10 +77,10 @@ Error handling:
     },
   );
   server.registerTool(
-    "nexus_similarity_search_api_compute_pairwise_nmi_matrix",
+    "nexus_similarity_search_api_compute_tokenized_corpus_similarity",
     {
-      title: "Pairwise NMI Feature Matrix",
-      description: `Computes the full NMI matrix across feature dimensions for a given collection, exposing per-feature mutual information weights without performing a search. Use this to inspect which feature dimensions carry the most discriminative mutual information before invoking rank_by_nmi_weighted_cosine, or to debug why certain features dominate weighting. Do NOT use as a replacement for the ranked search — this returns a DxD weight matrix, not similarity scores between items.
+      title: "Tokenized Text NMI-Cosine Similarity",
+      description: `Accepts pre-tokenized text sequences (lists of token IDs or term-frequency feature arrays) and ranks them against a query sequence using NMI-weighted cosine. NMI is computed over the token co-occurrence feature space to prune uninformative vocabulary dimensions. Use this for sparse text feature vectors or BoW/TF-IDF representations. Do NOT use with dense embedding vectors (use rank_vectors_by_nmi_cosine) and do NOT pass raw strings — tokenize first.
 
 Returns (JSON):
 {
@@ -92,7 +92,7 @@ Error handling:
   - Throws with a clear message if the core service is unreachable, times out,
     or returns a non-2xx status. The message includes the upstream request_id
     when available, for support correlation.`,
-      inputSchema: ComputePairwiseNmiMatrixInputSchema,
+      inputSchema: ComputeTokenizedCorpusSimilarityInputSchema,
       annotations: {
         readOnlyHint: true,
         destructiveHint: false,
@@ -100,12 +100,12 @@ Error handling:
         openWorldHint: false,
       },
     },
-    async ({ vectors, nmi_bins, normalize_weights }: ComputePairwiseNmiMatrixInput) => {
+    async ({ query_token_features, corpus_token_features, nmi_bins, top_k, confidence_level }: ComputeTokenizedCorpusSimilarityInput) => {
       try {
         const output = await callCore<Record<string, unknown>>(
-          "/v1/similarity/nmi-feature-matrix",
+          "/v1/similarity/rank-tokenized-corpus",
           "POST",
-          { vectors, nmi_bins, normalize_weights },
+          { query_token_features, corpus_token_features, nmi_bins, top_k, confidence_level },
         );
 
         const text = JSON.stringify(output, null, 2);
@@ -125,7 +125,7 @@ Error handling:
           return {
             content: [{
               type: "text" as const,
-              text: `Error calling nexus_similarity_search_api_compute_pairwise_nmi_matrix (${err.code}): ${err.message}` +
+              text: `Error calling nexus_similarity_search_api_compute_tokenized_corpus_similarity (${err.code}): ${err.message}` +
                 (err.requestId ? ` [request_id=${err.requestId}]` : ""),
             }],
             isError: true,
@@ -136,10 +136,10 @@ Error handling:
     },
   );
   server.registerTool(
-    "nexus_similarity_search_api_score_heterogeneous_pair",
+    "nexus_similarity_search_api_extract_nmi_feature_weights",
     {
-      title: "Single-Pair NMI-Cosine Score",
-      description: `Computes the NMI-weighted cosine similarity score for exactly one query-candidate pair with full per-dimension weight breakdown. Use for explainability: when you need to understand why two specific items score high or low, or to validate that NMI weighting is behaving correctly on a known pair. Do NOT use in batch loops to simulate collection ranking — rank_by_nmi_weighted_cosine is vectorized and orders of magnitude faster for that purpose.
+      title: "NMI Feature Relevance Extractor",
+      description: `Computes per-dimension NMI scores between a query vector and a corpus, returning the weight assigned to each feature dimension without performing similarity ranking. Use this to audit which features drive the NMI-cosine score, to tune nmi_threshold before a full ranking call, or to pre-validate corpus quality. Do NOT use as a substitute for ranking — this endpoint returns weights only, not similarity scores.
 
 Returns (JSON):
 {
@@ -151,7 +151,7 @@ Error handling:
   - Throws with a clear message if the core service is unreachable, times out,
     or returns a non-2xx status. The message includes the upstream request_id
     when available, for support correlation.`,
-      inputSchema: ScoreHeterogeneousPairInputSchema,
+      inputSchema: ExtractNmiFeatureWeightsInputSchema,
       annotations: {
         readOnlyHint: true,
         destructiveHint: false,
@@ -159,12 +159,12 @@ Error handling:
         openWorldHint: false,
       },
     },
-    async ({ vector_a, vector_b, nmi_bins, return_dimension_weights }: ScoreHeterogeneousPairInput) => {
+    async ({ query_vector, corpus_vectors, nmi_bins, return_top_n_dimensions }: ExtractNmiFeatureWeightsInput) => {
       try {
         const output = await callCore<Record<string, unknown>>(
-          "/v1/similarity/score-pair",
+          "/v1/similarity/nmi-feature-weights",
           "POST",
-          { vector_a, vector_b, nmi_bins, return_dimension_weights },
+          { query_vector, corpus_vectors, nmi_bins, return_top_n_dimensions },
         );
 
         const text = JSON.stringify(output, null, 2);
@@ -184,7 +184,7 @@ Error handling:
           return {
             content: [{
               type: "text" as const,
-              text: `Error calling nexus_similarity_search_api_score_heterogeneous_pair (${err.code}): ${err.message}` +
+              text: `Error calling nexus_similarity_search_api_extract_nmi_feature_weights (${err.code}): ${err.message}` +
                 (err.requestId ? ` [request_id=${err.requestId}]` : ""),
             }],
             isError: true,
@@ -195,10 +195,10 @@ Error handling:
     },
   );
   server.registerTool(
-    "nexus_similarity_search_api_filter_candidates_by_nmi_threshold",
+    "nexus_similarity_search_api_compare_tabular_row_similarity",
     {
-      title: "NMI-Threshold Candidate Filter",
-      description: `Returns only candidates whose NMI-weighted cosine score meets or exceeds a minimum threshold, without a fixed top_k cutoff. Use when downstream logic requires a quality floor rather than a fixed result count — e.g., deduplication pipelines, semantic clustering seeding, or anomaly filtering where you want all sufficiently similar items. Do NOT use when you need exactly K results; use rank_by_nmi_weighted_cosine with top_k instead.
+      title: "Tabular Row NMI-Cosine Comparator",
+      description: `Ranks rows in a tabular dataset (mixed numerical features, pre-encoded) against a query row using NMI-weighted cosine. Designed for structured tabular data where feature columns have heterogeneous scales. Handles per-column z-score normalization internally before NMI and cosine steps. Use for structured ML datasets, relational feature tables, or any input that originates as a dataframe row. Do NOT use for raw text or image embeddings — those have different distribution assumptions.
 
 Returns (JSON):
 {
@@ -210,7 +210,7 @@ Error handling:
   - Throws with a clear message if the core service is unreachable, times out,
     or returns a non-2xx status. The message includes the upstream request_id
     when available, for support correlation.`,
-      inputSchema: FilterCandidatesByNmiThresholdInputSchema,
+      inputSchema: CompareTabularRowSimilarityInputSchema,
       annotations: {
         readOnlyHint: true,
         destructiveHint: false,
@@ -218,12 +218,12 @@ Error handling:
         openWorldHint: false,
       },
     },
-    async ({ query_vector, candidate_vectors, candidate_ids, min_score_threshold, nmi_bins }: FilterCandidatesByNmiThresholdInput) => {
+    async ({ query_row, corpus_rows, column_names, nmi_threshold, top_k, confidence_level }: CompareTabularRowSimilarityInput) => {
       try {
         const output = await callCore<Record<string, unknown>>(
-          "/v1/similarity/filter-by-threshold",
+          "/v1/similarity/rank-tabular-rows",
           "POST",
-          { query_vector, candidate_vectors, candidate_ids, min_score_threshold, nmi_bins },
+          { query_row, corpus_rows, column_names, nmi_threshold, top_k, confidence_level },
         );
 
         const text = JSON.stringify(output, null, 2);
@@ -243,7 +243,7 @@ Error handling:
           return {
             content: [{
               type: "text" as const,
-              text: `Error calling nexus_similarity_search_api_filter_candidates_by_nmi_threshold (${err.code}): ${err.message}` +
+              text: `Error calling nexus_similarity_search_api_compare_tabular_row_similarity (${err.code}): ${err.message}` +
                 (err.requestId ? ` [request_id=${err.requestId}]` : ""),
             }],
             isError: true,
@@ -254,10 +254,10 @@ Error handling:
     },
   );
   server.registerTool(
-    "nexus_similarity_search_api_benchmark_nmi_vs_cosine_delta",
+    "nexus_similarity_search_api_estimate_similarity_confidence_band",
     {
-      title: "NMI vs Cosine Ranking Delta",
-      description: `Runs both pure cosine and NMI-weighted cosine ranking on the same query and candidates, returning side-by-side rank positions and score deltas per candidate. Use to quantify how much NMI weighting changes ranking order for a specific dataset — critical for justifying adoption to stakeholders or detecting feature spaces where cosine already suffices. Do NOT use in production ranking pipelines — this endpoint is designed for evaluation and costs roughly 2x the compute of a single ranking call.
+      title: "Similarity Score Confidence Band Estimator",
+      description: `Given a set of pre-computed NMI-cosine similarity scores and the underlying NMI weight distribution, returns bootstrap-derived confidence bands for each score. Use this when you already have scores from a prior ranking call and want to widen or narrow confidence intervals at a different confidence level, or to validate stability of results under resampling. Do NOT use as a primary similarity computation — this endpoint takes scores as input, not raw vectors.
 
 Returns (JSON):
 {
@@ -269,7 +269,7 @@ Error handling:
   - Throws with a clear message if the core service is unreachable, times out,
     or returns a non-2xx status. The message includes the upstream request_id
     when available, for support correlation.`,
-      inputSchema: BenchmarkNmiVsCosineDeltaInputSchema,
+      inputSchema: EstimateSimilarityConfidenceBandInputSchema,
       annotations: {
         readOnlyHint: true,
         destructiveHint: false,
@@ -277,12 +277,12 @@ Error handling:
         openWorldHint: false,
       },
     },
-    async ({ query_vector, candidate_vectors, candidate_ids, nmi_bins, top_k }: BenchmarkNmiVsCosineDeltaInput) => {
+    async ({ similarity_scores, nmi_weight_distribution, confidence_level, bootstrap_iterations }: EstimateSimilarityConfidenceBandInput) => {
       try {
         const output = await callCore<Record<string, unknown>>(
-          "/v1/similarity/benchmark-nmi-cosine-delta",
+          "/v1/similarity/confidence-band",
           "POST",
-          { query_vector, candidate_vectors, candidate_ids, nmi_bins, top_k },
+          { similarity_scores, nmi_weight_distribution, confidence_level, bootstrap_iterations },
         );
 
         const text = JSON.stringify(output, null, 2);
@@ -302,7 +302,7 @@ Error handling:
           return {
             content: [{
               type: "text" as const,
-              text: `Error calling nexus_similarity_search_api_benchmark_nmi_vs_cosine_delta (${err.code}): ${err.message}` +
+              text: `Error calling nexus_similarity_search_api_estimate_similarity_confidence_band (${err.code}): ${err.message}` +
                 (err.requestId ? ` [request_id=${err.requestId}]` : ""),
             }],
             isError: true,
