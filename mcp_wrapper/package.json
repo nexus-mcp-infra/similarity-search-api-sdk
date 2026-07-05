@@ -1,7 +1,7 @@
 {
   "name": "@nexus-mcp/similarity-search-api",
   "version": "1.0.0",
-  "description": "Computes stateless NMI-weighted cosine similarity between two collections of heterogeneous records (text + numeric + categorical) and returns ranked results in a single HTTP call, no index or prior setup required.",
+  "description": "Computes NMI-weighted cosine similarity between a query vector and a corpus in a single stateless HTTP call, returning ranked matches with empirical confidence intervals derived from the NMI distribution over query features.",
   "type": "module",
   "main": "dist/index.js",
   "bin": {
