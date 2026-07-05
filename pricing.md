@@ -1,132 +1,131 @@
-# Modelo de Pricing: Similarity Search API
+# Pricing Model — Similarity Search API (NMI-Cosine Hybrid)
+
+---
 
 ## Principio de diseño
 
-Pricing por operación atómica (una llamada = un par de vectores evaluado). Sin asientos, sin índices almacenados, sin compromisos de volumen mínimo en los niveles bajos. El coste marginal real de la primitiva es O(d) en dimensión del embedding — eso permite granularidad de centavos por llamada sin pérdida de margen.
+El activo es **stateless por diseño** (sin persistencia de vectores), lo que elimina el pricing por almacenamiento y hace que **la unidad de valor sea la operación de cómputo estadístico**, no el asiento ni el mes. El costo marginal real está en la discretización Freedman-Diaconis + estimación H(X,Y) + bootstrap de p-values — no en infraestructura de base de datos. El modelo de pricing debe reflejar eso directamente.
 
 ---
 
-## Tiers
+## Estructura de tiers
 
-### Free
+### Free Tier — `similarity:free`
 
 | Parámetro | Valor |
-|-----------|-------|
-| Operaciones / mes | 500 |
-| Dimensión máxima del embedding | 1 536 (OpenAI ada-002) |
-| Batch size máximo por request | 1 par |
-| Dominio disponible | `text` únicamente |
-| Latencia objetivo (p95) | < 120 ms |
-| Score devuelto | `composite` + `cosine` (NMI oculto) |
+|---|---|
+| Llamadas / mes | 500 |
+| Dimensionalidad máxima por vector | 512 dims |
+| Vectores por llamada (`query` + `candidates`) | máx. 20 vectores totales |
+| Bootstrap iterations (p-value CI) | 199 iteraciones |
+| Intervalo de confianza devuelto | 90% |
 | Rate limit | 10 req / min |
-| Autenticación | API key pública (sin SLA) |
-| Soporte | Documentación + GitHub Issues |
+| SLA | Best-effort, sin garantía de latencia |
+| Soporte | Documentación pública |
 
-**Lógica de conversión:** El NMI no se expone en Free. El developer ve que el `composite` diverge del `cosine` puro en sus propios datos, pero no puede reproducirlo — eso es el hook de conversión a Pro.
+**Restricción técnica clave:** con 199 iteraciones bootstrap el error estándar del p-value estimado es ~0.032 (SE = sqrt(p(1-p)/B) para p=0.05, B=199). Suficiente para exploración, insuficiente para decisiones de producción. Esta degradación es técnicamente honesta, no artificial — está documentada en el response body como `bootstrap_precision: "exploratory"`.
+
+**Propósito:** eliminar la fricción de evaluación. Un developer que resuelve "necesito similitud en 50 líneas sin levantar una DB" evalúa el activo en una tarde. El límite de 20 vectores fuerza el upgrade antes de cualquier uso real en pipelines.
 
 ---
 
-### Pro — Pay-per-operation
+### Pro Tier — `similarity:pro` (per-call)
 
-**Sin suscripción base. Se factura exclusivamente por operación consumida.**
+**Sin suscripción fija. Sin seats. Sin storage charges.**
 
 | Parámetro | Valor |
-|-----------|-------|
-| Precio base por operación | $0.0004 / par |
-| Batch size máximo por request | 128 pares |
-| Dimensión máxima del embedding | 4 096 |
-| Dominios disponibles | `text`, `image`, `tabular` |
-| Score devuelto | `composite` + `cosine` + `nmi` + `alpha` (peso aprendido) |
-| Latencia objetivo (p95) | < 60 ms |
-| Rate limit | 300 req / min (burst: 600 en ventana de 10 s) |
-| Autenticación | API key con HMAC-SHA256 en header |
-| Soporte | Email con SLA 24 h hábiles |
+|---|---|
+| Precio base por llamada | $0.004 |
+| Dimensionalidad máxima | 3072 dims (OpenAI text-embedding-3-large) |
+| Vectores por llamada | máx. 500 vectores totales |
+| Bootstrap iterations | 999 iteraciones |
+| Intervalo de confianza devuelto | 95% |
+| Rate limit | 300 req / min |
+| SLA latencia (p95) | < 800ms para 100 vectores × 1536 dims |
+| Soporte | Email, respuesta en 48h |
 
-**Descuentos por volumen dentro de Pro (mismo mes calendario):**
+**Escala de volumen (créditos prepago):**
 
-| Operaciones acumuladas en el mes | Precio por operación |
-|----------------------------------|----------------------|
-| 0 — 100 000 | $0.0004 |
-| 100 001 — 1 000 000 | $0.00028 (-30%) |
-| 1 000 001 — 10 000 000 | $0.00018 (-55%) |
-| > 10 000 000 | Cotización Enterprise automática |
+| Créditos prepago | Precio por llamada | Descuento efectivo |
+|---|---|---|
+| 0 – 9,999 llamadas | $0.0040 | — |
+| 10,000 – 49,999 | $0.0034 | 15% |
+| 50,000 – 199,999 | $0.0028 | 30% |
+| 200,000+ | $0.0022 | 45% |
 
-El descuento se aplica de forma escalonada (solo las operaciones en el tramo pagan ese precio, no retroactivo al primer request del mes). Esto protege el margen en adopción temprana y crea incentivo real para escalar sin requerir compromiso adelantado.
+**Lógica del precio base $0.0040:**
 
-**Estimación de factura típica:**
+El costo marginal de cómputo por llamada en 100 vectores × 1536 dims incluye:
 
-- Startup de RAG que hace 80 000 comparaciones/mes (reranking de top-k antes de respuesta LLM): **$32 / mes**
-- Plataforma de e-commerce con similitud de imágenes de producto, 400 000 ops/mes: **$98.40 / mes** (tramo mixto: 100k a $0.0004 + 300k a $0.00028)
-- Pipeline de detección de duplicados en dataset tabular, batch de 128, 2M ops/mes: **$244 / mes**
+- Discretización Freedman-Diaconis por dimensión: O(n · d · log n) donde n = vectores, d = dimensiones
+- Estimación H(X,Y) discreta: O(n² · B_avg) donde B_avg es el bin count promedio resultante del ajuste adaptativo (~18 bins en 1536 dims según distribución empírica de embeddings OpenAI)
+- Bootstrap con 999 iteraciones: el costo dominante — O(999 · n²) comparaciones de rangos permutados
+- En instancia compute-optimized (c6i.xlarge, $0.204/hr), 100 vectores × 1536 dims procesa en ~320ms -> ~630 llamadas/hr -> costo infra = $0.000323/llamada
+- Margen 12x sobre costo infra refleja: (a) el diferencial del bin-count flywheel, (b) el moat de la implementación correcta de Freedman-Diaconis vs bins fijos, (c) el valor de la primitiva de decisión (p-value) vs solo ranking
 
-Estas cifras son comparables con el coste de una instancia Pinecone s1 ($70/mes) más el tiempo de ingeniería de upsert — sin persistencia y sin warm-up.
-
----
-
-### Enterprise
-
-**Contrato anual prepagado con volumen garantizado.**
-
-| Parámetro | Condición |
-|-----------|-----------|
-| Volumen mínimo facturable | 10M operaciones / mes |
-| Precio por operación | Negociado, piso orientativo $0.00010 — $0.00014 |
-| Batch size máximo | 512 pares |
-| Dimensión máxima | Sin límite (sujeto a SLA de latencia acordado) |
-| Dominios | `text`, `image`, `tabular` + dominio custom con fine-tuning de alpha/beta sobre datos propios |
-| Score devuelto | Completo + `calibration_metadata` (intervalo de confianza del NMI, versión de pesos) |
-| Latencia objetivo (p99) | Acordado en SLA; base: < 80 ms p99 |
-| Rate limit | Dedicado (throughput reservado, no compartido) |
-| Autenticación | mTLS + IP allowlist + rotación de claves automatizada |
-| Soporte | Slack dedicado + TAM asignado + SLA 4 h respuesta crítica |
-| Acuerdo de datos | BAA disponible; los hashes SHA-256 de inputs pueden excluirse del log si se firma contrato de auditoría |
-| SLA de uptime | 99.9% mensual con créditos escalonados |
-
-**Entregable diferencial Enterprise:** fine-tuning del vector de pesos (alpha, beta) sobre corpus anotado del cliente. Los rankings resultantes son específicos al dominio propietario del cliente y no están disponibles en ningún nivel inferior. Esto convierte el contrato Enterprise en un activo técnico no portátil — el cliente no puede llevarse el modelo de pesos a un competidor porque ese modelo fue entrenado con su propio log de producción.
+**Modelo mental para el developer:** reemplaza "¿es este score de 0.87 bueno?" por "p-value = 0.031, la similitud es estadísticamente significativa al 5%". Ese salto epistémico vale más que $0.004.
 
 ---
 
-## Anatomía del precio por operación
+### Enterprise Tier — `similarity:enterprise`
 
-El precio de $0.0004 en Pro no es arbitrario:
+**Contrato anual. Precio negociado según volumen comprometido.**
 
-```
-Coste de cómputo por par (p95, d=1536):
-  Coseno:           O(d)   -> ~0.003 ms en CPU moderno
-  NMI (histograma): O(d * B) con B=32 bins -> ~0.08 ms
-  Calibración alpha: O(1)  -> lookup de tabla por dominio
-  Total latencia pura: ~0.1 ms
+| Parámetro | Valor |
+|---|---|
+| Precio de entrada | Desde $2,400/año (~600k llamadas a tarifa base) |
+| Dimensionalidad máxima | Sin límite (hasta 8192 dims, extensible) |
+| Vectores por llamada | máx. 2,000 vectores totales |
+| Bootstrap iterations | Configurable: 999 – 9,999 |
+| Intervalo de confianza | Configurable: 90%, 95%, 99% |
+| Rate limit | Dedicado, negociado (default: 2,000 req/min) |
+| SLA latencia (p99) | < 1,200ms para 500 vectores × 3072 dims, contractual |
+| Uptime SLA | 99.9% mensual |
+| Soporte | Slack dedicado + Technical Account Manager |
+| Facturación | Anual prepago con reconciliación trimestral de overage |
 
-Overhead de red + serialización: ~8 ms median
-Infraestructura (Uvicorn + load balancer + logging):
-  ~$0.000040 / operación a escala de 1M ops/mes en c6g.2xlarge
+**Capacidades exclusivas de Enterprise:**
 
-Margen bruto objetivo: 85%
-Precio mínimo para sostener margen: $0.000040 / (1 - 0.85) = $0.000267
-Precio publicado $0.0004 -> margen real ~90% en tramo base,
-  comprimiéndose a ~78% en tramo 1M-10M — aún sostenible.
-```
-
-El margen se comprime con volumen pero el flywheel de recalibración de alpha/beta se acelera: más volumen -> mejores pesos -> mayor NDCG -> menor churn -> justifica el descuento.
-
----
-
-## Métrica de valor para el developer
-
-La unidad de valor que comunica el pricing no es "por request" en abstracto — es **por decisión de ranking corregida estadísticamente**.
-
-En benchmarks BEIR (corpus heterogéneo, correlaciones no-lineales entre tokens y relevancia), el score compuesto NMI+Cosine con alpha calibrado por dominio supera al coseno puro en NDCG@10 entre +2.1 y +4.8 puntos porcentuales dependiendo del corpus. Para un sistema de RAG con 10 000 queries/día y precisión base del 70%, esa mejora se traduce en ~210-480 respuestas adicionales correctas por día — cada una potencialmente evitando una escalada de soporte o cerrando una conversión. El coste de esas 10 000 operaciones en Pro es $4/día.
-
-El argumento de venta no es el precio; es el coste de oportunidad de usar coseno puro.
+| Feature | Descripción técnica |
+|---|---|
+| `bin_calibration_profile` | Acceso al perfil de bin counts óptimos acumulado por el flywheel PostgreSQL para el rango de dimensionalidad del cliente — reduce la varianza del estimador H(X,Y) en embeddings de dominio específico |
+| `custom_discretization_method` | Opción de sustituir Freedman-Diaconis por Sturges o Scott rule para compatibilidad con pipelines legacy del cliente |
+| `batch_async_endpoint` | POST /v1/similarity/batch — hasta 10,000 pares en un job asíncrono con webhook de completion; Pro solo tiene el endpoint síncrono |
+| `audit_log_export` | JSONL firmado de cada llamada con inputs hash, outputs, y metadatos estadísticos — requerido por equipos de compliance en fintech/legaltech |
+| `private_deployment_option` | Imagen Docker certificada para VPC del cliente; el flywheel de bins no se comparte con el pool global pero sí se beneficia del seed inicial de distribuciones reales |
 
 ---
 
-## Invariantes del modelo
+## Comparativa de tiers
 
-1. **Nunca se cobra por almacenamiento** — la arquitectura stateless es tanto una decisión técnica como una promesa de pricing. Si en algún momento se introduce persistencia opcional, debe ser un tier separado con pricing separado, no una contaminación del modelo existente.
+| | Free | Pro | Enterprise |
+|---|---|---|---|
+| Precio | $0 | $0.004/call | Desde $2,400/año |
+| Llamadas/mes | 500 | Ilimitadas (prepago) | Ilimitadas (contractual) |
+| Dims máximas | 512 | 3,072 | 8,192+ |
+| Vectores/call | 20 | 500 | 2,000 |
+| Bootstrap iterations | 199 | 999 | 999–9,999 |
+| CI devuelto | 90% | 95% | Configurable |
+| p-value en response | Sí | Sí | Sí |
+| Bin calibration profile | Global seed | Global seed | Domain-specific |
+| Rate limit | 10 req/min | 300 req/min | Dedicado |
+| SLA | Best-effort | p95 < 800ms | p99 contractual |
+| Batch async | No | No | Sí |
+| Audit log export | No | No | Sí |
+| Soporte | Docs | Email 48h | Slack + TAM |
 
-2. **El batch descuenta latencia, no precio** — un batch de 128 pares cuesta 128 × $0.0004. El beneficio del batch es throughput y latencia reducida para el cliente, no descuento por unidad. Esto mantiene la métrica de precio limpia y predecible.
+---
 
-3. **Free nunca expone NMI directamente** — la opacidad del componente estadístico en Free es estructural, no una decisión de UX. Si el NMI se expone en Free, desaparece el diferencial técnico que justifica la conversión a Pro.
+## Mecanismo de overage (Pro)
 
-4. **Los pesos alpha/beta son versionados y auditables en Pro** — el campo `alpha` en la respuesta es el peso efectivo usado en esa llamada. Esto genera confianza técnica y permite al developer reproducir el score localmente con el coseno si audita una decisión específica — sin revelar la implementación del NMI.
+Créditos prepago nunca expiran. Si el saldo llega a cero, las llamadas continúan a la tarifa más alta ($0.0040/call) y se facturan a fin de mes con tarjeta registrada. Sin interrupciones de servicio por saldo agotado — el developer que tiene un script en producción no puede permitirse un corte.
+
+Umbral de alerta configurable vía webhook: cuando el saldo cae por debajo del valor definido por el usuario, se envía una notificación antes del corte de facturación.
+
+---
+
+## Rationale anti-commoditization
+
+El pricing no compite con Pinecone, Weaviate, ni Qdrant — esos productos cobran por almacenamiento y queries sobre índices persistidos. Este activo cobra por **el cómputo estadístico de significancia**, que no es substituible por ningún vector DB existente sin implementar el estimador de entropía conjunta con Freedman-Diaconis adaptativo.
+
+El riesgo de commoditización más real es que un developer implemente NMI con bins fijos (k=10) usando `sklearn.metrics.normalized_mutual_info_score` sobre histogramas hardcoded. Ese estimador produce NMI artificialmente alto en dimensiones de baja varianza (fenómeno documentado en Paninski 2003: el estimador plug-in sobreestima MI cuando el número de bins es fijo y la distribución marginal es casi determinista). El flywheel de distribuciones reales que ajusta B por rango de dimensionalidad es el foso técnico que hace que el p-value de este activo sea válido y el del competidor casero sea ruido estadístico — eso es lo que el pricing debe comunicar, y lo que justifica $0.004 sobre $0.
