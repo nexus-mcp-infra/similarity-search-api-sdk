@@ -1,274 +1,255 @@
-import hashlib
-import time
-import logging
+from fastapi import FastAPI, HTTPException, Depends, Security
+from fastapi.security.api_key import APIKeyHeader
+from pydantic import BaseModel, Field, model_validator
+from typing import Optional
 import numpy as np
-from fastapi import FastAPI, HTTPException, Security, Depends
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from pydantic import BaseModel, Field, field_validator, model_validator
-from scipy.stats import rankdata
-from sklearn.metrics import mutual_info_score
-from sklearn.preprocessing import KBinsDiscretizer
-from typing import Literal
+from scipy.stats import chi2_contingency
+from scipy.special import entr
 import os
-import json
-from datetime import datetime, timezone
+import time
+import hashlib
+import hmac
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("similarity_search_api")
+API_KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=False)
+VALID_API_KEYS = set(filter(None, os.environ.get("SIMILARITY_API_KEYS", "dev-key-local").split(",")))
 
 app = FastAPI(
-    title="Stateless Semantic Similarity API",
-    description="NMI+Cosine composite scoring without vector persistence",
+    title="NMI-Cosine Similarity API",
+    description="Hybrid NMI-cosine scoring with per-pair bootstrap p-values. Stateless — no vector persistence.",
     version="1.0.0",
 )
 
-security = HTTPBearer()
 
-DOMAIN_WEIGHTS: dict[str, dict[str, float]] = {
-    "text":     {"alpha": 0.62, "n_bins": 12},
-    "image":    {"alpha": 0.48, "n_bins": 16},
-    "tabular":  {"alpha": 0.35, "n_bins": 20},
-}
-
-MAX_DIM = 4096
-MIN_DIM = 2
-MAX_BATCH = 128
-
-
-def _validate_api_key(credentials: HTTPAuthorizationCredentials = Security(security)) -> str:
-    expected = os.environ.get("SIMILARITY_API_KEY", "")
-    if not expected:
-        raise HTTPException(status_code=500, detail="API key not configured on server")
-    if credentials.credentials != expected:
-        raise HTTPException(status_code=401, detail="Invalid or missing API key")
-    return credentials.credentials
-
-
-def _cosine_similarity(u: np.ndarray, v: np.ndarray) -> float:
-    norm_u = np.linalg.norm(u)
-    norm_v = np.linalg.norm(v)
-    if norm_u < 1e-12 or norm_v < 1e-12:
-        raise HTTPException(
-            status_code=422,
-            detail="One or both embeddings have near-zero norm; cosine similarity is undefined"
-        )
-    return float(np.dot(u, v) / (norm_u * norm_v))
-
-
-def _normalized_mutual_information(u: np.ndarray, v: np.ndarray, n_bins: int) -> float:
-    kbd = KBinsDiscretizer(n_bins=n_bins, encode="ordinal", strategy="quantile")
-    u_disc = kbd.fit_transform(u.reshape(-1, 1)).ravel().astype(int)
-    v_disc = kbd.fit_transform(v.reshape(-1, 1)).ravel().astype(int)
-    mi = mutual_info_score(u_disc, v_disc)
-    h_u = mutual_info_score(u_disc, u_disc)
-    h_v = mutual_info_score(v_disc, v_disc)
-    denom = 0.5 * (h_u + h_v)
-    if denom < 1e-12:
-        return 0.0
-    return float(np.clip(mi / denom, 0.0, 1.0))
-
-
-def _composite_score(cosine: float, nmi: float, alpha: float) -> float:
-    cosine_01 = (cosine + 1.0) / 2.0
-    return float(alpha * cosine_01 + (1.0 - alpha) * nmi)
-
-
-def _sha256_pair(vec_a: list[float], vec_b: list[float]) -> str:
-    payload = json.dumps({"a": vec_a[:8], "b": vec_b[:8]}, separators=(",", ":"))
-    return hashlib.sha256(payload.encode()).hexdigest()
-
-
-def _log_call(
-    pair_hash: str,
-    domain: str,
-    composite: float,
-    cosine: float,
-    nmi: float,
-    latency_ms: float,
-) -> None:
-    logger.info(
-        json.dumps({
-            "event": "similarity_call",
-            "pair_hash": pair_hash,
-            "domain": domain,
-            "composite": round(composite, 6),
-            "cosine": round(cosine, 6),
-            "nmi": round(nmi, 6),
-            "latency_ms": round(latency_ms, 3),
-            "ts": datetime.now(timezone.utc).isoformat(),
-        })
-    )
-
-
-class SimilarityRequest(BaseModel):
-    embedding_a: list[float] = Field(..., min_length=MIN_DIM, max_length=MAX_DIM)
-    embedding_b: list[float] = Field(..., min_length=MIN_DIM, max_length=MAX_DIM)
-    domain: Literal["text", "image", "tabular"] = Field(default="text")
+class EmbeddingPair(BaseModel):
+    query: list[float] = Field(..., min_length=2, max_length=4096, description="Query embedding vector.")
+    candidates: list[list[float]] = Field(..., min_length=1, max_length=256, description="Candidate embedding vectors to rank.")
+    bootstrap_samples: int = Field(default=499, ge=99, le=1999, description="Bootstrap iterations for p-value estimation. Higher = more precise, slower.")
+    alpha: float = Field(default=0.05, ge=0.001, le=0.5, description="Significance threshold for the returned confidence intervals.")
+    top_k: Optional[int] = Field(default=None, ge=1, le=256, description="Return only top-k results. None returns all candidates.")
 
     @model_validator(mode="after")
-    def check_equal_dimensions(self) -> "SimilarityRequest":
-        if len(self.embedding_a) != len(self.embedding_b):
-            raise ValueError(
-                f"embedding_a has {len(self.embedding_a)} dims but embedding_b has "
-                f"{len(self.embedding_b)} dims; they must match"
-            )
+    def validate_uniform_dimensionality(self) -> "EmbeddingPair":
+        dim = len(self.query)
+        for i, c in enumerate(self.candidates):
+            if len(c) != dim:
+                raise ValueError(f"Candidate {i} has dimension {len(c)}, expected {dim} (same as query).")
         return self
 
 
 class SimilarityResult(BaseModel):
-    composite_score: float
+    rank: int
+    candidate_index: int
     cosine_similarity: float
     nmi_score: float
-    domain: str
-    alpha: float
-    pair_hash: str
+    hybrid_score: float
+    p_value: float
+    ci_lower: float
+    ci_upper: float
+    significant: bool
+
+
+class SimilarityResponse(BaseModel):
+    results: list[SimilarityResult]
+    query_dim: int
+    n_candidates_evaluated: int
+    bootstrap_samples_used: int
     latency_ms: float
 
 
-class BatchSimilarityRequest(BaseModel):
-    pairs: list[SimilarityRequest] = Field(..., min_length=1, max_length=MAX_BATCH)
+class BatchRequest(BaseModel):
+    queries: list[EmbeddingPair] = Field(..., min_length=1, max_length=16)
 
 
-class BatchSimilarityResult(BaseModel):
-    results: list[SimilarityResult]
+class BatchResponse(BaseModel):
+    responses: list[SimilarityResponse]
     total_latency_ms: float
 
 
-class RankRequest(BaseModel):
-    query_embedding: list[float] = Field(..., min_length=MIN_DIM, max_length=MAX_DIM)
-    candidate_embeddings: list[list[float]] = Field(..., min_length=1, max_length=MAX_BATCH)
-    domain: Literal["text", "image", "tabular"] = Field(default="text")
-    top_k: int = Field(default=10, ge=1, le=MAX_BATCH)
-
-    @field_validator("candidate_embeddings")
-    @classmethod
-    def check_candidate_dims(cls, candidates: list[list[float]]) -> list[list[float]]:
-        lengths = {len(c) for c in candidates}
-        if len(lengths) > 1:
-            raise ValueError("All candidate embeddings must share the same dimensionality")
-        return candidates
-
-    @model_validator(mode="after")
-    def check_query_vs_candidates_dim(self) -> "RankRequest":
-        if self.candidate_embeddings:
-            cand_dim = len(self.candidate_embeddings[0])
-            if len(self.query_embedding) != cand_dim:
-                raise ValueError(
-                    f"query_embedding has {len(self.query_embedding)} dims but candidates "
-                    f"have {cand_dim} dims"
-                )
-        return self
+class HealthResponse(BaseModel):
+    status: str
+    version: str
 
 
-class RankedCandidate(BaseModel):
-    index: int
-    composite_score: float
-    cosine_similarity: float
-    nmi_score: float
+def _require_api_key(api_key: str = Security(API_KEY_HEADER)) -> str:
+    if not api_key or api_key not in VALID_API_KEYS:
+        raise HTTPException(status_code=401, detail="Invalid or missing X-API-Key header.")
+    return api_key
 
 
-class RankResult(BaseModel):
-    ranked: list[RankedCandidate]
-    domain: str
-    alpha: float
-    total_latency_ms: float
+def _freedman_diaconis_bins(data: np.ndarray) -> int:
+    n = len(data)
+    if n < 4:
+        return 2
+    iqr = np.percentile(data, 75) - np.percentile(data, 25)
+    if iqr < 1e-12:
+        return 2
+    bin_width = 2.0 * iqr * (n ** (-1.0 / 3.0))
+    data_range = data.max() - data.min()
+    if bin_width < 1e-12 or data_range < 1e-12:
+        return 2
+    n_bins = int(np.ceil(data_range / bin_width))
+    return max(2, min(n_bins, max(2, int(np.sqrt(n)))))
 
 
-def _compute_single(req: SimilarityRequest) -> tuple[SimilarityResult, float]:
+def _discretize_pair(v1: np.ndarray, v2: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    combined = np.stack([v1, v2], axis=0)
+    d1_bins = np.zeros(len(v1), dtype=np.int32)
+    d2_bins = np.zeros(len(v2), dtype=np.int32)
+    n_bins_per_dim = []
+    for dim_idx in range(len(v1)):
+        col = combined[:, dim_idx]
+        n_bins = _freedman_diaconis_bins(col)
+        edges = np.linspace(col.min() - 1e-12, col.max() + 1e-12, n_bins + 1)
+        d1_bins[dim_idx] = np.searchsorted(edges[1:], v1[dim_idx], side="left")
+        d2_bins[dim_idx] = np.searchsorted(edges[1:], v2[dim_idx], side="left")
+        n_bins_per_dim.append(n_bins)
+    return d1_bins, d2_bins
+
+
+def _joint_entropy_discrete(x_bins: np.ndarray, y_bins: np.ndarray, n_states_x: int, n_states_y: int) -> float:
+    joint_counts = np.zeros((n_states_x, n_states_y), dtype=np.float64)
+    for xi, yi in zip(x_bins, y_bins):
+        xi = min(xi, n_states_x - 1)
+        yi = min(yi, n_states_y - 1)
+        joint_counts[xi, yi] += 1.0
+    total = joint_counts.sum()
+    if total < 1e-12:
+        return 0.0
+    p_joint = joint_counts / total
+    return float(np.sum(entr(p_joint)))
+
+
+def _marginal_entropy(bins: np.ndarray, n_states: int) -> float:
+    counts = np.bincount(np.clip(bins, 0, n_states - 1), minlength=n_states).astype(np.float64)
+    total = counts.sum()
+    if total < 1e-12:
+        return 0.0
+    p = counts / total
+    return float(np.sum(entr(p)))
+
+
+def _compute_nmi(v1: np.ndarray, v2: np.ndarray) -> float:
+    d1, d2 = _discretize_pair(v1, v2)
+    n_states = max(d1.max(), d2.max()) + 1
+    h_x = _marginal_entropy(d1, n_states)
+    h_y = _marginal_entropy(d2, n_states)
+    h_xy = _joint_entropy_discrete(d1, d2, n_states, n_states)
+    denom = (h_x + h_y)
+    if denom < 1e-12:
+        return 0.0
+    mi = max(0.0, h_x + h_y - h_xy)
+    nmi = mi / (0.5 * denom)
+    return float(np.clip(nmi, 0.0, 1.0))
+
+
+def _cosine_similarity(v1: np.ndarray, v2: np.ndarray) -> float:
+    n1 = np.linalg.norm(v1)
+    n2 = np.linalg.norm(v2)
+    if n1 < 1e-12 or n2 < 1e-12:
+        return 0.0
+    return float(np.dot(v1, v2) / (n1 * n2))
+
+
+def _bootstrap_nmi_pvalue(
+    v1: np.ndarray,
+    v2: np.ndarray,
+    observed_nmi: float,
+    n_bootstrap: int,
+    alpha: float,
+    rng: np.random.Generator,
+) -> tuple[float, float, float]:
+    null_nmis = np.empty(n_bootstrap, dtype=np.float64)
+    for b in range(n_bootstrap):
+        v2_permuted = rng.permutation(v2)
+        null_nmis[b] = _compute_nmi(v1, v2_permuted)
+    p_value = float(np.mean(null_nmis >= observed_nmi))
+    half_alpha = alpha / 2.0
+    ci_lower = float(np.percentile(null_nmis, 100.0 * half_alpha))
+    ci_upper = float(np.percentile(null_nmis, 100.0 * (1.0 - half_alpha)))
+    return p_value, ci_lower, ci_upper
+
+
+def _run_similarity_search(payload: EmbeddingPair) -> SimilarityResponse:
     t0 = time.perf_counter()
-    weights = DOMAIN_WEIGHTS[req.domain]
-    alpha = weights["alpha"]
-    n_bins = weights["n_bins"]
-    u = np.array(req.embedding_a, dtype=np.float64)
-    v = np.array(req.embedding_b, dtype=np.float64)
-    cosine = _cosine_similarity(u, v)
-    nmi = _normalized_mutual_information(u, v, n_bins)
-    composite = _composite_score(cosine, nmi, alpha)
-    latency_ms = (time.perf_counter() - t0) * 1000.0
-    pair_hash = _sha256_pair(req.embedding_a, req.embedding_b)
-    _log_call(pair_hash, req.domain, composite, cosine, nmi, latency_ms)
-    result = SimilarityResult(
-        composite_score=round(composite, 6),
-        cosine_similarity=round(cosine, 6),
-        nmi_score=round(nmi, 6),
-        domain=req.domain,
-        alpha=alpha,
-        pair_hash=pair_hash,
-        latency_ms=round(latency_ms, 3),
-    )
-    return result, latency_ms
+    query = np.array(payload.query, dtype=np.float64)
+    candidates = [np.array(c, dtype=np.float64) for c in payload.candidates]
+    rng = np.random.default_rng(seed=int(hashlib.md5(query.tobytes()).hexdigest()[:8], 16))
 
-
-@app.post("/v1/similarity", response_model=SimilarityResult, tags=["core"])
-def compute_pairwise_similarity(
-    req: SimilarityRequest,
-    _: str = Depends(_validate_api_key),
-) -> SimilarityResult:
-    result, _ = _compute_single(req)
-    return result
-
-
-@app.post("/v1/similarity/batch", response_model=BatchSimilarityResult, tags=["core"])
-def compute_pairwise_similarity_batch(
-    req: BatchSimilarityRequest,
-    _: str = Depends(_validate_api_key),
-) -> BatchSimilarityResult:
-    t_batch = time.perf_counter()
-    results = []
-    for pair in req.pairs:
-        result, _ = _compute_single(pair)
-        results.append(result)
-    total_ms = (time.perf_counter() - t_batch) * 1000.0
-    return BatchSimilarityResult(results=results, total_latency_ms=round(total_ms, 3))
-
-
-@app.post("/v1/rank", response_model=RankResult, tags=["core"])
-def rank_candidates_by_composite_score(
-    req: RankRequest,
-    _: str = Depends(_validate_api_key),
-) -> RankResult:
-    t0 = time.perf_counter()
-    weights = DOMAIN_WEIGHTS[req.domain]
-    alpha = weights["alpha"]
-    n_bins = weights["n_bins"]
-    q = np.array(req.query_embedding, dtype=np.float64)
-    scored: list[tuple[int, float, float, float]] = []
-    for idx, cand in enumerate(req.candidate_embeddings):
-        c = np.array(cand, dtype=np.float64)
-        cosine = _cosine_similarity(q, c)
-        nmi = _normalized_mutual_information(q, c, n_bins)
-        composite = _composite_score(cosine, nmi, alpha)
-        scored.append((idx, composite, cosine, nmi))
-    scored.sort(key=lambda x: x[1], reverse=True)
-    top = scored[: req.top_k]
-    total_ms = (time.perf_counter() - t0) * 1000.0
-    ranked = [
-        RankedCandidate(
-            index=i,
-            composite_score=round(comp, 6),
-            cosine_similarity=round(cos, 6),
-            nmi_score=round(nmi, 6),
+    results: list[SimilarityResult] = []
+    for idx, cand in enumerate(candidates):
+        cosine = _cosine_similarity(query, cand)
+        nmi = _compute_nmi(query, cand)
+        hybrid = 0.5 * cosine + 0.5 * nmi
+        p_value, ci_lower, ci_upper = _bootstrap_nmi_pvalue(
+            query, cand, nmi, payload.bootstrap_samples, payload.alpha, rng
         )
-        for i, comp, cos, nmi in top
-    ]
-    return RankResult(
-        ranked=ranked,
-        domain=req.domain,
-        alpha=alpha,
-        total_latency_ms=round(total_ms, 3),
+        results.append(
+            SimilarityResult(
+                rank=0,
+                candidate_index=idx,
+                cosine_similarity=round(cosine, 6),
+                nmi_score=round(nmi, 6),
+                hybrid_score=round(hybrid, 6),
+                p_value=round(p_value, 6),
+                ci_lower=round(ci_lower, 6),
+                ci_upper=round(ci_upper, 6),
+                significant=p_value < payload.alpha,
+            )
+        )
+
+    results.sort(key=lambda r: r.hybrid_score, reverse=True)
+    top_k = payload.top_k if payload.top_k is not None else len(results)
+    results = results[:top_k]
+    for rank, r in enumerate(results, start=1):
+        r.rank = rank
+
+    latency_ms = round((time.perf_counter() - t0) * 1000.0, 3)
+    return SimilarityResponse(
+        results=results,
+        query_dim=len(query),
+        n_candidates_evaluated=len(candidates),
+        bootstrap_samples_used=payload.bootstrap_samples,
+        latency_ms=latency_ms,
     )
 
 
-@app.get("/v1/domain-weights", tags=["meta"])
-def get_domain_calibration_weights(
-    _: str = Depends(_validate_api_key),
-) -> dict:
-    return {
-        domain: {"alpha": cfg["alpha"], "beta": round(1.0 - cfg["alpha"], 4), "n_bins": cfg["n_bins"]}
-        for domain, cfg in DOMAIN_WEIGHTS.items()
-    }
+@app.get("/health", response_model=HealthResponse, tags=["meta"])
+def health_check() -> HealthResponse:
+    return HealthResponse(status="ok", version="1.0.0")
 
 
-@app.get("/healthz", include_in_schema=False)
-def health_check() -> dict:
-    return {"status": "ok", "version": "1.0.0"}
+@app.post("/search", response_model=SimilarityResponse, tags=["core"])
+def nmi_cosine_search(
+    payload: EmbeddingPair,
+    _api_key: str = Depends(_require_api_key),
+) -> SimilarityResponse:
+    if not payload.query:
+        raise HTTPException(status_code=422, detail="query vector must not be empty.")
+    if not payload.candidates:
+        raise HTTPException(status_code=422, detail="candidates list must not be empty.")
+    return _run_similarity_search(payload)
+
+
+@app.post("/batch", response_model=BatchResponse, tags=["core"])
+def nmi_cosine_batch_search(
+    batch: BatchRequest,
+    _api_key: str = Depends(_require_api_key),
+) -> BatchResponse:
+    t0 = time.perf_counter()
+    responses = [_run_similarity_search(q) for q in batch.queries]
+    total_ms = round((time.perf_counter() - t0) * 1000.0, 3)
+    return BatchResponse(responses=responses, total_latency_ms=total_ms)
+
+
+@app.post("/score", response_model=SimilarityResult, tags=["core"])
+def score_single_pair(
+    payload: EmbeddingPair,
+    _api_key: str = Depends(_require_api_key),
+) -> SimilarityResult:
+    if len(payload.candidates) != 1:
+        raise HTTPException(
+            status_code=422,
+            detail="/score accepts exactly 1 candidate. Use /search for multiple candidates.",
+        )
+    response = _run_similarity_search(payload)
+    return response.results[0]
