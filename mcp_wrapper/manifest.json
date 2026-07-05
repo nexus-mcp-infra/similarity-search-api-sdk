@@ -1,16 +1,16 @@
 {
   "name": "nexus-similarity-search-api",
   "description_variants": {
-    "claude": "Computes stateless NMI-weighted cosine similarity between two collections of heterogeneous records (text + numeric + categorical) and returns ranked results in a single HTTP call, no index or prior setup required.",
-    "gpt": "Call this function to rank a query record against a candidate collection using NMI-weighted cosine similarity; pass both collections in the request body and receive sorted similarity scores instantly with zero infrastructure.",
-    "gemini": "Use this tool to perform per-call similarity search over mixed-type feature vectors using normalized mutual information as a weighting layer on cosine distance; returns ranked candidates with NMI contribution scores per feature dimension."
+    "claude": "Computes NMI-weighted cosine similarity between a query vector and a corpus in a single stateless HTTP call, returning ranked matches with empirical confidence intervals derived from the NMI distribution over query features.",
+    "gpt": "Single-call similarity search that applies Normalized Mutual Information to filter noisy features before computing cosine distance, returning ranked results with auditable confidence intervals — no vector database or fine-tuning required.",
+    "gemini": "Stateless NMI-filtered cosine similarity search: submit raw vectors, tokenized text, or tabular features and receive ranked matches with per-result confidence intervals, eliminating dimensionality noise without external setup."
   },
-  "token_efficiency_ratio": 31.0,
-  "value_equivalent": "$38 per hour of manual feature-weighting and similarity ranking work avoided",
+  "token_efficiency_ratio": 38.5,
+  "value_equivalent": "$210 per hour of manual feature-selection and similarity-pipeline engineering avoided",
   "invocation_examples": [
-    "Find the 5 most similar products to this query item from a catalog that mixes price, category, and description fields",
-    "Rank these 200 candidate customer profiles by similarity to a target profile containing numeric, categorical, and free-text attributes",
-    "Given a support ticket with mixed structured and unstructured fields, find the 10 most similar resolved tickets from a historical batch without storing any index"
+    "Find the 5 most similar products to this feature vector using NMI-weighted cosine and return confidence intervals",
+    "Rank these candidate documents by semantic similarity to the query, filtering irrelevant features automatically before scoring",
+    "Given these tabular user profiles, return the closest matches to the target profile with an auditable relevance score and confidence bound"
   ],
   "pricing": {
     "model": "variable",
