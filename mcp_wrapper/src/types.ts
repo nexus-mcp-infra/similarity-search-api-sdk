@@ -22,30 +22,39 @@ export class CoreServiceError extends Error {
   }
 }
 
-export interface RankHybridSimilarityInput {
-  query: string;
-  corpus: string;
+export interface RankByNmiWeightedCosineInput {
+  query_vector: number[];
+  candidate_vectors: number[][];
+  candidate_ids: string[];
+  nmi_bins?: number | undefined;
   top_k?: number | undefined;
-  score_breakdown?: boolean | undefined;
 }
 
-export interface ComputePairwiseHybridMatrixInput {
-  records: string;
-  include_diagonal?: boolean | undefined;
+export interface ComputePairwiseNmiMatrixInput {
+  vectors: number[][];
+  nmi_bins?: number | undefined;
+  normalize_weights?: boolean | undefined;
 }
 
-export interface ExplainFeatureWeightCalibrationInput {
-  sample_records: string;
+export interface ScoreHeterogeneousPairInput {
+  vector_a: number[];
+  vector_b: number[];
+  nmi_bins?: number | undefined;
+  return_dimension_weights?: boolean | undefined;
 }
 
-export interface FilterByHybridThresholdInput {
-  query: string;
-  corpus: string;
-  min_hybrid_score: number;
-  score_breakdown?: boolean | undefined;
+export interface FilterCandidatesByNmiThresholdInput {
+  query_vector: number[];
+  candidate_vectors: number[][];
+  candidate_ids: string[];
+  min_score_threshold: number;
+  nmi_bins?: number | undefined;
 }
 
-export interface DetectFeatureTypeSchemaInput {
-  sample_records: string;
-  override_types?: string | undefined;
+export interface BenchmarkNmiVsCosineDeltaInput {
+  query_vector: number[];
+  candidate_vectors: number[][];
+  candidate_ids: string[];
+  nmi_bins?: number | undefined;
+  top_k?: number | undefined;
 }
