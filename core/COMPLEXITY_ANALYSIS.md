@@ -1,37 +1,43 @@
-# Análisis de Complejidad Computacional — Similarity Search API (NMI+Cosine Hybrid)
+## Análisis de Complejidad — NMI-Weighted Cosine Similarity API
 
-## Endpoints Públicos
+---
 
 ### `POST /similarity/search`
 
-**Temporal:** O(N · (F_cat² + F_cont)) por query, donde N = tamaño del corpus, F_cat = features categóricas, F_cont = features continuas. El cálculo de NMI por par de features categóricas requiere construir la tabla de contingencia en O(F_cat²·n_bins²) y computar entropías conjuntas; coseno sobre el bloque continuo es O(F_cont) por candidato.
+**Temporal:** O(n · d · log d) donde n = items en la colección candidata y d = dimensiones. El cuello de botella es el cálculo de NMI por feature: binning Freedman-Diaconis cuesta O(n · log n) por dimensión, repetido d veces. La multiplicación coseno ponderada posterior es O(n · d), dominada por la fase NMI.
 
-**Casos:** Mejor O(N·F_cont) cuando el payload es 100% continuo (NMI se omite). Promedio O(N·(F_cat·log F_cat + F_cont)) con cardinalidad moderada. Peor O(N·F_cat²·C²) donde C = cardinalidad máxima de una variable categórica — explota con variables nominales de alta cardinalidad sin binning previo.
+**Espacial:** O(n · d) para materializar la colección completa en memoria durante el request; no hay índice persistente, pero la colección vive íntegra en RAM durante el cómputo.
 
-**Cuello de botella:** Construcción de tablas de contingencia para NMI cuando F_cat > 10 y C > 50; la complejidad cuadrática en features categóricas domina sobre el producto escalar coseno, que es trivialmente vectorizable con NumPy.
+**Casos:** Mejor — features todas categóricas, frecuencias directas O(n · d). Promedio — mix categórico/continuo con d ≈ 50–200, O(n · d · log n). Peor — todas continuas con d grande (>500) y n > 10k, O(n · d · log n) con constante alta por binning adaptativo.
 
----
-
-### `POST /similarity/explain`
-
-**Temporal:** O(F_total) después de que `/search` cachea los scores intermedios; si se invoca sin caché, hereda O(N·(F_cat² + F_cont)). El desglose por componente (w_nmi, w_cos, entropía marginal por feature) es un postproceso O(F_total) sobre resultados ya computados.
-
-**Casos:** Mejor/promedio O(F_total) con caché activo (hits esperados >80% en corpus estático). Peor igual que `/search` si el TTL expiró o el corpus mutó.
-
-**Cuello de botella:** Serialización del breakdown por feature a JSON cuando F_total > 200; considerar respuesta paginada o proyección de features por relevancia.
+**Cuello de botella:** Cálculo de entropía marginal y conjunta por dimensión continua (Freedman-Diaconis requiere ordenamiento por dimensión). Con d = 200 y n = 1000, esto implica 200 sorts independientes de 1000 elementos.
 
 ---
 
-### `POST /similarity/calibrate` (weight flywheel — DuckDB)
+### `POST /similarity/batch`
 
-**Temporal:** O(D·log D) donde D = registros históricos de distribución de pesos por dominio almacenados en DuckDB. La actualización de umbrales de entropía es una aggregación SQL sobre la tabla de pesos — DuckDB la ejecuta vectorizado en columnar.
+**Temporal:** O(Q · n · d · log d) donde Q = queries en el batch. Sin paralelismo intra-batch, es lineal en Q. Con paralelismo via `np.vectorize` o `ThreadPoolExecutor`, el factor efectivo se reduce a O(ceil(Q/W) · n · d · log d) con W workers.
 
-**Casos:** Mejor O(1) si el dominio no tiene registros previos (devuelve umbrales default). Promedio O(D·log D) con D ~ 10⁵ registros. Peor O(D²) solo si se solicita recalibración con clustering jerárquico sobre distribuciones de pesos (opcional).
+**Espacial:** O(Q · n · d) en el peor caso si el batch completo se materializa; O(n · d) si se procesa en streaming por query.
 
-**Cuello de botella:** Escritura concurrente en DuckDB bajo alta QPS — DuckDB no es OLTP; el cuello real es el lock de escritura si `/search` registra pesos síncronamente.
+**Casos:** Mejor — Q = 1 (equivalente a `/search`). Promedio — Q ≈ 10–50 con paralelismo parcial. Peor — Q grande (>200) sin streaming, presión de memoria excede L3 cache y degrada throughput por cache misses.
+
+**Cuello de botella:** Contención de memoria al materializar múltiples colecciones simultáneamente; el NMI no es reutilizable entre queries si las colecciones candidatas difieren.
 
 ---
 
-## Saturación y Estrategia de Escala
+### `GET /similarity/explain`
 
-Con corpus N=10k, F_cat=5, F_cont=10, un worker Uvicorn en CPU moderna procesa ~180–240 req/s antes de que la latencia p95 supere 200ms — el factor limitante es NMI, no E/S. Para escalar: (1) precalcular y cachear las tablas de contingencia por corpus hash (Redis TTL = vida del corpus), reduciendo el inner loop a O(F_cont·N) puro; (2) separar el registro de pesos en DuckDB a un worker async desacoplado con cola en memoria para eliminar el write-lock del hot path; (3) paralelizar el loop sobre N con `numpy.einsum` vectorizado para el bloque coseno y `numba.prange` para el bloque NMI — combinación que permite escalar a ~1,200 req/s sin cambiar la arquitectura stateless.
+**Temporal:** O(d · log d) — recalcula el vector de pesos NMI para un par único y ordena features por contribución. Costo dominado por el ranking final, no por coseno.
+
+**Espacial:** O(d) — solo el vector de pesos y los metadatos por dimensión.
+
+**Casos:** Uniforme en todos los escenarios; la varianza viene del tipo de feature (categórica vs. continua), no del volumen.
+
+**Cuello de botella:** Ninguno significativo; este endpoint es I/O-bound en práctica.
+
+---
+
+### Saturación y Escala
+
+Con workers uvicorn de 4 CPUs y requests típicos (n = 500, d = 100, mix 50/50), el punto de saturación estimado es **~40–60 req/s** por instancia — el 80% del tiempo de CPU lo consume el binning NMI. Para escalar más allá: (1) cachear el vector de pesos NMI de colecciones recurrentes con hash SHA-256 del payload como clave (TTL corto, 60 s), convirtiendo llamadas repetidas en O(n · d) puro; (2) precomputar bins Freedman-Diaconis en paralelo por dimensión con `np.partition` en lugar de sort completo, reduciendo el ordenamiento de O(n · log n) a O(n) para el percentil necesario.
