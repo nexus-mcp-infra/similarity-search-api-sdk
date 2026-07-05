@@ -1,113 +1,151 @@
 # Similarity Search API
 
-Find the most relevant items in any collection — text, numeric, categorical, or mixed — with a single HTTP call. No vector database. No index setup. No infrastructure.
+NMI-weighted cosine similarity in a single HTTP call. No vector database. No setup. No fine-tuning.
+
+---
+
+## Install
 
 ```bash
 pip install similarity-search-sdk
 ```
 
+## Search in 3 lines
+
 ```python
 from similarity_search import SimilarityClient
 
-client = SimilarityClient(api_key="sk_live_...")
-results = client.search(query={"name": "espresso machine", "price": 89.99, "category": "kitchen"}, collection=products)
-```
-
-```json
-[{"id": "prod_482", "score": 0.94}, {"id": "prod_219", "score": 0.87}]
+client = SimilarityClient(api_key="sk_test_xxxxxxxxxxxxxxxx")
+results = client.search(query={"text": "transformer architecture"}, corpus=[...])
+# -> [{"id": "doc_42", "score": 0.91, "confidence_interval": [0.87, 0.94]}]
 ```
 
 ---
 
-## Why not cosine alone?
+## Why not build it yourself?
 
-Cosine similarity assumes all features contribute equally and linearly. That assumption breaks the moment your data mixes text descriptions, numeric prices, and categorical labels in the same record — which is most real-world data.
-
-This API uses **NMI-weighted cosine**: Normalized Mutual Information measures the statistical dependence between each feature dimension and the query target, including non-linear dependencies that cosine never sees. Features that actually predict relevance get higher weight. Features that are noise get downweighted automatically, per request.
-
-```
-sim(a, b) = cosine(w * a, w * b)
-
-where w_i = NMI(X_i, Y)
-      NMI estimated via Freedman-Diaconis binning (continuous features)
-      or direct frequency counts (categorical features)
-```
-
-Complexity: **O(n * d * log d)** per call, where `n` = items in your collection and `d` = feature dimensions. No index amortization needed — the math is fast enough to be stateless.
+| What you'd need to build | This API |
+|---|---|
+| Vector DB (Pinecone, Weaviate, Qdrant) + infra setup | Zero infra. Stateless per call. |
+| Manual feature selection before embedding | NMI filter runs automatically on your payload |
+| Cosine similarity without statistical grounding | Score includes auditable confidence interval |
+| Separate pipelines for text vs. tabular vs. vector inputs | One endpoint, all three input types |
+| Days of prototyping before first result | Working in under 5 minutes |
 
 ---
 
-## The problem with every alternative
+## The problem with Cosine alone
 
-| Approach | What you get | What you give up |
-|---|---|---|
-| Pinecone / Weaviate / Qdrant | Fast ANN at scale | Vector DB setup, index management, storage costs, vendor lock-in |
-| scikit-learn cosine | Works locally | No NMI weighting, no API, you own the infra |
-| Manual NMI + cosine | Full control | 3–5 days of entropy estimation code, binning edge cases, normalization bugs |
-| **Similarity Search API** | NMI-weighted results, one HTTP call | Nothing — no infra, no index, no state |
+Cosine similarity treats every dimension equally. In high-dimensional spaces — embeddings, tabular features, tokenized text — most dimensions are noise. Noise inflates similarity scores between unrelated items and collapses them between related ones.
 
-**Configuring a full vector database to compare 500 products in a shopping cart is over-engineering.** NMI is not a native metric in any mainstream vector DB — every team that wants it today writes their own post-processing layer and maintains it forever. This API makes that layer a single `POST /search`.
+```
+Without NMI filter:  query "revenue forecast" -> matches "weather forecast"  (score: 0.82)
+With NMI filter:     query "revenue forecast" -> matches "Q3 financial model" (score: 0.89, CI: [0.85, 0.92])
+```
 
----
+This API runs Normalized Mutual Information over the features present in your request payload — query + corpus — before computing cosine distance. Features with low statistical dependence to the query are down-weighted. The result is a distance metric that reflects structure, not just angle.
 
-## Zero infrastructure, zero lock-in
-
-The API is **fully stateless**. Your data travels in the request body and nowhere else. There is no index to populate before your first query, no async ingestion pipeline, no schema migration when your product schema changes. Change your feature set between calls with no consequences.
-
-This is the architectural difference: every competitor's business model is built on storing your vectors. Ours is built on computing the right answer faster than it takes to set up storage.
+The confidence interval is not a heuristic. It is derived from the empirical distribution of NMI scores across your corpus, so you can tell the difference between a strong match and a coincidental one.
 
 ---
 
 ## Endpoint
 
 ```
-POST https://api.similaritysearch.dev/v1/search
-Authorization: Bearer sk_live_...
+POST https://api.similarity.nexus/v1/search
+Authorization: Bearer sk_test_xxxxxxxxxxxxxxxx
+Content-Type: application/json
 ```
 
 ```json
 {
   "query": {
-    "description": "noise cancelling headphones",
-    "price": 249.00,
-    "brand": "Sony",
-    "in_stock": true
+    "text": "annual recurring revenue growth"
   },
-  "collection": [
-    {"id": "p1", "description": "wireless earbuds", "price": 199.00, "brand": "Sony", "in_stock": true},
-    {"id": "p2", "description": "gaming headset", "price": 89.00, "brand": "Razer", "in_stock": false}
+  "corpus": [
+    {"id": "doc_1", "text": "SaaS revenue metrics and ARR expansion"},
+    {"id": "doc_2", "text": "rainfall patterns in the Amazon basin"},
+    {"id": "doc_3", "features": [0.12, 0.87, 0.34, 0.65]}
   ],
-  "top_k": 10
+  "top_k": 3
 }
 ```
 
 ```json
 {
   "results": [
-    {"id": "p1", "score": 0.91, "rank": 1},
-    {"id": "p2", "score": 0.43, "rank": 2}
+    {
+      "id": "doc_1",
+      "score": 0.934,
+      "confidence_interval": [0.901, 0.958],
+      "nmi_retained_features": 18
+    }
   ],
-  "meta": {
-    "nmi_weights": {"description": 0.72, "price": 0.61, "brand": 0.88, "in_stock": 0.34},
-    "latency_ms": 18,
-    "items_scored": 2
-  }
+  "latency_ms": 34,
+  "nmi_computed_features": 42
 }
 ```
 
-The `nmi_weights` field in every response shows you exactly which features drove the ranking. No black box.
+---
+
+## Input types
+
+| Type | Field | Example |
+|---|---|---|
+| Raw text | `"text"` | `"transformer architecture"` |
+| Pre-computed vector | `"vector"` | `[0.12, 0.87, ..., 0.34]` |
+| Tabular features | `"features"` | `[1200.0, 0.43, 7, 0.91]` |
+
+Mix types within the same corpus. The NMI pipeline normalizes across representations before computing distance.
+
+---
+
+## Confidence interval explained
+
+After computing NMI scores for all features in your corpus, the API fits an empirical distribution over those scores. The confidence interval on the final similarity result reflects where that match lands relative to the full distribution — not a fixed threshold, not a model output. If the interval is narrow and high, the match is structurally unambiguous. If it is wide, you have genuine uncertainty that should inform downstream decisions.
+
+This is the property that makes the score **auditable**: given the same payload, any implementation of NMI-weighted cosine will produce the same interval.
 
 ---
 
 ## Pricing
 
-| Volume | Price |
+| Calls / month | Price per call |
 |---|---|
-| First 10,000 calls/month | Free |
-| 10,001 – 500,000 calls/month | $0.0008 per call |
-| 500,001+ calls/month | $0.0004 per call |
+| First 10,000 | Free |
+| 10,001 - 500,000 | $0.0008 |
+| 500,001+ | $0.0004 |
 
-Per call. No seat licenses. No storage fees. No minimum commitment.
+No base fee. No seat license. Pay per search operation.
+
+---
+
+## When to use this instead of a vector database
+
+Use this API when:
+- Your dataset is under 100k items and standing up a vector DB is more infrastructure than problem
+- You need a confidence-grounded similarity score, not just a ranking
+- You are combining text, numeric, and vector inputs in the same search space
+- You are prototyping and need a result today, not after a data pipeline is built
+
+Use a dedicated vector database when:
+- You are running ANN search over tens of millions of vectors with sub-10ms SLA requirements
+- Your access pattern is purely retrieval with no need for statistical grounding on the score
+
+---
+
+## Auth
+
+All requests require a Bearer token in the `Authorization` header.
+
+```bash
+curl -X POST https://api.similarity.nexus/v1/search \
+  -H "Authorization: Bearer sk_test_xxxxxxxxxxxxxxxx" \
+  -H "Content-Type: application/json" \
+  -d '{"query": {"text": "example"}, "corpus": [{"id": "1", "text": "sample document"}], "top_k": 1}'
+```
+
+Get your API key at [similarity.nexus/dashboard](https://similarity.nexus/dashboard).
 
 ---
 
@@ -115,27 +153,7 @@ Per call. No seat licenses. No storage fees. No minimum commitment.
 
 ```bash
 pip install similarity-search-sdk   # Python
-npm install @similarity-search/sdk  # Node.js
+npm install @nexus/similarity-search  # Node
 ```
 
-```python
-from similarity_search import SimilarityClient
-
-client = SimilarityClient(api_key="sk_live_...")
-
-# Search
-results = client.search(query=my_product, collection=catalog, top_k=5)
-
-# Inspect feature weights the API computed
-print(results.meta.nmi_weights)
-```
-
-Full SDK reference -> [docs.similaritysearch.dev/sdk](https://docs.similaritysearch.dev/sdk)
-
----
-
-## Get your API key
-
-[docs.similaritysearch.dev](https://docs.similaritysearch.dev) -> Dashboard -> New Key
-
-First key activates in 30 seconds. No credit card required for the free tier.
+Full SDK reference at [similarity.nexus/docs](https://similarity.nexus/docs).
