@@ -9,19 +9,19 @@ import { callCore } from "./coreClient.js";
 import { CoreServiceError } from "./types.js";
 import { CHARACTER_LIMIT } from "./constants.js";
 import {
-  RankByNmiCosineHybridInputSchema,   ComputePairwiseNmiMatrixInputSchema,   EstimateCorpusEntropyProfileInputSchema,   ScoreCandidatePairNmiCosineInputSchema,   BatchRankMultiqueryNmiCosineInputSchema,
+  RankHybridSimilarityInputSchema,   ComputePairwiseHybridMatrixInputSchema,   ExplainFeatureWeightCalibrationInputSchema,   FilterByHybridThresholdInputSchema,   DetectFeatureTypeSchemaInputSchema,
 } from "./schemas.js";
 import type {
-  RankByNmiCosineHybridInput,   ComputePairwiseNmiMatrixInput,   EstimateCorpusEntropyProfileInput,   ScoreCandidatePairNmiCosineInput,   BatchRankMultiqueryNmiCosineInput,
+  RankHybridSimilarityInput,   ComputePairwiseHybridMatrixInput,   ExplainFeatureWeightCalibrationInput,   FilterByHybridThresholdInput,   DetectFeatureTypeSchemaInput,
 } from "./types.js";
 
 export function registerTools(server: McpServer): void {
 
   server.registerTool(
-    "nexus_similarity_search_api_rank_by_nmi_cosine_hybrid",
+    "nexus_similarity_search_api_rank_hybrid_similarity",
     {
-      title: "NMI-Cosine Hybrid Ranking",
-      description: `Ranks a corpus of raw items (text, discrete categories, or integer time series) against a query using a weighted hybrid of Normalized Mutual Information and cosine similarity, where weights are determined adaptively by the marginal entropy of the corpus. Use when your data has non-linear statistical dependencies that cosine alone would miss, or when working with categorical/discrete distributions without a prebuilt embedding index. Do NOT use for continuous high-dimensional float vectors already embedded — cosine-only is faster and sufficient in that case; do NOT use if corpus exceeds 10,000 items per call (use batch endpoint instead).
+      title: "Hybrid NMI+Cosine Ranking",
+      description: `Ranks a corpus of records by hybrid similarity to a query record, fusing NMI for categorical/discrete features and cosine similarity for continuous features into a single adaptive-weighted score. Use when your payload contains a mix of categorical and numeric fields and you need ranked results with per-component score explanation. Do NOT use for pure text embedding search, for corpora larger than 50,000 records per call, or when you need persistent index storage between calls.
 
 Returns (JSON):
 {
@@ -33,7 +33,7 @@ Error handling:
   - Throws with a clear message if the core service is unreachable, times out,
     or returns a non-2xx status. The message includes the upstream request_id
     when available, for support correlation.`,
-      inputSchema: RankByNmiCosineHybridInputSchema,
+      inputSchema: RankHybridSimilarityInputSchema,
       annotations: {
         readOnlyHint: true,
         destructiveHint: false,
@@ -41,12 +41,12 @@ Error handling:
         openWorldHint: false,
       },
     },
-    async ({ query, corpus, data_modality, top_k, nmi_weight_override }: RankByNmiCosineHybridInput) => {
+    async ({ query, corpus, top_k, score_breakdown }: RankHybridSimilarityInput) => {
       try {
         const output = await callCore<Record<string, unknown>>(
-          "/v1/similarity/rank-hybrid",
+          "/v1/similarity/rank",
           "POST",
-          { query, corpus, data_modality, top_k, nmi_weight_override },
+          { query, corpus, top_k, score_breakdown },
         );
 
         const text = JSON.stringify(output, null, 2);
@@ -66,7 +66,7 @@ Error handling:
           return {
             content: [{
               type: "text" as const,
-              text: `Error calling nexus_similarity_search_api_rank_by_nmi_cosine_hybrid (${err.code}): ${err.message}` +
+              text: `Error calling nexus_similarity_search_api_rank_hybrid_similarity (${err.code}): ${err.message}` +
                 (err.requestId ? ` [request_id=${err.requestId}]` : ""),
             }],
             isError: true,
@@ -77,10 +77,10 @@ Error handling:
     },
   );
   server.registerTool(
-    "nexus_similarity_search_api_compute_pairwise_nmi_matrix",
+    "nexus_similarity_search_api_compute_pairwise_hybrid_matrix",
     {
-      title: "Pairwise NMI Matrix",
-      description: `Computes the full N x N Normalized Mutual Information matrix for a set of raw items, returning both the matrix and per-item marginal entropy values. Use for clustering preparation, feature selection diagnostics, or any downstream task that needs the full dependency structure of a corpus rather than a ranked list against a single query. Do NOT use as a ranking primitive — this is O(N^2) and intended for offline analysis, not per-request retrieval. Do NOT call with more than 500 items; use the batch endpoint for larger corpora.
+      title: "Pairwise Hybrid Similarity Matrix",
+      description: `Computes the full N×N hybrid similarity matrix for a set of records using the same NMI+cosine adaptive fusion. Use for clustering preprocessing, graph construction, or any workflow that needs all pairwise distances in one call. Do NOT use when N > 2000 (O(N^2) complexity becomes prohibitive) or when you only need a single query ranked against a corpus — use rank_hybrid_similarity instead.
 
 Returns (JSON):
 {
@@ -92,7 +92,7 @@ Error handling:
   - Throws with a clear message if the core service is unreachable, times out,
     or returns a non-2xx status. The message includes the upstream request_id
     when available, for support correlation.`,
-      inputSchema: ComputePairwiseNmiMatrixInputSchema,
+      inputSchema: ComputePairwiseHybridMatrixInputSchema,
       annotations: {
         readOnlyHint: true,
         destructiveHint: false,
@@ -100,12 +100,12 @@ Error handling:
         openWorldHint: false,
       },
     },
-    async ({ items, data_modality, return_marginal_entropies }: ComputePairwiseNmiMatrixInput) => {
+    async ({ records, include_diagonal }: ComputePairwiseHybridMatrixInput) => {
       try {
         const output = await callCore<Record<string, unknown>>(
-          "/v1/similarity/pairwise-nmi-matrix",
+          "/v1/similarity/matrix",
           "POST",
-          { items, data_modality, return_marginal_entropies },
+          { records, include_diagonal },
         );
 
         const text = JSON.stringify(output, null, 2);
@@ -125,7 +125,7 @@ Error handling:
           return {
             content: [{
               type: "text" as const,
-              text: `Error calling nexus_similarity_search_api_compute_pairwise_nmi_matrix (${err.code}): ${err.message}` +
+              text: `Error calling nexus_similarity_search_api_compute_pairwise_hybrid_matrix (${err.code}): ${err.message}` +
                 (err.requestId ? ` [request_id=${err.requestId}]` : ""),
             }],
             isError: true,
@@ -136,10 +136,10 @@ Error handling:
     },
   );
   server.registerTool(
-    "nexus_similarity_search_api_estimate_corpus_entropy_profile",
+    "nexus_similarity_search_api_explain_feature_weight_calibration",
     {
-      title: "Corpus Entropy Profile",
-      description: `Computes the marginal entropy of each item in a corpus and the joint entropy distribution across the full set, returning the entropy-based NMI weight that rank_by_nmi_cosine_hybrid would apply automatically. Use to audit or preview the adaptive weighting before committing to a ranking call, or to detect degenerate corpora where all items have near-zero entropy (making NMI unreliable). Do NOT use as a substitute for ranking — this endpoint only returns entropy diagnostics, not similarity scores.
+      title: "Feature Weight Calibration Explanation",
+      description: `Given a sample of records, returns the adaptive weight assigned to each feature under the NMI+cosine fusion model: marginal entropy for categoricals, L2 norm variance for numerics, and the resulting nmi_weight/cosine_weight split. Use for auditing or understanding why the model weights features as it does before running a large ranking job. Do NOT use as a substitute for actual similarity computation — weights here are descriptive, not prescriptive overrides.
 
 Returns (JSON):
 {
@@ -151,7 +151,7 @@ Error handling:
   - Throws with a clear message if the core service is unreachable, times out,
     or returns a non-2xx status. The message includes the upstream request_id
     when available, for support correlation.`,
-      inputSchema: EstimateCorpusEntropyProfileInputSchema,
+      inputSchema: ExplainFeatureWeightCalibrationInputSchema,
       annotations: {
         readOnlyHint: true,
         destructiveHint: false,
@@ -159,12 +159,12 @@ Error handling:
         openWorldHint: false,
       },
     },
-    async ({ corpus, data_modality }: EstimateCorpusEntropyProfileInput) => {
+    async ({ sample_records }: ExplainFeatureWeightCalibrationInput) => {
       try {
         const output = await callCore<Record<string, unknown>>(
-          "/v1/similarity/corpus-entropy-profile",
+          "/v1/similarity/calibration",
           "POST",
-          { corpus, data_modality },
+          { sample_records },
         );
 
         const text = JSON.stringify(output, null, 2);
@@ -184,7 +184,7 @@ Error handling:
           return {
             content: [{
               type: "text" as const,
-              text: `Error calling nexus_similarity_search_api_estimate_corpus_entropy_profile (${err.code}): ${err.message}` +
+              text: `Error calling nexus_similarity_search_api_explain_feature_weight_calibration (${err.code}): ${err.message}` +
                 (err.requestId ? ` [request_id=${err.requestId}]` : ""),
             }],
             isError: true,
@@ -195,10 +195,10 @@ Error handling:
     },
   );
   server.registerTool(
-    "nexus_similarity_search_api_score_candidate_pair_nmi_cosine",
+    "nexus_similarity_search_api_filter_by_hybrid_threshold",
     {
-      title: "Single Pair NMI-Cosine Score",
-      description: `Computes the NMI score, cosine score, and hybrid weighted score for exactly one (query, candidate) pair without needing a full corpus. Entropy-based weight is estimated from the pair's joint distribution alone (no corpus marginal). Use for spot-checks, unit-level debugging of scoring logic, or integration tests where you need a deterministic score for a known pair. Do NOT use in production ranking loops — call rank_by_nmi_cosine_hybrid instead, which benefits from corpus-level entropy calibration that this endpoint cannot provide for isolated pairs.
+      title: "Threshold-Based Hybrid Similarity Filter",
+      description: `Returns all corpus records whose hybrid similarity to the query exceeds a minimum threshold, without ranking. Use when you need a membership decision (similar/not-similar) rather than a ranked list, e.g., deduplication, near-duplicate detection, or candidate set construction. Do NOT use when you need a ranked ordering — rank_hybrid_similarity is more appropriate. Do NOT use with thresholds below 0.05 on high-cardinality categorical corpora, as recall will be near-total and the result set will be unmanageably large.
 
 Returns (JSON):
 {
@@ -210,7 +210,7 @@ Error handling:
   - Throws with a clear message if the core service is unreachable, times out,
     or returns a non-2xx status. The message includes the upstream request_id
     when available, for support correlation.`,
-      inputSchema: ScoreCandidatePairNmiCosineInputSchema,
+      inputSchema: FilterByHybridThresholdInputSchema,
       annotations: {
         readOnlyHint: true,
         destructiveHint: false,
@@ -218,12 +218,12 @@ Error handling:
         openWorldHint: false,
       },
     },
-    async ({ item_a, item_b, data_modality, nmi_weight_override }: ScoreCandidatePairNmiCosineInput) => {
+    async ({ query, corpus, min_hybrid_score, score_breakdown }: FilterByHybridThresholdInput) => {
       try {
         const output = await callCore<Record<string, unknown>>(
-          "/v1/similarity/score-pair",
+          "/v1/similarity/filter",
           "POST",
-          { item_a, item_b, data_modality, nmi_weight_override },
+          { query, corpus, min_hybrid_score, score_breakdown },
         );
 
         const text = JSON.stringify(output, null, 2);
@@ -243,7 +243,7 @@ Error handling:
           return {
             content: [{
               type: "text" as const,
-              text: `Error calling nexus_similarity_search_api_score_candidate_pair_nmi_cosine (${err.code}): ${err.message}` +
+              text: `Error calling nexus_similarity_search_api_filter_by_hybrid_threshold (${err.code}): ${err.message}` +
                 (err.requestId ? ` [request_id=${err.requestId}]` : ""),
             }],
             isError: true,
@@ -254,10 +254,10 @@ Error handling:
     },
   );
   server.registerTool(
-    "nexus_similarity_search_api_batch_rank_multiquery_nmi_cosine",
+    "nexus_similarity_search_api_detect_feature_type_schema",
     {
-      title: "Multi-Query Batch Hybrid Ranking",
-      description: `Executes NMI-Cosine hybrid ranking for multiple queries against a shared corpus in a single request, sharing corpus entropy computation across all queries to reduce total cost. Use when you need to rank the same corpus against 2 or more queries simultaneously (e.g., multi-faceted retrieval, ensemble query expansion). Do NOT use for a single query — rank_by_nmi_cosine_hybrid is cheaper. Do NOT use when each query has a different corpus — this endpoint assumes one shared corpus across all queries.
+      title: "Automatic Feature Type Detection",
+      description: `Analyzes a sample of records and returns the inferred type (categorical or continuous) and entropy/variance statistics for each feature key, exactly as the similarity engine would classify them internally. Use before a ranking or filtering call to validate that the engine will treat your features as intended, especially for ambiguous fields (e.g., integer codes that should be categorical). Do NOT use as a general-purpose schema inference tool — it only classifies features into the two types the similarity model supports.
 
 Returns (JSON):
 {
@@ -269,7 +269,7 @@ Error handling:
   - Throws with a clear message if the core service is unreachable, times out,
     or returns a non-2xx status. The message includes the upstream request_id
     when available, for support correlation.`,
-      inputSchema: BatchRankMultiqueryNmiCosineInputSchema,
+      inputSchema: DetectFeatureTypeSchemaInputSchema,
       annotations: {
         readOnlyHint: true,
         destructiveHint: false,
@@ -277,12 +277,12 @@ Error handling:
         openWorldHint: false,
       },
     },
-    async ({ queries, corpus, data_modality, top_k, nmi_weight_override }: BatchRankMultiqueryNmiCosineInput) => {
+    async ({ sample_records, override_types }: DetectFeatureTypeSchemaInput) => {
       try {
         const output = await callCore<Record<string, unknown>>(
-          "/v1/similarity/batch-rank-multiquery",
+          "/v1/similarity/schema",
           "POST",
-          { queries, corpus, data_modality, top_k, nmi_weight_override },
+          { sample_records, override_types },
         );
 
         const text = JSON.stringify(output, null, 2);
@@ -302,7 +302,7 @@ Error handling:
           return {
             content: [{
               type: "text" as const,
-              text: `Error calling nexus_similarity_search_api_batch_rank_multiquery_nmi_cosine (${err.code}): ${err.message}` +
+              text: `Error calling nexus_similarity_search_api_detect_feature_type_schema (${err.code}): ${err.message}` +
                 (err.requestId ? ` [request_id=${err.requestId}]` : ""),
             }],
             isError: true,
