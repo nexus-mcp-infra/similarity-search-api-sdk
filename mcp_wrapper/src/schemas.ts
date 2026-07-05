@@ -1,38 +1,40 @@
 import { z } from "zod";
 
-export const RankByNmiWeightedCosineInputSchema = z.object({
-  query_vector: z.array(z.number()).min(2).max(4096).describe("Dense numeric representation of the query item. Must match dimensionality of all candidate vectors."),
-  candidate_vectors: z.array(z.array(z.number())).describe("Collection of candidate dense vectors to rank against the query. Each row must have the same length as query_vector."),
-  candidate_ids: z.array(z.string()).describe("Stable identifiers for each candidate vector, returned in ranked output. Must be same length as candidate_vectors."),
-  nmi_bins: z.number().min(3).max(50).default(10).describe("Number of histogram bins used when estimating marginal and joint distributions for NMI computation per feature dimension. Higher values increase precision for continuous features but raise compute cost. Recommended range 5-20."),
-  top_k: z.number().min(1).max(500).default(10).describe("Maximum number of ranked results to return. Results are sorted descending by NMI-weighted cosine score."),
+export const RankVectorsByNmiCosineInputSchema = z.object({
+  query_vector: z.array(z.number()).min(2).max(8192).describe("Query vector as a flat list of floats. Must match dimensionality of all corpus vectors."),
+  corpus_vectors: z.array(z.array(z.number())).describe("List of candidate vectors to rank. Each inner list must have the same length as query_vector. Maximum 50,000 rows."),
+  nmi_threshold: z.number().min(0.0).max(1.0).default(0.1).describe("Minimum NMI score [0.0\u20131.0] a feature dimension must achieve to be included in cosine computation. Higher values are more aggressive at dropping noisy features. Recommended range 0.05\u20130.30."),
+  top_k: z.number().min(1).max(50000).default(10).describe("Number of top-ranked results to return. Must be between 1 and the corpus size."),
+  confidence_level: z.number().min(0.8).max(0.99).default(0.95).describe("Confidence level for the returned similarity score interval, derived from empirical NMI distribution. Typical values: 0.90, 0.95, 0.99."),
 }).strict();
 
-export const ComputePairwiseNmiMatrixInputSchema = z.object({
-  vectors: z.array(z.array(z.number())).describe("Collection of vectors from which feature-level NMI weights are derived. Each row is one sample; each column is one feature dimension."),
-  nmi_bins: z.number().min(3).max(50).default(10).describe("Histogram bins per feature dimension used to estimate joint and marginal distributions. Increase for continuous features with wide range, decrease for near-binary features."),
-  normalize_weights: z.boolean().default(true).describe("If true, returns NMI values normalized to [0,1] per dimension pair. If false, returns raw joint entropy ratios. Set true when you intend to feed output directly into rank_by_nmi_weighted_cosine as custom weights."),
+export const ComputeTokenizedCorpusSimilarityInputSchema = z.object({
+  query_token_features: z.array(z.number()).min(2).max(131072).describe("Query document represented as a feature vector over vocabulary (e.g., TF-IDF weights or binary term presence). Length defines vocabulary size."),
+  corpus_token_features: z.array(z.array(z.number())).describe("Corpus documents as feature vectors over the same vocabulary as query_token_features. All rows must share vocabulary length."),
+  nmi_bins: z.number().min(5).max(50).default(10).describe("Number of histogram bins used when discretizing continuous feature values to compute NMI. Higher bins increase NMI resolution but add compute cost. Meaningful range: 5\u201350."),
+  top_k: z.number().min(1).max(20000).default(10).describe("Number of top-ranked results to return."),
+  confidence_level: z.number().min(0.8).max(0.99).default(0.95).describe("Confidence level for the returned per-result similarity confidence interval."),
 }).strict();
 
-export const ScoreHeterogeneousPairInputSchema = z.object({
-  vector_a: z.array(z.number()).min(2).max(4096).describe("First dense vector of the pair. Treated as query in the NMI weight derivation."),
-  vector_b: z.array(z.number()).min(2).max(4096).describe("Second dense vector of the pair. Must match dimensionality of vector_a."),
-  nmi_bins: z.number().min(3).max(50).default(10).describe("Histogram bins used to estimate per-dimension marginal distributions from the two vectors. Lower values smooth distributions; higher values respect fine structure."),
-  return_dimension_weights: z.boolean().default(false).describe("If true, the response includes the NMI weight assigned to each feature dimension, enabling full score decomposition."),
+export const ExtractNmiFeatureWeightsInputSchema = z.object({
+  query_vector: z.array(z.number()).min(2).max(8192).describe("Query vector defining the reference distribution for NMI computation across corpus dimensions."),
+  corpus_vectors: z.array(z.array(z.number())).describe("Corpus used to estimate the empirical feature distributions needed for NMI. Same shape constraints as rank_vectors_by_nmi_cosine."),
+  nmi_bins: z.number().min(5).max(50).default(10).describe("Number of histogram bins for NMI discretization. Consistent with the bins used in downstream ranking calls."),
+  return_top_n_dimensions: z.number().min(1).max(8192).optional().describe("Return only the top-N highest-NMI feature indices and their scores, sorted descending. Returns all dimensions if omitted."),
 }).strict();
 
-export const FilterCandidatesByNmiThresholdInputSchema = z.object({
-  query_vector: z.array(z.number()).min(2).max(4096).describe("Dense query vector. Must match dimensionality of all candidate vectors."),
-  candidate_vectors: z.array(z.array(z.number())).describe("Collection of candidate dense vectors to evaluate against the threshold."),
-  candidate_ids: z.array(z.string()).describe("Stable identifiers for each candidate vector. Must be same length as candidate_vectors."),
-  min_score_threshold: z.number().min(0.0).max(1.0).describe("Minimum NMI-weighted cosine score [0.0, 1.0] a candidate must reach to be included in the response. Values below 0.3 may return very large result sets on heterogeneous collections."),
-  nmi_bins: z.number().min(3).max(50).default(10).describe("Histogram bins for NMI estimation per feature dimension."),
+export const CompareTabularRowSimilarityInputSchema = z.object({
+  query_row: z.array(z.number()).min(2).max(4096).describe("Single query row as a list of numerically encoded feature values. Length must equal number of columns in corpus_rows."),
+  corpus_rows: z.array(z.array(z.number())).describe("Tabular corpus where each row is a candidate record with the same feature schema as query_row."),
+  column_names: z.array(z.string()).optional().describe("Optional column labels for each feature position. Used only for interpretability in the response payload \u2014 does not affect computation. Must match query_row length if provided."),
+  nmi_threshold: z.number().min(0.0).max(1.0).default(0.05).describe("Minimum NMI score for a column to participate in cosine similarity. For tabular data with many correlated columns, values of 0.05\u20130.15 are typical."),
+  top_k: z.number().min(1).max(50000).default(10).describe("Number of most-similar rows to return, ranked by NMI-weighted cosine score."),
+  confidence_level: z.number().min(0.8).max(0.99).default(0.95).describe("Confidence level for similarity score intervals."),
 }).strict();
 
-export const BenchmarkNmiVsCosineDeltaInputSchema = z.object({
-  query_vector: z.array(z.number()).min(2).max(4096).describe("Dense query vector used in both cosine and NMI-weighted cosine evaluations."),
-  candidate_vectors: z.array(z.array(z.number())).describe("Collection of candidate dense vectors to rank under both metrics."),
-  candidate_ids: z.array(z.string()).describe("Stable identifiers for each candidate. Must be same length as candidate_vectors."),
-  nmi_bins: z.number().min(3).max(50).default(10).describe("Histogram bins for NMI estimation. Applies only to the NMI-weighted cosine branch of the benchmark."),
-  top_k: z.number().min(2).max(200).default(20).describe("Number of top candidates to include in the delta comparison output. Full collection is still ranked internally."),
+export const EstimateSimilarityConfidenceBandInputSchema = z.object({
+  similarity_scores: z.array(z.number()).min(1).max(50000).describe("List of raw NMI-weighted cosine similarity scores from a prior ranking call, in [\u22121.0, 1.0]."),
+  nmi_weight_distribution: z.array(z.number()).min(2).max(131072).describe("Per-dimension NMI weights used to produce the scores. Returned by extract_nmi_feature_weights or included in rank_vectors_by_nmi_cosine response."),
+  confidence_level: z.number().min(0.8).max(0.99).default(0.95).describe("Target confidence level for the output bands. Can differ from the level used in the original ranking call."),
+  bootstrap_iterations: z.number().min(100).max(5000).default(500).describe("Number of bootstrap resampling iterations for band estimation. Higher values reduce Monte Carlo variance at compute cost. Range 100\u20135000."),
 }).strict();
