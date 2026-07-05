@@ -22,36 +22,30 @@ export class CoreServiceError extends Error {
   }
 }
 
-export interface RankByNmiCosineHybridInput {
+export interface RankHybridSimilarityInput {
   query: string;
-  corpus: string[];
-  data_modality: string;
+  corpus: string;
   top_k?: number | undefined;
-  nmi_weight_override?: number | undefined;
+  score_breakdown?: boolean | undefined;
 }
 
-export interface ComputePairwiseNmiMatrixInput {
-  items: string[];
-  data_modality: string;
-  return_marginal_entropies?: boolean | undefined;
+export interface ComputePairwiseHybridMatrixInput {
+  records: string;
+  include_diagonal?: boolean | undefined;
 }
 
-export interface EstimateCorpusEntropyProfileInput {
-  corpus: string[];
-  data_modality: string;
+export interface ExplainFeatureWeightCalibrationInput {
+  sample_records: string;
 }
 
-export interface ScoreCandidatePairNmiCosineInput {
-  item_a: string;
-  item_b: string;
-  data_modality: string;
-  nmi_weight_override?: number | undefined;
+export interface FilterByHybridThresholdInput {
+  query: string;
+  corpus: string;
+  min_hybrid_score: number;
+  score_breakdown?: boolean | undefined;
 }
 
-export interface BatchRankMultiqueryNmiCosineInput {
-  queries: string[];
-  corpus: string[];
-  data_modality: string;
-  top_k?: number | undefined;
-  nmi_weight_override?: number | undefined;
+export interface DetectFeatureTypeSchemaInput {
+  sample_records: string;
+  override_types?: string | undefined;
 }
