@@ -9,10 +9,10 @@ import { callCore } from "./coreClient.js";
 import { CoreServiceError } from "./types.js";
 import { CHARACTER_LIMIT } from "./constants.js";
 import {
-  RankEmbeddingsByNmiCosineInputSchema,   ComputePairwiseNmiCosineMatrixInputSchema,   ScoreEmbeddingPairNmiCosineInputSchema,   CalibrateDomainNmiCosineWeightsInputSchema,   ExplainNmiCosineRankDivergenceInputSchema,
+  RankEmbeddingsByNmiCosineInputSchema,   EstimatePairwiseNmiMatrixInputSchema,   ScoreCandidatePairSignificanceInputSchema,   DetectEmbeddingDimensionRedundancyInputSchema,   CalibrateNmiCosineWeightForCorpusInputSchema,
 } from "./schemas.js";
 import type {
-  RankEmbeddingsByNmiCosineInput,   ComputePairwiseNmiCosineMatrixInput,   ScoreEmbeddingPairNmiCosineInput,   CalibrateDomainNmiCosineWeightsInput,   ExplainNmiCosineRankDivergenceInput,
+  RankEmbeddingsByNmiCosineInput,   EstimatePairwiseNmiMatrixInput,   ScoreCandidatePairSignificanceInput,   DetectEmbeddingDimensionRedundancyInput,   CalibrateNmiCosineWeightForCorpusInput,
 } from "./types.js";
 
 export function registerTools(server: McpServer): void {
@@ -20,8 +20,8 @@ export function registerTools(server: McpServer): void {
   server.registerTool(
     "nexus_similarity_search_api_rank_embeddings_by_nmi_cosine",
     {
-      title: "NMI+Cosine Composite Ranking",
-      description: `Ranks a set of candidate embeddings against a query embedding using a weighted NMI+Cosine composite score calibrated per domain. Use when you need stateless semantic similarity ranking without a vector index or upsert step, especially when candidate correlations are non-linear. Do NOT use if you have a persistent vector store already indexed — latency will be higher than ANN retrieval for corpora above 50k vectors.
+      title: "NMI-Cosine Hybrid Ranking",
+      description: `Ranks a corpus of embeddings against a query vector using a hybrid score that combines cosine similarity with Normalized Mutual Information (NMI) computed via joint-entropy estimation over discretized embedding dimensions. Returns per-pair p-values from bootstrap confidence intervals. Use when you need statistically validated similarity rankings where you must distinguish real dependency patterns from random correlation. Do NOT use for real-time latency-sensitive paths (>500 vectors adds bootstrap overhead), for pure nearest-neighbor ANN tasks where p-values are irrelevant, or when corpus vectors are fewer than 10 (bootstrap intervals become unreliable).
 
 Returns (JSON):
 {
@@ -41,12 +41,12 @@ Error handling:
         openWorldHint: false,
       },
     },
-    async ({ query_embedding, candidate_embeddings, domain, top_k, return_scores }: RankEmbeddingsByNmiCosineInput) => {
+    async ({ query_vector, corpus_vectors, corpus_ids, discretization_bins, bootstrap_iterations, top_k, alpha, filter_insignificant, nmi_cosine_weight }: RankEmbeddingsByNmiCosineInput) => {
       try {
         const output = await callCore<Record<string, unknown>>(
-          "/v1/similarity/rank",
+          "/v1/similarity/rank-nmi-cosine",
           "POST",
-          { query_embedding, candidate_embeddings, domain, top_k, return_scores },
+          { query_vector, corpus_vectors, corpus_ids, discretization_bins, bootstrap_iterations, top_k, alpha, filter_insignificant, nmi_cosine_weight },
         );
 
         const text = JSON.stringify(output, null, 2);
@@ -77,10 +77,10 @@ Error handling:
     },
   );
   server.registerTool(
-    "nexus_similarity_search_api_compute_pairwise_nmi_cosine_matrix",
+    "nexus_similarity_search_api_estimate_pairwise_nmi_matrix",
     {
-      title: "Pairwise NMI+Cosine Matrix",
-      description: `Computes the full N×N composite similarity matrix for a set of embeddings. Use for clustering preprocessing, graph construction, or reranking pipelines where every pair needs a score. Do NOT use for query-vs-corpus ranking (use rank_embeddings_by_nmi_cosine instead) — cost is O(N²) and grows quadratically.
+      title: "Pairwise NMI Matrix Estimation",
+      description: `Computes the full N×N Normalized Mutual Information matrix for a set of embeddings, returning each cell's NMI score along with a bootstrap-derived p-value under the null hypothesis H0: NMI=0 (independence). Use for clustering pre-analysis, redundancy detection across a document set, or graph-of-similarity construction where edge weights must be statistically grounded. Do NOT use when N > 80 — O(N^2 * bootstrap_iterations) cost makes it prohibitive; use rank_embeddings_by_nmi_cosine in batches instead. Not suitable as a real-time retrieval path.
 
 Returns (JSON):
 {
@@ -92,7 +92,7 @@ Error handling:
   - Throws with a clear message if the core service is unreachable, times out,
     or returns a non-2xx status. The message includes the upstream request_id
     when available, for support correlation.`,
-      inputSchema: ComputePairwiseNmiCosineMatrixInputSchema,
+      inputSchema: EstimatePairwiseNmiMatrixInputSchema,
       annotations: {
         readOnlyHint: true,
         destructiveHint: false,
@@ -100,12 +100,12 @@ Error handling:
         openWorldHint: false,
       },
     },
-    async ({ embeddings, domain, normalize_output }: ComputePairwiseNmiCosineMatrixInput) => {
+    async ({ vectors, vector_ids, discretization_bins, bootstrap_iterations, alpha }: EstimatePairwiseNmiMatrixInput) => {
       try {
         const output = await callCore<Record<string, unknown>>(
-          "/v1/similarity/pairwise-matrix",
+          "/v1/similarity/pairwise-nmi-matrix",
           "POST",
-          { embeddings, domain, normalize_output },
+          { vectors, vector_ids, discretization_bins, bootstrap_iterations, alpha },
         );
 
         const text = JSON.stringify(output, null, 2);
@@ -125,7 +125,7 @@ Error handling:
           return {
             content: [{
               type: "text" as const,
-              text: `Error calling nexus_similarity_search_api_compute_pairwise_nmi_cosine_matrix (${err.code}): ${err.message}` +
+              text: `Error calling nexus_similarity_search_api_estimate_pairwise_nmi_matrix (${err.code}): ${err.message}` +
                 (err.requestId ? ` [request_id=${err.requestId}]` : ""),
             }],
             isError: true,
@@ -136,10 +136,10 @@ Error handling:
     },
   );
   server.registerTool(
-    "nexus_similarity_search_api_score_embedding_pair_nmi_cosine",
+    "nexus_similarity_search_api_score_candidate_pair_significance",
     {
-      title: "Single-Pair NMI+Cosine Score",
-      description: `Returns the decomposed composite similarity score (NMI component, cosine component, weighted composite) for exactly one pair of embeddings. Use for debugging, threshold calibration, or audit trails where you need interpretable component breakdown. Do NOT use in batch loops — use rank_embeddings_by_nmi_cosine or compute_pairwise_nmi_cosine_matrix for multiple pairs; per-call overhead makes looping expensive.
+      title: "Single-Pair NMI Significance Score",
+      description: `Computes the hybrid NMI-cosine score and bootstrap p-value for exactly one (query, candidate) embedding pair. Use when you already have a candidate from an external ANN index and need to validate whether the cosine similarity reflects a real statistical dependency — i.e., post-retrieval significance gating. Do NOT use to rank a corpus (use rank_embeddings_by_nmi_cosine instead); calling this in a loop over hundreds of candidates is wasteful because it cannot amortize discretization costs across the corpus.
 
 Returns (JSON):
 {
@@ -151,7 +151,7 @@ Error handling:
   - Throws with a clear message if the core service is unreachable, times out,
     or returns a non-2xx status. The message includes the upstream request_id
     when available, for support correlation.`,
-      inputSchema: ScoreEmbeddingPairNmiCosineInputSchema,
+      inputSchema: ScoreCandidatePairSignificanceInputSchema,
       annotations: {
         readOnlyHint: true,
         destructiveHint: false,
@@ -159,12 +159,12 @@ Error handling:
         openWorldHint: false,
       },
     },
-    async ({ embedding_a, embedding_b, domain }: ScoreEmbeddingPairNmiCosineInput) => {
+    async ({ vector_a, vector_b, discretization_bins, bootstrap_iterations, nmi_cosine_weight }: ScoreCandidatePairSignificanceInput) => {
       try {
         const output = await callCore<Record<string, unknown>>(
-          "/v1/similarity/pair-score",
+          "/v1/similarity/pair-significance",
           "POST",
-          { embedding_a, embedding_b, domain },
+          { vector_a, vector_b, discretization_bins, bootstrap_iterations, nmi_cosine_weight },
         );
 
         const text = JSON.stringify(output, null, 2);
@@ -184,7 +184,7 @@ Error handling:
           return {
             content: [{
               type: "text" as const,
-              text: `Error calling nexus_similarity_search_api_score_embedding_pair_nmi_cosine (${err.code}): ${err.message}` +
+              text: `Error calling nexus_similarity_search_api_score_candidate_pair_significance (${err.code}): ${err.message}` +
                 (err.requestId ? ` [request_id=${err.requestId}]` : ""),
             }],
             isError: true,
@@ -195,10 +195,10 @@ Error handling:
     },
   );
   server.registerTool(
-    "nexus_similarity_search_api_calibrate_domain_nmi_cosine_weights",
+    "nexus_similarity_search_api_detect_embedding_dimension_redundancy",
     {
-      title: "Domain Weight Calibration",
-      description: `Derives optimal alpha_nmi and alpha_cosine weights for a custom embedding domain by fitting the composite scorer to a labeled relevance dataset you supply. Use when 'text', 'image', and 'tabular' presets underperform on your specific embedding model or corpus distribution. Do NOT use at inference time — run once offline and cache the returned weight profile; recalibrate only when the embedding model changes.
+      title: "Embedding Dimension Redundancy Detector",
+      description: `Identifies redundant dimensions within a single embedding space by computing pairwise NMI across all D*(D-1)/2 dimension pairs of the provided sample vectors, returning clusters of highly dependent dimensions (NMI above threshold) and a suggested reduced dimensionality. Use before building a similarity pipeline to prune embedding dimensions that carry no additional information — reduces downstream NMI estimation variance and cosine noise. Do NOT use for embeddings with D > 256 (quadratic in D); not intended for runtime retrieval calls, only for offline embedding space analysis.
 
 Returns (JSON):
 {
@@ -210,20 +210,20 @@ Error handling:
   - Throws with a clear message if the core service is unreachable, times out,
     or returns a non-2xx status. The message includes the upstream request_id
     when available, for support correlation.`,
-      inputSchema: CalibrateDomainNmiCosineWeightsInputSchema,
+      inputSchema: DetectEmbeddingDimensionRedundancyInputSchema,
       annotations: {
-        readOnlyHint: false,
+        readOnlyHint: true,
         destructiveHint: false,
-        idempotentHint: false,
+        idempotentHint: true,
         openWorldHint: false,
       },
     },
-    async ({ anchor_embeddings, positive_embeddings, negative_embeddings, domain_label }: CalibrateDomainNmiCosineWeightsInput) => {
+    async ({ sample_vectors, redundancy_nmi_threshold, discretization_bins, alpha }: DetectEmbeddingDimensionRedundancyInput) => {
       try {
         const output = await callCore<Record<string, unknown>>(
-          "/v1/similarity/calibrate-weights",
+          "/v1/similarity/dimension-redundancy",
           "POST",
-          { anchor_embeddings, positive_embeddings, negative_embeddings, domain_label },
+          { sample_vectors, redundancy_nmi_threshold, discretization_bins, alpha },
         );
 
         const text = JSON.stringify(output, null, 2);
@@ -243,7 +243,7 @@ Error handling:
           return {
             content: [{
               type: "text" as const,
-              text: `Error calling nexus_similarity_search_api_calibrate_domain_nmi_cosine_weights (${err.code}): ${err.message}` +
+              text: `Error calling nexus_similarity_search_api_detect_embedding_dimension_redundancy (${err.code}): ${err.message}` +
                 (err.requestId ? ` [request_id=${err.requestId}]` : ""),
             }],
             isError: true,
@@ -254,10 +254,10 @@ Error handling:
     },
   );
   server.registerTool(
-    "nexus_similarity_search_api_explain_nmi_cosine_rank_divergence",
+    "nexus_similarity_search_api_calibrate_nmi_cosine_weight_for_corpus",
     {
-      title: "NMI vs Cosine Rank Divergence Report",
-      description: `Given a query and candidates, returns a divergence report showing where NMI-informed ranking differs from pure-cosine ranking and why — quantifying non-linear dependency contribution per candidate. Use when auditing model behavior, justifying ranking decisions to stakeholders, or diagnosing unexpected rank positions. Do NOT use in latency-sensitive inference paths — this runs both rankers plus divergence attribution and is 2-3x slower than rank_embeddings_by_nmi_cosine alone.
+      title: "NMI-Cosine Weight Calibrator",
+      description: `Given a labeled calibration set of (query, positive_candidate, negative_candidate) triplets and their embeddings, finds the optimal nmi_cosine_weight w that maximizes separation between positive and negative pairs under the hybrid scoring function, reporting the optimal w with its bootstrap confidence interval and the resulting AUC-ROC. Use once before deploying rank_embeddings_by_nmi_cosine on a specific embedding model and domain to select the best w rather than using the default 0.5. Do NOT use as a runtime call per request — this is a one-time offline calibration step. Requires labeled triplets; if no labels are available, skip and use the default weight.
 
 Returns (JSON):
 {
@@ -269,7 +269,7 @@ Error handling:
   - Throws with a clear message if the core service is unreachable, times out,
     or returns a non-2xx status. The message includes the upstream request_id
     when available, for support correlation.`,
-      inputSchema: ExplainNmiCosineRankDivergenceInputSchema,
+      inputSchema: CalibrateNmiCosineWeightForCorpusInputSchema,
       annotations: {
         readOnlyHint: true,
         destructiveHint: false,
@@ -277,12 +277,12 @@ Error handling:
         openWorldHint: false,
       },
     },
-    async ({ query_embedding, candidate_embeddings, domain, top_k }: ExplainNmiCosineRankDivergenceInput) => {
+    async ({ triplets, weight_search_grid_size, discretization_bins, bootstrap_iterations }: CalibrateNmiCosineWeightForCorpusInput) => {
       try {
         const output = await callCore<Record<string, unknown>>(
-          "/v1/similarity/rank-divergence",
+          "/v1/similarity/calibrate-hybrid-weight",
           "POST",
-          { query_embedding, candidate_embeddings, domain, top_k },
+          { triplets, weight_search_grid_size, discretization_bins, bootstrap_iterations },
         );
 
         const text = JSON.stringify(output, null, 2);
@@ -302,7 +302,7 @@ Error handling:
           return {
             content: [{
               type: "text" as const,
-              text: `Error calling nexus_similarity_search_api_explain_nmi_cosine_rank_divergence (${err.code}): ${err.message}` +
+              text: `Error calling nexus_similarity_search_api_calibrate_nmi_cosine_weight_for_corpus (${err.code}): ${err.message}` +
                 (err.requestId ? ` [request_id=${err.requestId}]` : ""),
             }],
             isError: true,
