@@ -1,34 +1,37 @@
-# Análisis de Complejidad Computacional — Similarity Search API (NMI-Hybrid)
+# Análisis de Complejidad Computacional — Similarity Search API (NMI+Cosine Hybrid)
 
-## Notación base
-- `n` = ítems en corpus, `|V|` = tamaño vocabulario/bins, `d` = dimensión feature vector, `k` = top-k resultados solicitados
+## Endpoints Públicos
 
----
+### `POST /similarity/search`
 
-## Endpoints / Métodos Públicos
+**Temporal:** O(N · (F_cat² + F_cont)) por query, donde N = tamaño del corpus, F_cat = features categóricas, F_cont = features continuas. El cálculo de NMI por par de features categóricas requiere construir la tabla de contingencia en O(F_cat²·n_bins²) y computar entropías conjuntas; coseno sobre el bloque continuo es O(F_cont) por candidato.
 
-### `POST /ingest` — Indexación de corpus y cálculo de alpha(C)
+**Casos:** Mejor O(N·F_cont) cuando el payload es 100% continuo (NMI se omite). Promedio O(N·(F_cat·log F_cat + F_cont)) con cardinalidad moderada. Peor O(N·F_cat²·C²) donde C = cardinalidad máxima de una variable categórica — explota con variables nominales de alta cardinalidad sin binning previo.
 
-**Temporal:** `O(n · |V| · log|V|)` — el cuello real es el cálculo de distribuciones marginales `p(x)` para cada token/bin sobre los `n` documentos, necesario para derivar `H_marginal(corpus)` y fijar `alpha(C)`. El paso `log2(|V|)` aparece en la normalización de entropía.
-**Espacial:** `O(n · |V|)` — la tabla de frecuencias conjunta debe residir en memoria íntegra durante el cálculo de entropía marginal; no es streamable sin aproximación.
-**Mejor caso:** corpus con distribución uniforme — entropía converge rápido, `O(n · |V|)` efectivo. **Peor caso:** vocabulario denso heterogéneo (`|V|` ~ 50k, n ~ 100k) — el producto domina. **Cuello de botella:** construcción de la distribución marginal conjunta; no paralelizable trivialmente porque `alpha(C)` requiere el corpus completo antes de emitir un solo score.
+**Cuello de botella:** Construcción de tablas de contingencia para NMI cuando F_cat > 10 y C > 50; la complejidad cuadrática en features categóricas domina sobre el producto escalar coseno, que es trivialmente vectorizable con NumPy.
 
 ---
 
-### `POST /search` — Score híbrido H(q,d) sobre corpus ingestado
+### `POST /similarity/explain`
 
-**Temporal:** `O(n · |V|)` por query — cosine es `O(n · d)` con d << |V| en la mayoría de dominios, pero NMI exige estimar `I(q;d)` para cada par (q, documento), lo que requiere recorrer la distribución conjunta. El término dominante es NMI: `O(n · |V|)`.
-**Espacial:** `O(|V|)` por query — se mantiene solo la distribución condicional `p(x|q)` en memoria durante el scoring; el top-k se mantiene en un heap de tamaño `k`.
-**Mejor caso:** query con solapamiento de tokens alto — early-stopping posible si `H(q,d)` supera umbral antes de recorrer los `n` documentos. **Peor caso:** query out-of-distribution, sin solapamiento — recorre `n` completo. **Cuello de botella:** el cálculo de `I(q;d) = H(q) + H(d) - H(q,d)` para cada documento es secuencial y no vectorizable con operaciones BLAS estándar.
+**Temporal:** O(F_total) después de que `/search` cachea los scores intermedios; si se invoca sin caché, hereda O(N·(F_cat² + F_cont)). El desglose por componente (w_nmi, w_cos, entropía marginal por feature) es un postproceso O(F_total) sobre resultados ya computados.
+
+**Casos:** Mejor/promedio O(F_total) con caché activo (hits esperados >80% en corpus estático). Peor igual que `/search` si el TTL expiró o el corpus mutó.
+
+**Cuello de botella:** Serialización del breakdown por feature a JSON cuando F_total > 200; considerar respuesta paginada o proyección de features por relevancia.
 
 ---
 
-### `GET /alpha` — Exposición del peso adaptativo alpha(C)
+### `POST /similarity/calibrate` (weight flywheel — DuckDB)
 
-**Temporal:** `O(1)` — `alpha(C)` se precalcula en ingest y se almacena. **Espacial:** `O(1)`. Sin caso peor relevante; el único riesgo es cache staleness si el corpus muta entre ingest y consulta, que el sistema debe versionar explícitamente.
+**Temporal:** O(D·log D) donde D = registros históricos de distribución de pesos por dominio almacenados en DuckDB. La actualización de umbrales de entropía es una aggregación SQL sobre la tabla de pesos — DuckDB la ejecuta vectorizado en columnar.
+
+**Casos:** Mejor O(1) si el dominio no tiene registros previos (devuelve umbrales default). Promedio O(D·log D) con D ~ 10⁵ registros. Peor O(D²) solo si se solicita recalibración con clustering jerárquico sobre distribuciones de pesos (opcional).
+
+**Cuello de botella:** Escritura concurrente en DuckDB bajo alta QPS — DuckDB no es OLTP; el cuello real es el lock de escritura si `/search` registra pesos síncronamente.
 
 ---
 
 ## Saturación y Estrategia de Escala
 
-Con corpus de `n = 10k` ítems y `|V| = 5k`, cada llamada a `/search` ejecuta ~50M operaciones de punto flotante; en un worker Uvicorn con un solo core moderno (~2 GFLOPS efectivos para operaciones no-BLAS), el throughput estimado es **~40 requests/segundo** antes de que la latencia p95 supere 500ms. El cuello de botella no es I/O sino CPU pura en el bucle NMI. La estrategia de escala prioritaria es **vectorización por lotes del cálculo de entropía conjunta con NumPy broadcasting** (`O(n · |V|)` -> operaciones matriciales en bloque de 512 documentos), combinada con **caching LRU de distribuciones marginales por corpus hash** para evitar recomputar `p(x|d)` en queries repetidas sobre el mismo corpus.
+Con corpus N=10k, F_cat=5, F_cont=10, un worker Uvicorn en CPU moderna procesa ~180–240 req/s antes de que la latencia p95 supere 200ms — el factor limitante es NMI, no E/S. Para escalar: (1) precalcular y cachear las tablas de contingencia por corpus hash (Redis TTL = vida del corpus), reduciendo el inner loop a O(F_cont·N) puro; (2) separar el registro de pesos en DuckDB a un worker async desacoplado con cola en memoria para eliminar el write-lock del hot path; (3) paralelizar el loop sobre N con `numpy.einsum` vectorizado para el bloque coseno y `numba.prange` para el bloque NMI — combinación que permite escalar a ~1,200 req/s sin cambiar la arquitectura stateless.
