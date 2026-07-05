@@ -22,39 +22,41 @@ export class CoreServiceError extends Error {
   }
 }
 
-export interface RankByNmiWeightedCosineInput {
+export interface RankVectorsByNmiCosineInput {
   query_vector: number[];
-  candidate_vectors: number[][];
-  candidate_ids: string[];
+  corpus_vectors: number[][];
+  nmi_threshold?: number | undefined;
+  top_k?: number | undefined;
+  confidence_level?: number | undefined;
+}
+
+export interface ComputeTokenizedCorpusSimilarityInput {
+  query_token_features: number[];
+  corpus_token_features: number[][];
   nmi_bins?: number | undefined;
   top_k?: number | undefined;
+  confidence_level?: number | undefined;
 }
 
-export interface ComputePairwiseNmiMatrixInput {
-  vectors: number[][];
-  nmi_bins?: number | undefined;
-  normalize_weights?: boolean | undefined;
-}
-
-export interface ScoreHeterogeneousPairInput {
-  vector_a: number[];
-  vector_b: number[];
-  nmi_bins?: number | undefined;
-  return_dimension_weights?: boolean | undefined;
-}
-
-export interface FilterCandidatesByNmiThresholdInput {
+export interface ExtractNmiFeatureWeightsInput {
   query_vector: number[];
-  candidate_vectors: number[][];
-  candidate_ids: string[];
-  min_score_threshold: number;
+  corpus_vectors: number[][];
   nmi_bins?: number | undefined;
+  return_top_n_dimensions?: number | undefined;
 }
 
-export interface BenchmarkNmiVsCosineDeltaInput {
-  query_vector: number[];
-  candidate_vectors: number[][];
-  candidate_ids: string[];
-  nmi_bins?: number | undefined;
+export interface CompareTabularRowSimilarityInput {
+  query_row: number[];
+  corpus_rows: number[][];
+  column_names?: string[] | undefined;
+  nmi_threshold?: number | undefined;
   top_k?: number | undefined;
+  confidence_level?: number | undefined;
+}
+
+export interface EstimateSimilarityConfidenceBandInput {
+  similarity_scores: number[];
+  nmi_weight_distribution: number[];
+  confidence_level?: number | undefined;
+  bootstrap_iterations?: number | undefined;
 }
