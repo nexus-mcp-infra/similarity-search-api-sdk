@@ -17,75 +17,83 @@ from pydantic import BaseModel, Field
 from ._mcp_client import call_mcp_tool
 
 class RankEmbeddingsByNmiCosineInput(BaseModel):
-    query_embedding: list[float] = Field(..., description='Dense float vector representing the query. Must match dimensionality of all candidate_embeddings.')
-    candidate_embeddings: list[list[float]] = Field(..., description='List of dense float vectors to rank against the query. Each inner array must have the same length as query_embedding.')
-    domain: str = Field(..., description="Embedding domain that controls the learned NMI/cosine weight mix. Accepted values: 'text', 'image', 'tabular'. Determines alpha_nmi and alpha_cosine from pretrained domain calibration.")
-    top_k: float = Field(None, description='Number of top-ranked candidates to return. Must be <= len(candidate_embeddings).')
-    return_scores: bool = Field(None, description='If true, includes composite score, nmi_component, and cosine_component for each result. Set false to reduce payload size when only rank order matters.')
+    query_vector: list[float] = Field(..., description='Dense embedding vector to rank against the corpus. Must be the same dimensionality as all corpus_vectors. Values should be raw floats, not pre-normalized.')
+    corpus_vectors: list[list[float]] = Field(..., description='List of candidate embedding vectors. Each inner array must share the same dimensionality as query_vector. Minimum 10 vectors required for valid bootstrap estimation.')
+    corpus_ids: list[str] = Field(..., description='Opaque identifiers for each vector in corpus_vectors, returned in the ranking response. Length must exactly match corpus_vectors. Use stable external IDs (document IDs, chunk hashes, etc.).')
+    discretization_bins: float = Field(None, description='Number of equal-width bins used to discretize continuous embedding dimensions before computing joint entropy. Higher values increase NMI resolution but also estimation variance. Recommended range 4-20; values above 30 degrade NMI reliability on typical embedding sizes.')
+    bootstrap_iterations: float = Field(None, description='Number of bootstrap resampling iterations per pair used to compute the 95% confidence interval on the hybrid score and the p-value under the null of no mutual information. Higher values narrow confidence intervals at linear compute cost. Minimum 100 for valid p-values.')
+    top_k: float = Field(None, description='Number of top-ranked results to return, ordered by descending hybrid score. Must be <= len(corpus_vectors). Set to 0 to return all ranked results.')
+    alpha: float = Field(None, description='Significance level threshold for p-value filtering. Results with p_value > alpha are flagged as statistically insignificant in the response but are still returned unless filter_insignificant is true. Standard values: 0.05 or 0.01.')
+    filter_insignificant: bool = Field(None, description='If true, results where p_value > alpha are excluded from the returned ranking entirely. If false, they are included but flagged. Set to false when you need ranked output regardless of significance for downstream reranking.')
+    nmi_cosine_weight: float = Field(None, description='Convex combination weight w in hybrid_score = w * nmi + (1-w) * cosine_similarity. Set closer to 1.0 to emphasize statistical dependency over geometric proximity. Set to 0.5 for balanced scoring. Do not set below 0.1 if the goal is statistical validation — the p-value computation is always NMI-based regardless of this weight.')
 
 
 class RankEmbeddingsByNmiCosineTool(BaseTool):
     name: str = "nexus_similarity_search_api_rank_embeddings_by_nmi_cosine"
-    description: str = 'Ranks a set of candidate embeddings against a query embedding using a weighted NMI+Cosine composite score calibrated per domain. Use when you need stateless semantic similarity ranking without a vector index or upsert step, especially when candidate correlations are non-linear. Do NOT use if you have a persistent vector store already indexed — latency will be higher than ANN retrieval for corpora above 50k vectors.'
+    description: str = 'Ranks a corpus of embeddings against a query vector using a hybrid score that combines cosine similarity with Normalized Mutual Information (NMI) computed via joint-entropy estimation over discretized embedding dimensions. Returns per-pair p-values from bootstrap confidence intervals. Use when you need statistically validated similarity rankings where you must distinguish real dependency patterns from random correlation. Do NOT use for real-time latency-sensitive paths (>500 vectors adds bootstrap overhead), for pure nearest-neighbor ANN tasks where p-values are irrelevant, or when corpus vectors are fewer than 10 (bootstrap intervals become unreliable).'
     args_schema: type[BaseModel] = RankEmbeddingsByNmiCosineInput
 
-    def _run(self, query_embedding, candidate_embeddings, domain, top_k, return_scores) -> Any:
-        return call_mcp_tool("nexus_similarity_search_api_rank_embeddings_by_nmi_cosine", {"query_embedding": query_embedding, "candidate_embeddings": candidate_embeddings, "domain": domain, "top_k": top_k, "return_scores": return_scores})
+    def _run(self, query_vector, corpus_vectors, corpus_ids, discretization_bins, bootstrap_iterations, top_k, alpha, filter_insignificant, nmi_cosine_weight) -> Any:
+        return call_mcp_tool("nexus_similarity_search_api_rank_embeddings_by_nmi_cosine", {"query_vector": query_vector, "corpus_vectors": corpus_vectors, "corpus_ids": corpus_ids, "discretization_bins": discretization_bins, "bootstrap_iterations": bootstrap_iterations, "top_k": top_k, "alpha": alpha, "filter_insignificant": filter_insignificant, "nmi_cosine_weight": nmi_cosine_weight})
 
-class ComputePairwiseNmiCosineMatrixInput(BaseModel):
-    embeddings: list[list[float]] = Field(..., description='Set of dense float vectors for which to compute all pairwise composite scores. All vectors must share the same dimensionality.')
-    domain: str = Field(..., description="Embedding domain controlling the NMI/cosine weight calibration. Accepted values: 'text', 'image', 'tabular'.")
-    normalize_output: bool = Field(None, description='If true, min-max normalizes the composite matrix to [0, 1] per row. Set false to preserve raw composite scores for downstream calibration.')
-
-
-class ComputePairwiseNmiCosineMatrixTool(BaseTool):
-    name: str = "nexus_similarity_search_api_compute_pairwise_nmi_cosine_matrix"
-    description: str = 'Computes the full N×N composite similarity matrix for a set of embeddings. Use for clustering preprocessing, graph construction, or reranking pipelines where every pair needs a score. Do NOT use for query-vs-corpus ranking (use rank_embeddings_by_nmi_cosine instead) — cost is O(N²) and grows quadratically.'
-    args_schema: type[BaseModel] = ComputePairwiseNmiCosineMatrixInput
-
-    def _run(self, embeddings, domain, normalize_output) -> Any:
-        return call_mcp_tool("nexus_similarity_search_api_compute_pairwise_nmi_cosine_matrix", {"embeddings": embeddings, "domain": domain, "normalize_output": normalize_output})
-
-class ScoreEmbeddingPairNmiCosineInput(BaseModel):
-    embedding_a: list[float] = Field(..., description='First dense float vector of the pair.')
-    embedding_b: list[float] = Field(..., description='Second dense float vector of the pair. Must match dimensionality of embedding_a.')
-    domain: str = Field(..., description="Embedding domain controlling calibrated weight mix. Accepted values: 'text', 'image', 'tabular'.")
+class EstimatePairwiseNmiMatrixInput(BaseModel):
+    vectors: list[list[float]] = Field(..., description='Set of embedding vectors for which to compute the pairwise NMI matrix. All vectors must share identical dimensionality. N must be between 2 and 80.')
+    vector_ids: list[str] = Field(..., description='Identifiers for each vector in vectors, used to label the matrix rows and columns in the response. Length must exactly match vectors.')
+    discretization_bins: float = Field(None, description='Number of bins for discretizing continuous dimensions before joint-entropy estimation. Shared across all pairs. Same semantics as in rank_embeddings_by_nmi_cosine.')
+    bootstrap_iterations: float = Field(None, description='Bootstrap resampling iterations applied to each pair. Because this endpoint computes N*(N-1)/2 pairs, keep this lower than in single-pair calls to control latency. Minimum 100 required for valid p-values.')
+    alpha: float = Field(None, description='Significance threshold. Pairs with p_value > alpha are flagged as statistically independent in the matrix response.')
 
 
-class ScoreEmbeddingPairNmiCosineTool(BaseTool):
-    name: str = "nexus_similarity_search_api_score_embedding_pair_nmi_cosine"
-    description: str = 'Returns the decomposed composite similarity score (NMI component, cosine component, weighted composite) for exactly one pair of embeddings. Use for debugging, threshold calibration, or audit trails where you need interpretable component breakdown. Do NOT use in batch loops — use rank_embeddings_by_nmi_cosine or compute_pairwise_nmi_cosine_matrix for multiple pairs; per-call overhead makes looping expensive.'
-    args_schema: type[BaseModel] = ScoreEmbeddingPairNmiCosineInput
+class EstimatePairwiseNmiMatrixTool(BaseTool):
+    name: str = "nexus_similarity_search_api_estimate_pairwise_nmi_matrix"
+    description: str = "Computes the full N×N Normalized Mutual Information matrix for a set of embeddings, returning each cell's NMI score along with a bootstrap-derived p-value under the null hypothesis H0: NMI=0 (independence). Use for clustering pre-analysis, redundancy detection across a document set, or graph-of-similarity construction where edge weights must be statistically grounded. Do NOT use when N > 80 — O(N^2 * bootstrap_iterations) cost makes it prohibitive; use rank_embeddings_by_nmi_cosine in batches instead. Not suitable as a real-time retrieval path."
+    args_schema: type[BaseModel] = EstimatePairwiseNmiMatrixInput
 
-    def _run(self, embedding_a, embedding_b, domain) -> Any:
-        return call_mcp_tool("nexus_similarity_search_api_score_embedding_pair_nmi_cosine", {"embedding_a": embedding_a, "embedding_b": embedding_b, "domain": domain})
+    def _run(self, vectors, vector_ids, discretization_bins, bootstrap_iterations, alpha) -> Any:
+        return call_mcp_tool("nexus_similarity_search_api_estimate_pairwise_nmi_matrix", {"vectors": vectors, "vector_ids": vector_ids, "discretization_bins": discretization_bins, "bootstrap_iterations": bootstrap_iterations, "alpha": alpha})
 
-class CalibrateDomainNmiCosineWeightsInput(BaseModel):
-    anchor_embeddings: list[list[float]] = Field(..., description='Query-side embeddings for each relevance pair. Index-aligned with positive_embeddings and negative_embeddings.')
-    positive_embeddings: list[list[float]] = Field(..., description='Embeddings of items labeled as relevant/similar to the corresponding anchor. Same length as anchor_embeddings.')
-    negative_embeddings: list[list[float]] = Field(..., description='Embeddings of items labeled as non-relevant to the corresponding anchor. Same length as anchor_embeddings.')
-    domain_label: str = Field(..., description='Identifier for the custom domain profile to be created. Used to reference this calibration in subsequent ranking calls via the domain parameter.')
-
-
-class CalibrateDomainNmiCosineWeightsTool(BaseTool):
-    name: str = "nexus_similarity_search_api_calibrate_domain_nmi_cosine_weights"
-    description: str = "Derives optimal alpha_nmi and alpha_cosine weights for a custom embedding domain by fitting the composite scorer to a labeled relevance dataset you supply. Use when 'text', 'image', and 'tabular' presets underperform on your specific embedding model or corpus distribution. Do NOT use at inference time — run once offline and cache the returned weight profile; recalibrate only when the embedding model changes."
-    args_schema: type[BaseModel] = CalibrateDomainNmiCosineWeightsInput
-
-    def _run(self, anchor_embeddings, positive_embeddings, negative_embeddings, domain_label) -> Any:
-        return call_mcp_tool("nexus_similarity_search_api_calibrate_domain_nmi_cosine_weights", {"anchor_embeddings": anchor_embeddings, "positive_embeddings": positive_embeddings, "negative_embeddings": negative_embeddings, "domain_label": domain_label})
-
-class ExplainNmiCosineRankDivergenceInput(BaseModel):
-    query_embedding: list[float] = Field(..., description='Dense float vector representing the query.')
-    candidate_embeddings: list[list[float]] = Field(..., description='Candidate dense float vectors to compare under both ranking methods.')
-    domain: str = Field(..., description="Embedding domain for composite weight calibration. Accepted values: 'text', 'image', 'tabular', or a custom domain_label from calibrate_domain_nmi_cosine_weights.")
-    top_k: float = Field(None, description='Number of candidates to include in the divergence report, taken from the top of the composite ranking.')
+class ScoreCandidatePairSignificanceInput(BaseModel):
+    vector_a: list[float] = Field(..., description='First embedding vector of the pair. Must share dimensionality with vector_b.')
+    vector_b: list[float] = Field(..., description='Second embedding vector of the pair. Must share dimensionality with vector_a.')
+    discretization_bins: float = Field(None, description="Bins for joint-entropy discretization of the two vectors' dimensions.")
+    bootstrap_iterations: float = Field(None, description='Resampling iterations for confidence interval and p-value on the NMI estimate. For a single pair, 500+ iterations are affordable and recommended for tight intervals.')
+    nmi_cosine_weight: float = Field(None, description='Weight w for hybrid_score = w * nmi + (1-w) * cosine. Same semantics as in rank_embeddings_by_nmi_cosine.')
 
 
-class ExplainNmiCosineRankDivergenceTool(BaseTool):
-    name: str = "nexus_similarity_search_api_explain_nmi_cosine_rank_divergence"
-    description: str = 'Given a query and candidates, returns a divergence report showing where NMI-informed ranking differs from pure-cosine ranking and why — quantifying non-linear dependency contribution per candidate. Use when auditing model behavior, justifying ranking decisions to stakeholders, or diagnosing unexpected rank positions. Do NOT use in latency-sensitive inference paths — this runs both rankers plus divergence attribution and is 2-3x slower than rank_embeddings_by_nmi_cosine alone.'
-    args_schema: type[BaseModel] = ExplainNmiCosineRankDivergenceInput
+class ScoreCandidatePairSignificanceTool(BaseTool):
+    name: str = "nexus_similarity_search_api_score_candidate_pair_significance"
+    description: str = 'Computes the hybrid NMI-cosine score and bootstrap p-value for exactly one (query, candidate) embedding pair. Use when you already have a candidate from an external ANN index and need to validate whether the cosine similarity reflects a real statistical dependency — i.e., post-retrieval significance gating. Do NOT use to rank a corpus (use rank_embeddings_by_nmi_cosine instead); calling this in a loop over hundreds of candidates is wasteful because it cannot amortize discretization costs across the corpus.'
+    args_schema: type[BaseModel] = ScoreCandidatePairSignificanceInput
 
-    def _run(self, query_embedding, candidate_embeddings, domain, top_k) -> Any:
-        return call_mcp_tool("nexus_similarity_search_api_explain_nmi_cosine_rank_divergence", {"query_embedding": query_embedding, "candidate_embeddings": candidate_embeddings, "domain": domain, "top_k": top_k})
+    def _run(self, vector_a, vector_b, discretization_bins, bootstrap_iterations, nmi_cosine_weight) -> Any:
+        return call_mcp_tool("nexus_similarity_search_api_score_candidate_pair_significance", {"vector_a": vector_a, "vector_b": vector_b, "discretization_bins": discretization_bins, "bootstrap_iterations": bootstrap_iterations, "nmi_cosine_weight": nmi_cosine_weight})
+
+class DetectEmbeddingDimensionRedundancyInput(BaseModel):
+    sample_vectors: list[list[float]] = Field(..., description='Representative sample of embedding vectors from the target space. Used to estimate marginal and joint entropy across dimensions. Minimum 50 samples recommended for stable entropy estimates; maximum 1000.')
+    redundancy_nmi_threshold: float = Field(None, description='NMI value above which two dimensions are considered redundant with each other and grouped into the same cluster. NMI=1.0 means perfect dependency; 0.0 means independence. Values between 0.6 and 0.85 are typical for flagging actionable redundancy.')
+    discretization_bins: float = Field(None, description='Bins for discretizing each scalar dimension value across the sample before joint-entropy computation.')
+    alpha: float = Field(None, description='Significance level. Dimension pairs whose NMI p-value > alpha are excluded from redundancy clusters even if their NMI point estimate exceeds redundancy_nmi_threshold.')
+
+
+class DetectEmbeddingDimensionRedundancyTool(BaseTool):
+    name: str = "nexus_similarity_search_api_detect_embedding_dimension_redundancy"
+    description: str = 'Identifies redundant dimensions within a single embedding space by computing pairwise NMI across all D*(D-1)/2 dimension pairs of the provided sample vectors, returning clusters of highly dependent dimensions (NMI above threshold) and a suggested reduced dimensionality. Use before building a similarity pipeline to prune embedding dimensions that carry no additional information — reduces downstream NMI estimation variance and cosine noise. Do NOT use for embeddings with D > 256 (quadratic in D); not intended for runtime retrieval calls, only for offline embedding space analysis.'
+    args_schema: type[BaseModel] = DetectEmbeddingDimensionRedundancyInput
+
+    def _run(self, sample_vectors, redundancy_nmi_threshold, discretization_bins, alpha) -> Any:
+        return call_mcp_tool("nexus_similarity_search_api_detect_embedding_dimension_redundancy", {"sample_vectors": sample_vectors, "redundancy_nmi_threshold": redundancy_nmi_threshold, "discretization_bins": discretization_bins, "alpha": alpha})
+
+class CalibrateNmiCosineWeightForCorpusInput(BaseModel):
+    triplets: list[list[float]] = Field(..., description='Flattened calibration triplets. Each triplet is encoded as three consecutive rows: [query_vector, positive_vector, negative_vector]. Total rows must be a multiple of 3. Minimum 15 triplets (45 rows); maximum 300 triplets (900 rows).')
+    weight_search_grid_size: float = Field(None, description='Number of evenly spaced w values in [0.0, 1.0] to evaluate. A grid of 20 evaluates w in {0.0, 0.05, 0.10, ..., 1.0}. Higher values yield finer-grained optima at linear cost.')
+    discretization_bins: float = Field(None, description='Bins for joint-entropy estimation used during calibration scoring. Should match the value you plan to use in production rank_embeddings_by_nmi_cosine calls.')
+    bootstrap_iterations: float = Field(None, description='Bootstrap iterations per NMI computation during calibration grid search. Kept lower than single-pair calls because it is applied across all triplets and all grid points.')
+
+
+class CalibrateNmiCosineWeightForCorpusTool(BaseTool):
+    name: str = "nexus_similarity_search_api_calibrate_nmi_cosine_weight_for_corpus"
+    description: str = 'Given a labeled calibration set of (query, positive_candidate, negative_candidate) triplets and their embeddings, finds the optimal nmi_cosine_weight w that maximizes separation between positive and negative pairs under the hybrid scoring function, reporting the optimal w with its bootstrap confidence interval and the resulting AUC-ROC. Use once before deploying rank_embeddings_by_nmi_cosine on a specific embedding model and domain to select the best w rather than using the default 0.5. Do NOT use as a runtime call per request — this is a one-time offline calibration step. Requires labeled triplets; if no labels are available, skip and use the default weight.'
+    args_schema: type[BaseModel] = CalibrateNmiCosineWeightForCorpusInput
+
+    def _run(self, triplets, weight_search_grid_size, discretization_bins, bootstrap_iterations) -> Any:
+        return call_mcp_tool("nexus_similarity_search_api_calibrate_nmi_cosine_weight_for_corpus", {"triplets": triplets, "weight_search_grid_size": weight_search_grid_size, "discretization_bins": discretization_bins, "bootstrap_iterations": bootstrap_iterations})
