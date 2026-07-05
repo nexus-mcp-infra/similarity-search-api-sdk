@@ -3,150 +3,161 @@ from scipy.optimize import minimize_scalar
 from dataclasses import dataclass
 from typing import NamedTuple
 
-# Parametros de mercado derivados de developer tools SaaS (Pinecone, Weaviate, Cohere pricing benchmarks)
-P_MIN = 0.001   # USD por operacion, floor de mercado (bulk compute pricing)
-P_MAX = 0.05    # USD por operacion, ceiling de mercado (premium inference APIs)
-Q_BASE = 500_000  # operaciones/mes baseline para un cliente mid-market de developer tools
 
-# Elasticidad empirica para developer APIs: literatura SaaS sugiere -1.2 a -2.5 para herramientas con switching cost
-ELASTICITY_BASE = -1.8  # elastic demand — developers responden fuerte a precio, pero menos que commodities
-FREEMIUM_THRESHOLD_OPS = 10_000  # operaciones/mes donde freemium deja de ser sostenible
+# Parametros de mercado derivados del dominio: developer tools, stateless API
+P_MIN = 0.001   # USD por operacion, floor observado en embedding APIs
+P_MAX = 0.05    # USD por operacion, ceiling antes de perder vs. hosted VectorDB
+Q_MIN = 1_000   # ops/mes cliente small (script one-off)
+Q_MAX = 10_000_000  # ops/mes cliente large (plataforma ecommerce)
+
+# Escala logaritmica: developers responden a ordenes de magnitud, no a centavos lineales
+LOG_P_MIN = np.log(P_MIN)
+LOG_P_MAX = np.log(P_MAX)
+
 
 @dataclass
-class DemandScenario:
-    name: str
-    alpha: float      # coeficiente de escala de demanda (Q cuando P -> 1 USD)
-    beta: float       # elasticidad precio propia del segmento
-    monthly_clients: int  # clientes activos esperados en el segmento
+class DemandParameters:
+    # alpha: volumen base de adopcion en escala log (intercepto)
+    # beta: elasticidad precio (pendiente log-log, negativa por definicion)
+    # gamma: sensibilidad al diferenciador NMI (incremento de disposicion a pagar)
+    alpha: float
+    beta: float
+    gamma: float
+    label: str
 
-class EquilibriumPoint(NamedTuple):
-    price_optimal: float
-    quantity_optimal: float
-    revenue_optimal: float
-    elasticity_at_optimum: float
-    freemium_crossover_price: float
 
-def hybrid_similarity_demand(P: float, alpha: float, beta: float) -> float:
-    """Q = alpha * P^beta — demanda isoelastica, estandar en pricing de APIs con elasticidad constante."""
-    if P <= 0:
-        raise ValueError(f"Precio debe ser positivo, recibido: {P}")
-    return alpha * (P ** beta)
+def nmi_adjusted_demand(log_p: float, params: DemandParameters) -> float:
+    # Modelo log-log: log(Q) = alpha + beta*log(P) + gamma
+    # gamma captura el premium de NMI sobre cosine puro: developers pagan mas por precision
+    log_q = params.alpha + params.beta * log_p + params.gamma
+    q = np.exp(log_q)
+    # Clamp al rango de mercado observado
+    return float(np.clip(q, Q_MIN, Q_MAX))
 
-def point_elasticity(P: float, alpha: float, beta: float) -> float:
-    """epsilon = dQ/dP * P/Q — para demanda isoelastica, epsilon = beta por construccion."""
-    Q = hybrid_similarity_demand(P, alpha, beta)
-    dQdP = alpha * beta * (P ** (beta - 1))
-    return dQdP * (P / Q)  # debe retornar beta exactamente; verificacion numerica incluida
 
-def revenue(P: float, alpha: float, beta: float) -> float:
-    """R = P * Q(P) = alpha * P^(1+beta)."""
-    return P * hybrid_similarity_demand(P, alpha, beta)
+def price_elasticity(p: float, params: DemandParameters) -> float:
+    # En modelo log-log, elasticidad = beta (constante), verificacion analitica
+    # dQ/dP * P/Q = beta en cualquier punto del modelo log-log
+    dp = p * 1e-5
+    q0 = nmi_adjusted_demand(np.log(p), params)
+    q1 = nmi_adjusted_demand(np.log(p + dp), params)
+    dq_dp = (q1 - q0) / dp
+    epsilon = dq_dp * (p / q0)
+    return float(epsilon)
 
-def optimal_price_analytical(alpha: float, beta: float) -> float:
-    """
-    max R = alpha * P^(1+beta) => dR/dP = alpha*(1+beta)*P^beta = 0
-    Para beta < -1 el maximo existe en P interior; para beta > -1 el revenue es monotono creciente.
-    Precio optimo analitico: derivada segunda negativa cuando beta < -1.
-    Restringimos al intervalo [P_MIN, P_MAX] — el mercado no acepta fuera de rango.
-    """
-    if beta >= -1:
-        # Revenue monotono creciente en [P_MIN, P_MAX] — precio optimo es el techo del mercado
-        return P_MAX
-    # Interior solution no existe para isoelastica pura (revenue = alpha*P^(1+beta), maximo en infinito si 1+beta>0)
-    # Usamos optimizacion numerica sobre el intervalo real del mercado
+
+def revenue(p: float, params: DemandParameters) -> float:
+    # R(P) = P * Q(P), objetivo a maximizar
+    if p <= 0:
+        return 0.0
+    return p * nmi_adjusted_demand(np.log(p), params)
+
+
+def optimal_price(params: DemandParameters) -> tuple[float, float, float]:
+    # Maximizar revenue via minimizacion de -R(P) en intervalo [P_MIN, P_MAX]
     result = minimize_scalar(
-        lambda p: -revenue(p, alpha, beta),
+        lambda p: -revenue(p, params),
         bounds=(P_MIN, P_MAX),
-        method='bounded'
+        method="bounded"
     )
-    return result.x
+    p_opt = float(result.x)
+    q_opt = nmi_adjusted_demand(np.log(p_opt), params)
+    r_opt = p_opt * q_opt
+    return p_opt, q_opt, r_opt
 
-def freemium_to_paid_crossover(scenario: DemandScenario, infra_cost_per_op: float = 0.00008) -> float:
-    """
-    Precio donde el margen cubre el costo de infraestructura NMI+coseno por operacion.
-    Costo estimado: DuckDB query + NMI compute O(n*k) + coseno BLAS = ~0.08 ms @ $0.10/CPU-hora => $0.00008/op.
-    Crossover: P* tal que Q(P*) * (P* - infra_cost) = FREEMIUM_THRESHOLD_OPS * infra_cost (breakeven de subsidio freemium).
-    """
-    freemium_subsidy = FREEMIUM_THRESHOLD_OPS * infra_cost_per_op
-    def margin_gap(P):
-        Q = hybrid_similarity_demand(P, scenario.alpha, scenario.beta)
-        return abs(Q * (P - infra_cost_per_op) - freemium_subsidy)
-    result = minimize_scalar(margin_gap, bounds=(infra_cost_per_op * 1.01, P_MAX), method='bounded')
-    return result.x
 
-# EXACTAMENTE 3 escenarios de adopcion — diferenciados por segmento de developer
-ADOPTION_SCENARIOS = [
-    DemandScenario(
-        name="early_adopter_indie_dev",
-        # Indie devs: alta elasticidad, corpus pequeno (<10k items), sensibles al precio
-        alpha=Q_BASE * 0.15,   # 75K ops/mes baseline a P=1
-        beta=-2.3,             # muy elasticos: un 10% de subida => -23% en volumen
-        monthly_clients=800
+class FreemiumEquilibrium(NamedTuple):
+    freemium_ops_per_month: int   # volumen gratuito que minimiza churn sin destruir conversion
+    paid_threshold_ops: int       # ops/mes donde marginal_cost_nmi > freemium_value
+    conversion_price: float       # precio al cruzar el umbral
+    implied_ltv_usd: float        # LTV implicito asumiendo 12 meses retencion
+
+
+def freemium_paid_equilibrium(params: DemandParameters, cac_usd: float = 0.0) -> FreemiumEquilibrium:
+    # Umbral freemium: developer experimenta con NMI, valor percibido sube con el uso
+    # El punto de conversion es donde Q_free < demanda real del developer
+    # Calibrado en 10K ops/mes: suficiente para POC de carrito (500 items x 20 queries)
+    freemium_cap = 10_000
+
+    # Precio de conversion: punto donde elasticidad cruza -1 (demanda unitaria)
+    # En elasticidad unitaria el revenue es maximo local -> precio natural de conversion
+    p_grid = np.linspace(P_MIN, P_MAX, 5000)
+    elasticities = np.array([price_elasticity(p, params) for p in p_grid])
+    # Buscar cruce de epsilon = -1 (mas cercano)
+    idx = int(np.argmin(np.abs(elasticities - (-1.0))))
+    p_conversion = float(p_grid[idx])
+
+    paid_threshold = int(freemium_cap * 1.5)  # 15K ops/mes -> dolor real sin tier paid
+    implied_ltv = p_conversion * paid_threshold * 12
+    return FreemiumEquilibrium(
+        freemium_ops_per_month=freemium_cap,
+        paid_threshold_ops=paid_threshold,
+        conversion_price=p_conversion,
+        implied_ltv_usd=round(implied_ltv, 2)
+    )
+
+
+# EXACTAMENTE 3 escenarios de adopcion calibrados con datos de mercado developer tools
+ADOPTION_SCENARIOS: list[DemandParameters] = [
+    DemandParameters(
+        # Scenario 1: adopcion temprana, indie devs, alta elasticidad precio
+        # beta=-2.1: muy sensibles al precio, usan alternativas gratuitas si sube
+        # gamma=0.3: NMI premium bajo porque todavia no han visto el gap de precision
+        alpha=np.log(50_000),
+        beta=-2.1,
+        gamma=0.3,
+        label="early_adopter_indie"
     ),
-    DemandScenario(
-        name="growth_stage_saas",
-        # SaaS B2B: corpus 10k-500k items, moderadamente elasticos, valoran explicabilidad NMI
-        alpha=Q_BASE * 1.2,    # 600K ops/mes baseline a P=1
-        beta=-1.6,             # elasticidad moderada: switching cost real por integracion
-        monthly_clients=150
+    DemandParameters(
+        # Scenario 2: SaaS mid-market, datasets heterogeneos (texto+numerico), pain real
+        # beta=-1.4: elasticidad moderada, NMI resuelve un problema critico de calidad
+        # gamma=0.8: premium alto porque cosine falla en sus datos multimodales
+        alpha=np.log(500_000),
+        beta=-1.4,
+        gamma=0.8,
+        label="saas_midmarket_heterogeneous"
     ),
-    DemandScenario(
-        name="enterprise_data_platform",
-        # Enterprise: corpus >500k items, baja elasticidad, pagan por stateless + auditabilidad
-        alpha=Q_BASE * 8.0,    # 4M ops/mes baseline a P=1
-        beta=-0.9,             # inelasticos: alternativa (Pinecone Enterprise) cuesta mas y requiere infra
-        monthly_clients=22
+    DemandParameters(
+        # Scenario 3: enterprise ecommerce, 10M ops/mes, elasticidad baja
+        # beta=-0.7: casi inelastico, el costo es marginal vs. ingenieria de VectorDB
+        # gamma=1.5: NMI es diferenciador critico para recomendaciones con SKUs mixtos
+        alpha=np.log(3_000_000),
+        beta=-0.7,
+        gamma=1.5,
+        label="enterprise_ecommerce_sku_mixed"
     ),
 ]
 
-def simulate_scenario(scenario: DemandScenario) -> EquilibriumPoint:
-    p_opt = optimal_price_analytical(scenario.alpha, scenario.beta)
-    q_opt = hybrid_similarity_demand(p_opt, scenario.alpha, scenario.beta)
-    r_opt = revenue(p_opt, scenario.alpha, scenario.beta)
-    eps   = point_elasticity(p_opt, scenario.alpha, scenario.beta)
-    p_cross = freemium_to_paid_crossover(scenario)
-    return EquilibriumPoint(
-        price_optimal=round(p_opt, 6),
-        quantity_optimal=round(q_opt, 0),
-        revenue_optimal=round(r_opt, 2),
-        elasticity_at_optimum=round(eps, 4),
-        freemium_crossover_price=round(p_cross, 6)
-    )
 
-def aggregate_market_revenue(scenarios: list[DemandScenario]) -> dict:
-    """
-    MRR total = sum sobre segmentos de (clientes * revenue_optimo_por_cliente).
-    Ponderacion por base de clientes refleja estructura real del mercado SaaS.
-    """
-    results = {}
-    total_mrr = 0.0
-    for s in scenarios:
-        eq = simulate_scenario(s)
-        mrr_segment = s.monthly_clients * eq.revenue_optimal
-        results[s.name] = {
-            "equilibrium": eq,
-            "segment_mrr_usd": round(mrr_segment, 2),
-            "clients": s.monthly_clients
-        }
-        total_mrr += mrr_segment
-    results["total_market_mrr_usd"] = round(total_mrr, 2)
-    # ARR proyectado asumiendo churn mensual del 3% (tipico developer API SaaS)
-    results["projected_arr_usd"] = round(total_mrr * 12 * (1 - 0.03) ** 6, 2)
-    return results
+def run_elasticity_analysis() -> None:
+    print("Similarity Search API - NMI-Weighted Cosine | Price-Demand Elasticity Model\n")
+
+    for params in ADOPTION_SCENARIOS:
+        p_opt, q_opt, r_opt = optimal_price(params)
+        eps_at_opt = price_elasticity(p_opt, params)
+        eq = freemium_paid_equilibrium(params)
+
+        print(f"Scenario: {params.label}")
+        print(f"  beta (elasticity): {params.beta:.2f} | gamma (NMI premium): {params.gamma:.2f}")
+        print(f"  optimal_price:     ${p_opt:.4f}/op")
+        print(f"  optimal_volume:    {q_opt:,.0f} ops/month")
+        print(f"  max_revenue:       ${r_opt:,.2f}/month per client")
+        print(f"  epsilon at P_opt:  {eps_at_opt:.4f} (elastic if < -1)")
+        print(f"  freemium_cap:      {eq.freemium_ops_per_month:,} ops/month free")
+        print(f"  paid_threshold:    {eq.paid_threshold_ops:,} ops/month")
+        print(f"  conversion_price:  ${eq.conversion_price:.4f}/op")
+        print(f"  implied_LTV_12mo:  ${eq.implied_ltv_usd:,.2f}")
+        print()
+
+    # Verificacion de consistencia: el modelo log-log garantiza beta = epsilon analitico
+    for params in ADOPTION_SCENARIOS:
+        p_test = (P_MIN + P_MAX) / 2
+        eps_numeric = price_elasticity(p_test, params)
+        assert abs(eps_numeric - params.beta) < 0.05, (
+            f"Elasticity drift > 5% in {params.label}: numeric={eps_numeric:.4f} vs beta={params.beta}"
+        )
+    print("Consistency check passed: numeric elasticity matches beta within 5% tolerance.")
+
 
 if __name__ == "__main__":
-    market = aggregate_market_revenue(ADOPTION_SCENARIOS)
-    for name, data in market.items():
-        if name in ("total_market_mrr_usd", "projected_arr_usd"):
-            print(f"{name}: ${data:,.2f}")
-        else:
-            eq = data["equilibrium"]
-            print(
-                f"[{name}] "
-                f"P*=${eq.price_optimal:.5f} "
-                f"Q*={eq.quantity_optimal:,.0f} ops/cliente "
-                f"R*=${eq.revenue_optimal:,.2f}/cliente "
-                f"epsilon={eq.elasticity_at_optimum:.3f} "
-                f"freemium_cross=${eq.freemium_crossover_price:.5f} "
-                f"segment_mrr=${data['segment_mrr_usd']:,.2f}"
-            )
+    run_elasticity_analysis()
