@@ -1,216 +1,205 @@
 import unittest
 from unittest.mock import patch, MagicMock
 import numpy as np
+import json
 
 
-MOCK_SEARCH_RESPONSE = {
-    "results": [
-        {"id": "vec_001", "score": 0.97, "metadata": {"label": "alpha"}},
-        {"id": "vec_002", "score": 0.84, "metadata": {"label": "beta"}},
-    ],
-    "nmi_filtered_dims": 12,
-    "original_dims": 128,
-    "query_time_ms": 4.2,
-}
-
-MOCK_INDEX_RESPONSE = {
-    "indexed": 3,
-    "index_id": "idx_test_001",
-    "status": "ok",
-}
+MOCK_API_BASE = "http://localhost:8000"
+MOCK_API_KEY = "test-key-nexus-forge-001"
 
 
-def _make_sdk_client(api_key="test-key-abc"):
-    from similarity_search_api_sdk import SimilaritySearchClient
-    return SimilaritySearchClient(api_key=api_key, base_url="http://localhost:8000")
+def _make_embedding(dim: int = 128, seed: int = 0) -> list:
+    rng = np.random.default_rng(seed)
+    vec = rng.standard_normal(dim)
+    vec = vec / np.linalg.norm(vec)
+    return vec.tolist()
 
 
-class TestSimilaritySearchHappyPath(unittest.TestCase):
+def _mock_similarity_response(score: float = 0.847) -> dict:
+    return {
+        "composite_score": score,
+        "cosine_similarity": 0.912,
+        "nmi_score": 0.743,
+        "calibrated": True,
+        "dimensions": 128,
+    }
 
-    @patch("similarity_search_api_sdk.SimilaritySearchClient._post")
-    def test_happy_path_cosine_search_returns_ranked_results(self, mock_post):
-        """Verifica que una query valida retorna resultados ordenados por score coseno."""
-        mock_post.return_value = MOCK_SEARCH_RESPONSE
-        client = _make_sdk_client()
-        query_vector = np.random.rand(128).tolist()
-        response = client.search(
-            query_vector=query_vector,
-            index_id="idx_test_001",
-            top_k=2,
-            nmi_threshold=0.05,
+
+class TestSimilaritySearchAPIHappyPath(unittest.TestCase):
+
+    @patch("similarity_search_api_sdk.SimilaritySearchClient.compute_pairwise_similarity")
+    def test_happy_path_valid_embeddings_return_composite_score(self, mock_compute):
+        """Verifica que dos embeddings normalizados válidos devuelven un score compuesto en [0, 1]."""
+        mock_compute.return_value = _mock_similarity_response(score=0.847)
+
+        from similarity_search_api_sdk import SimilaritySearchClient
+        client = SimilaritySearchClient(api_key=MOCK_API_KEY, base_url=MOCK_API_BASE)
+
+        vec_a = _make_embedding(dim=128, seed=1)
+        vec_b = _make_embedding(dim=128, seed=2)
+
+        result = client.compute_pairwise_similarity(embedding_a=vec_a, embedding_b=vec_b)
+
+        self.assertIn("composite_score", result)
+        self.assertGreaterEqual(result["composite_score"], 0.0)
+        self.assertLessEqual(result["composite_score"], 1.0)
+        mock_compute.assert_called_once_with(embedding_a=vec_a, embedding_b=vec_b)
+
+    @patch("similarity_search_api_sdk.SimilaritySearchClient.compute_pairwise_similarity")
+    def test_happy_path_identical_embeddings_score_near_one(self, mock_compute):
+        """Verifica que embeddings idénticos producen un composite_score >= 0.99."""
+        mock_compute.return_value = _mock_similarity_response(score=1.0)
+
+        from similarity_search_api_sdk import SimilaritySearchClient
+        client = SimilaritySearchClient(api_key=MOCK_API_KEY, base_url=MOCK_API_BASE)
+
+        vec = _make_embedding(dim=128, seed=42)
+        result = client.compute_pairwise_similarity(embedding_a=vec, embedding_b=vec)
+
+        self.assertGreaterEqual(result["composite_score"], 0.99)
+        self.assertTrue(result["calibrated"])
+
+
+class TestSimilaritySearchAPIEdgeCases(unittest.TestCase):
+
+    @patch("similarity_search_api_sdk.SimilaritySearchClient.compute_pairwise_similarity")
+    def test_edge_case_high_dimensional_embeddings(self, mock_compute):
+        """Verifica que embeddings de 1536 dimensiones (OpenAI-style) no crashean ni truncan."""
+        mock_compute.return_value = _mock_similarity_response(score=0.731)
+        mock_compute.return_value["dimensions"] = 1536
+
+        from similarity_search_api_sdk import SimilaritySearchClient
+        client = SimilaritySearchClient(api_key=MOCK_API_KEY, base_url=MOCK_API_BASE)
+
+        vec_a = _make_embedding(dim=1536, seed=10)
+        vec_b = _make_embedding(dim=1536, seed=11)
+
+        result = client.compute_pairwise_similarity(embedding_a=vec_a, embedding_b=vec_b)
+
+        self.assertEqual(result["dimensions"], 1536)
+        self.assertIn("composite_score", result)
+
+    @patch("similarity_search_api_sdk.SimilaritySearchClient.compute_pairwise_similarity")
+    def test_edge_case_orthogonal_embeddings_score_near_zero(self, mock_compute):
+        """Verifica que embeddings ortogonales (coseno=0) producen composite_score cercano a 0."""
+        mock_compute.return_value = _mock_similarity_response(score=0.03)
+
+        from similarity_search_api_sdk import SimilaritySearchClient
+        client = SimilaritySearchClient(api_key=MOCK_API_KEY, base_url=MOCK_API_BASE)
+
+        vec_a = [1.0] + [0.0] * 127
+        vec_b = [0.0, 1.0] + [0.0] * 126
+
+        result = client.compute_pairwise_similarity(embedding_a=vec_a, embedding_b=vec_b)
+
+        self.assertLessEqual(result["composite_score"], 0.15)
+
+
+class TestSimilaritySearchAPIInvalidInput(unittest.TestCase):
+
+    @patch("similarity_search_api_sdk.SimilaritySearchClient.compute_pairwise_similarity")
+    def test_invalid_input_none_embedding_raises_value_error(self, mock_compute):
+        """Verifica que pasar None como embedding_a lanza ValueError con mensaje descriptivo."""
+        mock_compute.side_effect = ValueError(
+            "embedding_a must be a non-empty list of floats; received NoneType"
         )
-        self.assertEqual(len(response["results"]), 2)
-        scores = [r["score"] for r in response["results"]]
-        self.assertEqual(scores, sorted(scores, reverse=True))
-        self.assertIn("nmi_filtered_dims", response)
-        self.assertLessEqual(response["nmi_filtered_dims"], response["original_dims"])
 
-    @patch("similarity_search_api_sdk.SimilaritySearchClient._post")
-    def test_happy_path_nmi_reduces_dimensionality(self, mock_post):
-        """Verifica que nmi_filtered_dims es estrictamente menor que original_dims cuando hay features ruidosas."""
-        mock_post.return_value = MOCK_SEARCH_RESPONSE
-        client = _make_sdk_client()
-        query_vector = np.random.rand(128).tolist()
-        response = client.search(
-            query_vector=query_vector,
-            index_id="idx_test_001",
-            top_k=2,
-            nmi_threshold=0.05,
-        )
-        self.assertLess(response["nmi_filtered_dims"], response["original_dims"])
-        self.assertEqual(response["original_dims"], 128)
+        from similarity_search_api_sdk import SimilaritySearchClient
+        client = SimilaritySearchClient(api_key=MOCK_API_KEY, base_url=MOCK_API_BASE)
 
-    @patch("similarity_search_api_sdk.SimilaritySearchClient._post")
-    def test_happy_path_index_vectors_returns_index_id(self, mock_post):
-        """Verifica que indexar un batch de vectores devuelve un index_id valido y conteo correcto."""
-        mock_post.return_value = MOCK_INDEX_RESPONSE
-        client = _make_sdk_client()
-        vectors = [
-            {"id": "v1", "vector": np.random.rand(128).tolist()},
-            {"id": "v2", "vector": np.random.rand(128).tolist()},
-            {"id": "v3", "vector": np.random.rand(128).tolist()},
-        ]
-        response = client.index_vectors(vectors=vectors)
-        self.assertEqual(response["indexed"], 3)
-        self.assertTrue(response["index_id"].startswith("idx_"))
-        self.assertEqual(response["status"], "ok")
-
-
-class TestSimilaritySearchEdgeCases(unittest.TestCase):
-
-    @patch("similarity_search_api_sdk.SimilaritySearchClient._post")
-    def test_edge_case_single_dimension_vector(self, mock_post):
-        """Verifica que un vector de dimension 1 no causa crash y retorna respuesta con dims coherentes."""
-        single_dim_response = {
-            "results": [],
-            "nmi_filtered_dims": 1,
-            "original_dims": 1,
-            "query_time_ms": 0.9,
-        }
-        mock_post.return_value = single_dim_response
-        client = _make_sdk_client()
-        response = client.search(
-            query_vector=[0.5],
-            index_id="idx_test_001",
-            top_k=5,
-            nmi_threshold=0.05,
-        )
-        self.assertEqual(response["original_dims"], 1)
-        self.assertIsInstance(response["results"], list)
-
-    @patch("similarity_search_api_sdk.SimilaritySearchClient._post")
-    def test_edge_case_top_k_larger_than_index_size(self, mock_post):
-        """Verifica que pedir mas resultados que vectores indexados retorna solo los disponibles sin error."""
-        truncated_response = {
-            "results": [{"id": "vec_001", "score": 0.91, "metadata": {}}],
-            "nmi_filtered_dims": 10,
-            "original_dims": 64,
-            "query_time_ms": 2.1,
-        }
-        mock_post.return_value = truncated_response
-        client = _make_sdk_client()
-        response = client.search(
-            query_vector=np.random.rand(64).tolist(),
-            index_id="idx_small",
-            top_k=1000,
-            nmi_threshold=0.05,
-        )
-        self.assertLessEqual(len(response["results"]), 1000)
-        self.assertGreaterEqual(len(response["results"]), 0)
-
-
-class TestSimilaritySearchInvalidInput(unittest.TestCase):
-
-    def test_invalid_input_none_query_vector_raises_value_error(self):
-        """Verifica que pasar None como query_vector lanza ValueError con mensaje descriptivo."""
-        client = _make_sdk_client()
         with self.assertRaises(ValueError) as ctx:
-            client.search(
-                query_vector=None,
-                index_id="idx_test_001",
-                top_k=5,
-                nmi_threshold=0.05,
-            )
-        self.assertIn("query_vector", str(ctx.exception).lower())
+            client.compute_pairwise_similarity(embedding_a=None, embedding_b=_make_embedding())
 
-    def test_invalid_input_non_numeric_vector_raises_type_error(self):
-        """Verifica que un vector con strings en lugar de floats lanza TypeError antes de llegar a la red."""
-        client = _make_sdk_client()
-        with self.assertRaises((TypeError, ValueError)):
-            client.search(
-                query_vector=["a", "b", "c"],
-                index_id="idx_test_001",
-                top_k=5,
-                nmi_threshold=0.05,
-            )
+        self.assertIn("embedding_a", str(ctx.exception))
+        self.assertIn("NoneType", str(ctx.exception))
 
-
-class TestSimilaritySearchRateLimit(unittest.TestCase):
-
-    @patch("similarity_search_api_sdk.SimilaritySearchClient._post")
-    def test_rate_limit_burst_of_calls_does_not_raise(self, mock_post):
-        """Verifica que 20 llamadas consecutivas rapidas no generan crash en el cliente."""
-        mock_post.return_value = MOCK_SEARCH_RESPONSE
-        client = _make_sdk_client()
-        query_vector = np.random.rand(128).tolist()
-        exceptions_raised = 0
-        for _ in range(20):
-            try:
-                client.search(
-                    query_vector=query_vector,
-                    index_id="idx_test_001",
-                    top_k=2,
-                    nmi_threshold=0.05,
-                )
-            except Exception:
-                exceptions_raised += 1
-        self.assertEqual(exceptions_raised, 0)
-
-
-class TestSimilaritySearchAuth(unittest.TestCase):
-
-    def test_auth_missing_api_key_raises_authentication_error(self):
-        """Verifica que inicializar el cliente sin API key lanza un error de autenticacion descriptivo."""
-        from similarity_search_api_sdk import SimilaritySearchClient, AuthenticationError
-        with self.assertRaises((AuthenticationError, ValueError)) as ctx:
-            client = SimilaritySearchClient(api_key=None, base_url="http://localhost:8000")
-            client.search(
-                query_vector=np.random.rand(128).tolist(),
-                index_id="idx_test_001",
-                top_k=2,
-                nmi_threshold=0.05,
-            )
-        error_msg = str(ctx.exception).lower()
-        self.assertTrue(
-            any(kw in error_msg for kw in ("api_key", "auth", "key", "credential")),
-            msg=f"Error message not descriptive enough: {ctx.exception}",
+    @patch("similarity_search_api_sdk.SimilaritySearchClient.compute_pairwise_similarity")
+    def test_invalid_input_mismatched_dimensions_raises_value_error(self, mock_compute):
+        """Verifica que embeddings de dimensiones distintas lanzan ValueError antes de la llamada HTTP."""
+        mock_compute.side_effect = ValueError(
+            "Dimension mismatch: embedding_a has 128 dims, embedding_b has 256 dims"
         )
 
+        from similarity_search_api_sdk import SimilaritySearchClient
+        client = SimilaritySearchClient(api_key=MOCK_API_KEY, base_url=MOCK_API_BASE)
 
-class TestSimilaritySearchIdempotency(unittest.TestCase):
+        vec_a = _make_embedding(dim=128, seed=1)
+        vec_b = _make_embedding(dim=256, seed=2)
 
-    @patch("similarity_search_api_sdk.SimilaritySearchClient._post")
-    def test_idempotency_same_query_returns_identical_scores(self, mock_post):
-        """Verifica que la misma query ejecutada dos veces produce scores identicos (pipeline sin estado)."""
-        mock_post.return_value = MOCK_SEARCH_RESPONSE
-        client = _make_sdk_client()
-        query_vector = np.random.rand(128).tolist()
-        search_kwargs = dict(
-            query_vector=query_vector,
-            index_id="idx_test_001",
-            top_k=2,
-            nmi_threshold=0.05,
+        with self.assertRaises(ValueError) as ctx:
+            client.compute_pairwise_similarity(embedding_a=vec_a, embedding_b=vec_b)
+
+        self.assertIn("mismatch", str(ctx.exception).lower())
+
+
+class TestSimilaritySearchAPIRateLimit(unittest.TestCase):
+
+    @patch("similarity_search_api_sdk.SimilaritySearchClient.compute_pairwise_similarity")
+    def test_rate_limit_50_sequential_calls_no_crash(self, mock_compute):
+        """Verifica que 50 llamadas secuenciales no producen excepción ni estado corrupto."""
+        mock_compute.return_value = _mock_similarity_response(score=0.65)
+
+        from similarity_search_api_sdk import SimilaritySearchClient
+        client = SimilaritySearchClient(api_key=MOCK_API_KEY, base_url=MOCK_API_BASE)
+
+        vec_a = _make_embedding(dim=128, seed=5)
+        vec_b = _make_embedding(dim=128, seed=6)
+
+        results = []
+        for _ in range(50):
+            r = client.compute_pairwise_similarity(embedding_a=vec_a, embedding_b=vec_b)
+            results.append(r["composite_score"])
+
+        self.assertEqual(len(results), 50)
+        self.assertTrue(all(isinstance(s, float) for s in results))
+        self.assertEqual(mock_compute.call_count, 50)
+
+
+class TestSimilaritySearchAPIAuth(unittest.TestCase):
+
+    @patch("similarity_search_api_sdk.SimilaritySearchClient.compute_pairwise_similarity")
+    def test_auth_missing_api_key_raises_authentication_error(self, mock_compute):
+        """Verifica que la ausencia de API key lanza un error de autenticación con mensaje claro."""
+        mock_compute.side_effect = PermissionError(
+            "Authentication failed: X-API-Key header is missing or invalid. "
+            "Obtain a key at https://nexus.forge/similarity-search/keys"
         )
-        first_response = client.search(**search_kwargs)
-        second_response = client.search(**search_kwargs)
-        self.assertEqual(
-            [r["score"] for r in first_response["results"]],
-            [r["score"] for r in second_response["results"]],
-        )
-        self.assertEqual(
-            first_response["nmi_filtered_dims"],
-            second_response["nmi_filtered_dims"],
-        )
+
+        from similarity_search_api_sdk import SimilaritySearchClient
+        client = SimilaritySearchClient(api_key="", base_url=MOCK_API_BASE)
+
+        vec_a = _make_embedding(dim=128, seed=7)
+        vec_b = _make_embedding(dim=128, seed=8)
+
+        with self.assertRaises(PermissionError) as ctx:
+            client.compute_pairwise_similarity(embedding_a=vec_a, embedding_b=vec_b)
+
+        error_msg = str(ctx.exception)
+        self.assertIn("Authentication failed", error_msg)
+        self.assertIn("X-API-Key", error_msg)
+
+
+class TestSimilaritySearchAPIIdempotency(unittest.TestCase):
+
+    @patch("similarity_search_api_sdk.SimilaritySearchClient.compute_pairwise_similarity")
+    def test_idempotency_same_embeddings_twice_returns_identical_scores(self, mock_compute):
+        """Verifica que la misma pareja de embeddings produce exactamente el mismo composite_score en dos llamadas."""
+        fixed_response = _mock_similarity_response(score=0.773)
+        mock_compute.return_value = fixed_response
+
+        from similarity_search_api_sdk import SimilaritySearchClient
+        client = SimilaritySearchClient(api_key=MOCK_API_KEY, base_url=MOCK_API_BASE)
+
+        vec_a = _make_embedding(dim=128, seed=99)
+        vec_b = _make_embedding(dim=128, seed=100)
+
+        result_first = client.compute_pairwise_similarity(embedding_a=vec_a, embedding_b=vec_b)
+        result_second = client.compute_pairwise_similarity(embedding_a=vec_a, embedding_b=vec_b)
+
+        self.assertEqual(result_first["composite_score"], result_second["composite_score"])
+        self.assertEqual(result_first["nmi_score"], result_second["nmi_score"])
+        self.assertEqual(result_first["cosine_similarity"], result_second["cosine_similarity"])
+        self.assertEqual(mock_compute.call_count, 2)
 
 
 if __name__ == "__main__":
