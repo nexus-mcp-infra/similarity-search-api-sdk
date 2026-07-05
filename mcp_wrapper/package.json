@@ -1,7 +1,7 @@
 {
   "name": "@nexus-mcp/similarity-search-api",
   "version": "1.0.0",
-  "description": "Ejecuta b\u00fasqueda h\u00edbrida stateless sobre colecciones arbitrarias fusionando NMI para features categ\u00f3ricas y coseno para features continuas en un score \u00fanico con desglose por componente, sin \u00edndices ni infraestructura persistente.",
+  "description": "Computes stateless NMI-weighted cosine similarity between two collections of heterogeneous records (text + numeric + categorical) and returns ranked results in a single HTTP call, no index or prior setup required.",
   "type": "module",
   "main": "dist/index.js",
   "bin": {
