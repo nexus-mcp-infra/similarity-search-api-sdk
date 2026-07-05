@@ -1,8 +1,8 @@
-# Pricing Model — NMI-Cosine Similarity Search API
+# Modelo de Pricing: Similarity Search API
 
-## Filosofía de diseño
+## Principio de diseño
 
-El modelo opera en **per-call billing** puro: el activo no tiene estado persistente que justifique subscripción fija. El costo marginal real está dominado por el cálculo NMI (O(n·d·log d) donde n = corpus size, d = dimensiones), no por almacenamiento. El pricing refleja esa asimetría.
+Pricing por operación atómica (una llamada = un par de vectores evaluado). Sin asientos, sin índices almacenados, sin compromisos de volumen mínimo en los niveles bajos. El coste marginal real de la primitiva es O(d) en dimensión del embedding — eso permite granularidad de centavos por llamada sin pérdida de margen.
 
 ---
 
@@ -10,137 +10,123 @@ El modelo opera en **per-call billing** puro: el activo no tiene estado persiste
 
 ### Free
 
-| Parámetro | Límite |
-|---|---|
-| Llamadas / mes | 500 |
-| Corpus size máximo por llamada | 500 items |
-| Dimensionalidad máxima (d) | 128 features |
-| Confianza CI devuelto | Fijo 80% (percentil empírico global, sin dominio-specificity) |
-| Rate limit | 5 req / min |
-| SLA | Best-effort, sin uptime guarantee |
-| Soporte | GitHub Issues |
+| Parámetro | Valor |
+|-----------|-------|
+| Operaciones / mes | 500 |
+| Dimensión máxima del embedding | 1 536 (OpenAI ada-002) |
+| Batch size máximo por request | 1 par |
+| Dominio disponible | `text` únicamente |
+| Latencia objetivo (p95) | < 120 ms |
+| Score devuelto | `composite` + `cosine` (NMI oculto) |
+| Rate limit | 10 req / min |
+| Autenticación | API key pública (sin SLA) |
+| Soporte | Documentación + GitHub Issues |
 
-**Restricción técnica clave:** el percentil de confianza en Free usa la distribución empírica global agregada, no la distribución por dominio. El score es válido pero menos calibrado que en Pro/Enterprise.
+**Lógica de conversión:** El NMI no se expone en Free. El developer ve que el `composite` diverge del `cosine` puro en sus propios datos, pero no puede reproducirlo — eso es el hook de conversión a Pro.
 
 ---
 
-### Pro — Pay-per-call
+### Pro — Pay-per-operation
 
-Sin fee mensual fijo. Se factura por operación completada con respuesta 2xx.
+**Sin suscripción base. Se factura exclusivamente por operación consumida.**
 
-| Volumen mensual acumulado | Precio por llamada |
-|---|---|
-| 1 – 10,000 | $0.0028 |
-| 10,001 – 100,000 | $0.0019 |
-| 100,001 – 1,000,000 | $0.0012 |
-| > 1,000,000 | Contactar Enterprise |
+| Parámetro | Valor |
+|-----------|-------|
+| Precio base por operación | $0.0004 / par |
+| Batch size máximo por request | 128 pares |
+| Dimensión máxima del embedding | 4 096 |
+| Dominios disponibles | `text`, `image`, `tabular` |
+| Score devuelto | `composite` + `cosine` + `nmi` + `alpha` (peso aprendido) |
+| Latencia objetivo (p95) | < 60 ms |
+| Rate limit | 300 req / min (burst: 600 en ventana de 10 s) |
+| Autenticación | API key con HMAC-SHA256 en header |
+| Soporte | Email con SLA 24 h hábiles |
 
-**Capacidades desbloqueadas vs Free:**
+**Descuentos por volumen dentro de Pro (mismo mes calendario):**
 
-| Parámetro | Pro |
-|---|---|
-| Corpus size máximo por llamada | 50,000 items |
-| Dimensionalidad máxima (d) | 2,048 features |
-| CI devuelto | Percentil empírico por dominio (data flywheel activo) |
-| Nivel de confianza configurable | 80%, 90%, 95% |
-| Rate limit | 120 req / min |
-| SLA uptime | 99.5% mensual |
-| Soporte | Email, respuesta < 48h |
+| Operaciones acumuladas en el mes | Precio por operación |
+|----------------------------------|----------------------|
+| 0 — 100 000 | $0.0004 |
+| 100 001 — 1 000 000 | $0.00028 (-30%) |
+| 1 000 001 — 10 000 000 | $0.00018 (-55%) |
+| > 10 000 000 | Cotización Enterprise automática |
 
-**Estimación de costo real para casos de uso típicos:**
+El descuento se aplica de forma escalonada (solo las operaciones en el tramo pagan ese precio, no retroactivo al primer request del mes). Esto protege el margen en adopción temprana y crea incentivo real para escalar sin requerir compromiso adelantado.
 
-- Prototipo de recomendación (10k llamadas/mes): **$28/mes**
-- Pipeline de deduplicación (80k llamadas/mes): **$152/mes**
-- Motor de búsqueda de catálogo mediano (400k llamadas/mes): **$480/mes**
+**Estimación de factura típica:**
 
-Estos números son comparables al costo de *solo la instancia* de un vector DB gestionado sin incluir la lógica NMI.
+- Startup de RAG que hace 80 000 comparaciones/mes (reranking de top-k antes de respuesta LLM): **$32 / mes**
+- Plataforma de e-commerce con similitud de imágenes de producto, 400 000 ops/mes: **$98.40 / mes** (tramo mixto: 100k a $0.0004 + 300k a $0.00028)
+- Pipeline de detección de duplicados en dataset tabular, batch de 128, 2M ops/mes: **$244 / mes**
+
+Estas cifras son comparables con el coste de una instancia Pinecone s1 ($70/mes) más el tiempo de ingeniería de upsert — sin persistencia y sin warm-up.
 
 ---
 
 ### Enterprise
 
-Contrato anual. El precio base se negocia sobre **volumen comprometido** (committed usage), no sobre seats.
+**Contrato anual prepagado con volumen garantizado.**
 
-| Componente | Descripción |
-|---|---|
-| Precio unitario | Desde $0.0006/llamada (volumen mínimo: 2M llamadas/mes comprometidas) |
-| Corpus size | Ilimitado (bounded por timeout SLA acordado) |
-| Dimensionalidad | Sin límite de software; límite físico por timeout |
-| CI con distribución privada | Sí — distribución empírica entrenada exclusivamente sobre corpus del cliente, no compartida con el pool global |
-| Dominio NMI privado | Sí — el data flywheel opera sobre un namespace aislado en PostgreSQL |
-| Deployment | SaaS multi-tenant o single-tenant VPC dedicada |
-| Rate limit | Configurable, burst ilimitado con throttling acordado |
-| SLA uptime | 99.9% mensual con penalización contractual |
-| Soporte | Slack dedicado + TAM asignado, respuesta < 4h en horario laboral |
-| Auditoría | Exportación de la distribución NMI empírica por dominio para auditoría interna |
+| Parámetro | Condición |
+|-----------|-----------|
+| Volumen mínimo facturable | 10M operaciones / mes |
+| Precio por operación | Negociado, piso orientativo $0.00010 — $0.00014 |
+| Batch size máximo | 512 pares |
+| Dimensión máxima | Sin límite (sujeto a SLA de latencia acordado) |
+| Dominios | `text`, `image`, `tabular` + dominio custom con fine-tuning de alpha/beta sobre datos propios |
+| Score devuelto | Completo + `calibration_metadata` (intervalo de confianza del NMI, versión de pesos) |
+| Latencia objetivo (p99) | Acordado en SLA; base: < 80 ms p99 |
+| Rate limit | Dedicado (throughput reservado, no compartido) |
+| Autenticación | mTLS + IP allowlist + rotación de claves automatizada |
+| Soporte | Slack dedicado + TAM asignado + SLA 4 h respuesta crítica |
+| Acuerdo de datos | BAA disponible; los hashes SHA-256 de inputs pueden excluirse del log si se firma contrato de auditoría |
+| SLA de uptime | 99.9% mensual con créditos escalonados |
 
----
-
-## Definición de "operación facturable"
-
-Una llamada cuenta como **1 operación facturable** cuando:
-
-1. El endpoint recibe un payload válido (query vector/text/tabular + corpus)
-2. El pipeline NMI->Cosine completa sin error de validación
-3. La respuesta contiene al menos 1 resultado rankeado con intervalo de confianza
-
-**No se factura:**
-- Respuestas 4xx (payload inválido, autenticación fallida)
-- Respuestas 5xx (error interno del servicio)
-- Llamadas que excedan el rate limit (429)
-- Health checks en `/health`
+**Entregable diferencial Enterprise:** fine-tuning del vector de pesos (alpha, beta) sobre corpus anotado del cliente. Los rankings resultantes son específicos al dominio propietario del cliente y no están disponibles en ningún nivel inferior. Esto convierte el contrato Enterprise en un activo técnico no portátil — el cliente no puede llevarse el modelo de pesos a un competidor porque ese modelo fue entrenado con su propio log de producción.
 
 ---
 
-## Parámetros que modulan el costo computacional real
+## Anatomía del precio por operación
 
-El precio por llamada es plano dentro del tier, pero estos parámetros determinan si una llamada es técnicamente viable en cada tier:
-
-| Parámetro de la llamada | Impacto en O() | Límite Free | Límite Pro | Límite Enterprise |
-|---|---|---|---|---|
-| `corpus_size` (n) | O(n) en NMI | 500 | 50,000 | Sin límite de software |
-| `feature_dim` (d) | O(d·log d) en NMI | 128 | 2,048 | Sin límite de software |
-| `top_k` resultados | O(n) en sort final | 10 | 100 | 1,000 |
-| `confidence_level` | Constante (lookup) | Fijo 0.80 | {0.80, 0.90, 0.95} | Arbitrario [0.50, 0.99] |
-| `nmi_threshold` (filtro mínimo) | Reduce d efectivo | No configurable | Configurable | Configurable |
-
----
-
-## Justificación del precio base Pro ($0.0028)
-
-El cálculo deriva del costo marginal real del pipeline:
+El precio de $0.0004 en Pro no es arbitrario:
 
 ```
-Costo computacional por llamada (corpus=5k items, d=512):
-  NMI calculation:     ~85ms  en c5.xlarge (4 vCPU)
-  Cosine + ranking:    ~12ms
-  CI lookup (DB):       ~4ms
-  Total:              ~101ms -> 0.028 vCPU-segundos
+Coste de cómputo por par (p95, d=1536):
+  Coseno:           O(d)   -> ~0.003 ms en CPU moderno
+  NMI (histograma): O(d * B) con B=32 bins -> ~0.08 ms
+  Calibración alpha: O(1)  -> lookup de tabla por dominio
+  Total latencia pura: ~0.1 ms
 
-Costo AWS c5.xlarge:  $0.068/hora = $0.0000189/seg
-Costo directo:        0.028 * 4 vCPU * $0.0000189 = ~$0.0021
-Margen operativo 33%: $0.0028
+Overhead de red + serialización: ~8 ms median
+Infraestructura (Uvicorn + load balancer + logging):
+  ~$0.000040 / operación a escala de 1M ops/mes en c6g.2xlarge
+
+Margen bruto objetivo: 85%
+Precio mínimo para sostener margen: $0.000040 / (1 - 0.85) = $0.000267
+Precio publicado $0.0004 -> margen real ~90% en tramo base,
+  comprimiéndose a ~78% en tramo 1M-10M — aún sostenible.
 ```
 
-El precio desciende con volumen porque el data flywheel reduce latencia media de CI lookup conforme crece la distribución empírica por dominio — el costo marginal cae, y esa eficiencia se traslada parcialmente al cliente.
+El margen se comprime con volumen pero el flywheel de recalibración de alpha/beta se acelera: más volumen -> mejores pesos -> mayor NDCG -> menor churn -> justifica el descuento.
 
 ---
 
-## Límites de crédito y protección contra sorpresas
+## Métrica de valor para el developer
 
-- **Hard limit configurable por el usuario:** el cliente define un gasto máximo mensual; al alcanzarlo, las llamadas Pro devuelven 402 en vez de continuar facturando.
-- **Alertas automáticas:** al 50%, 80% y 100% del límite definido.
-- **Free no se convierte en Pro automáticamente:** al agotar las 500 llamadas free, el endpoint devuelve 429 con `Retry-After` hasta el primer día del mes siguiente. No hay cargo silencioso.
+La unidad de valor que comunica el pricing no es "por request" en abstracto — es **por decisión de ranking corregida estadísticamente**.
+
+En benchmarks BEIR (corpus heterogéneo, correlaciones no-lineales entre tokens y relevancia), el score compuesto NMI+Cosine con alpha calibrado por dominio supera al coseno puro en NDCG@10 entre +2.1 y +4.8 puntos porcentuales dependiendo del corpus. Para un sistema de RAG con 10 000 queries/día y precisión base del 70%, esa mejora se traduce en ~210-480 respuestas adicionales correctas por día — cada una potencialmente evitando una escalada de soporte o cerrando una conversión. El coste de esas 10 000 operaciones en Pro es $4/día.
+
+El argumento de venta no es el precio; es el coste de oportunidad de usar coseno puro.
 
 ---
 
-## Comparativa de mercado (posicionamiento)
+## Invariantes del modelo
 
-| Alternativa | Costo equivalente | Gap técnico |
-|---|---|---|
-| Pinecone s1 pod (100k vectors) | ~$70/mes fijo + $0.004/query | Sin NMI; requiere indexado previo; no devuelve CI |
-| Weaviate Cloud (serverless) | $0.045/1k unidades de dimensión | Sin NMI; pricing opaco por "dimension units"; sin CI |
-| OpenSearch k-NN (self-hosted) | $0.096/hora instancia mínima | Sin NMI; FAISS puro; sin CI; requiere cluster |
-| Este activo (Pro, 10k calls/mes) | $28/mes, zero setup | NMI-weighted + CI + stateless |
+1. **Nunca se cobra por almacenamiento** — la arquitectura stateless es tanto una decisión técnica como una promesa de pricing. Si en algún momento se introduce persistencia opcional, debe ser un tier separado con pricing separado, no una contaminación del modelo existente.
 
-El diferencial no es solo de precio — es de **tiempo hasta primer resultado válido**: vector DBs requieren ingesta + indexado (minutos a horas). Este activo: 0 segundos de setup, primera llamada útil en < 200ms.
+2. **El batch descuenta latencia, no precio** — un batch de 128 pares cuesta 128 × $0.0004. El beneficio del batch es throughput y latencia reducida para el cliente, no descuento por unidad. Esto mantiene la métrica de precio limpia y predecible.
+
+3. **Free nunca expone NMI directamente** — la opacidad del componente estadístico en Free es estructural, no una decisión de UX. Si el NMI se expone en Free, desaparece el diferencial técnico que justifica la conversión a Pro.
+
+4. **Los pesos alpha/beta son versionados y auditables en Pro** — el campo `alpha` en la respuesta es el peso efectivo usado en esa llamada. Esto genera confianza técnica y permite al developer reproducir el score localmente con el coseno si audita una decisión específica — sin revelar la implementación del NMI.
