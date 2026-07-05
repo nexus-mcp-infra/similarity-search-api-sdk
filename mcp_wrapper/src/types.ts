@@ -22,41 +22,36 @@ export class CoreServiceError extends Error {
   }
 }
 
-export interface RankVectorsByNmiCosineInput {
-  query_vector: number[];
-  corpus_vectors: number[][];
-  nmi_threshold?: number | undefined;
+export interface RankEmbeddingsByNmiCosineInput {
+  query_embedding: number[];
+  candidate_embeddings: number[][];
+  domain: string;
   top_k?: number | undefined;
-  confidence_level?: number | undefined;
+  return_scores?: boolean | undefined;
 }
 
-export interface ComputeTokenizedCorpusSimilarityInput {
-  query_token_features: number[];
-  corpus_token_features: number[][];
-  nmi_bins?: number | undefined;
+export interface ComputePairwiseNmiCosineMatrixInput {
+  embeddings: number[][];
+  domain: string;
+  normalize_output?: boolean | undefined;
+}
+
+export interface ScoreEmbeddingPairNmiCosineInput {
+  embedding_a: number[];
+  embedding_b: number[];
+  domain: string;
+}
+
+export interface CalibrateDomainNmiCosineWeightsInput {
+  anchor_embeddings: number[][];
+  positive_embeddings: number[][];
+  negative_embeddings: number[][];
+  domain_label: string;
+}
+
+export interface ExplainNmiCosineRankDivergenceInput {
+  query_embedding: number[];
+  candidate_embeddings: number[][];
+  domain: string;
   top_k?: number | undefined;
-  confidence_level?: number | undefined;
-}
-
-export interface ExtractNmiFeatureWeightsInput {
-  query_vector: number[];
-  corpus_vectors: number[][];
-  nmi_bins?: number | undefined;
-  return_top_n_dimensions?: number | undefined;
-}
-
-export interface CompareTabularRowSimilarityInput {
-  query_row: number[];
-  corpus_rows: number[][];
-  column_names?: string[] | undefined;
-  nmi_threshold?: number | undefined;
-  top_k?: number | undefined;
-  confidence_level?: number | undefined;
-}
-
-export interface EstimateSimilarityConfidenceBandInput {
-  similarity_scores: number[];
-  nmi_weight_distribution: number[];
-  confidence_level?: number | undefined;
-  bootstrap_iterations?: number | undefined;
 }
