@@ -1,7 +1,7 @@
 {
   "name": "@nexus-mcp/similarity-search-api",
   "version": "1.0.0",
-  "description": "Computes NMI-weighted cosine similarity between a query vector and a corpus in a single stateless HTTP call, returning ranked matches with empirical confidence intervals derived from the NMI distribution over query features.",
+  "description": "Computes on-the-fly semantic similarity between raw embedding vectors using a calibrated NMI+Cosine composite score without requiring vector storage, indexing, or upsert operations.",
   "type": "module",
   "main": "dist/index.js",
   "bin": {
