@@ -1,505 +1,417 @@
 from __future__ import annotations
 
+import os
 import time
-import logging
-from typing import Any, Optional, Union
-from dataclasses import dataclass, field
+from typing import Any
 
-import numpy as np
-import requests
+import httpx
 
-from src.math.information import NormalizedMutualInformation, TransferEntropy
-from src.math.causal import DoCalculus, CausalDAG
-from src.math.game_theory import NashEquilibrium
-
-logger = logging.getLogger("similarity_search_sdk")
-
-_DEFAULT_BASE_URL = "https://api.similaritysearch.io/v1"
+_DEFAULT_BASE_URL = "https://api.nexus-similarity.io/v1"
 _DEFAULT_TIMEOUT_SECONDS = 30.0
-_DEFAULT_TOP_K = 10
-_MAX_COLLECTION_SIZE = 10_000
-_MIN_COLLECTION_SIZE = 1
-_MAX_FEATURES = 4_096
-_MIN_TOP_K = 1
-_MAX_TOP_K = 500
+_MAX_RETRIES = 3
+_RETRY_BACKOFF_BASE = 0.5
 
 
 class SimilaritySearchError(Exception):
-    pass
+    """Raised when the Similarity Search API returns a non-2xx response."""
+
+    def __init__(self, status_code: int, detail: str) -> None:
+        self.status_code = status_code
+        self.detail = detail
+        super().__init__(f"HTTP {status_code}: {detail}")
 
 
 class AuthenticationError(SimilaritySearchError):
-    pass
-
-
-class ValidationError(SimilaritySearchError):
-    pass
+    """Raised when the API key is missing or rejected (401/403)."""
 
 
 class RateLimitError(SimilaritySearchError):
-    def __init__(self, message: str, retry_after: Optional[float] = None):
-        super().__init__(message)
-        self.retry_after = retry_after
+    """Raised when the API signals rate limiting (429)."""
 
 
-class UpstreamAPIError(SimilaritySearchError):
-    def __init__(self, message: str, status_code: int, response_body: Any = None):
-        super().__init__(message)
-        self.status_code = status_code
-        self.response_body = response_body
-
-
-@dataclass
-class SimilarityMatch:
-    index: int
-    score: float
-    item: dict[str, Any]
-    nmi_weights: list[float] = field(default_factory=list)
-
-
-@dataclass
 class SimilaritySearchResult:
-    matches: list[SimilarityMatch]
-    query_item: dict[str, Any]
-    nmi_weight_vector: list[float]
-    computation_ms: float
-    model_version: str
-    transfer_entropy_signal: float
-    nash_equilibrium_threshold: float
+    """Structured response from a NMI-weighted cosine similarity query."""
 
-
-def _validate_nonempty_list(value: Any, name: str) -> list:
-    if value is None:
-        raise ValidationError(f"'{name}' must not be None.")
-    if not isinstance(value, list):
-        raise ValidationError(
-            f"'{name}' must be a list, got {type(value).__name__}."
-        )
-    if len(value) == 0:
-        raise ValidationError(f"'{name}' must contain at least one item.")
-    return value
-
-
-def _validate_collection_size(collection: list, name: str) -> None:
-    if len(collection) < _MIN_COLLECTION_SIZE:
-        raise ValidationError(
-            f"'{name}' must have at least {_MIN_COLLECTION_SIZE} item(s)."
-        )
-    if len(collection) > _MAX_COLLECTION_SIZE:
-        raise ValidationError(
-            f"'{name}' exceeds maximum allowed size of {_MAX_COLLECTION_SIZE} items."
-        )
-
-
-def _validate_item_structure(item: Any, index: int, collection_name: str) -> None:
-    if not isinstance(item, dict):
-        raise ValidationError(
-            f"Item at index {index} in '{collection_name}' must be a dict, "
-            f"got {type(item).__name__}."
-        )
-    if "features" not in item:
-        raise ValidationError(
-            f"Item at index {index} in '{collection_name}' missing required key 'features'."
-        )
-    features = item["features"]
-    if not isinstance(features, (list, np.ndarray)):
-        raise ValidationError(
-            f"Item at index {index} in '{collection_name}': 'features' must be a list "
-            f"or numpy array, got {type(features).__name__}."
-        )
-    if len(features) == 0:
-        raise ValidationError(
-            f"Item at index {index} in '{collection_name}': 'features' must be non-empty."
-        )
-    if len(features) > _MAX_FEATURES:
-        raise ValidationError(
-            f"Item at index {index} in '{collection_name}': 'features' length {len(features)} "
-            f"exceeds maximum of {_MAX_FEATURES}."
-        )
-
-
-def _extract_feature_matrix(collection: list[dict[str, Any]]) -> np.ndarray:
-    arrays = []
-    reference_dim = len(collection[0]["features"])
-    for idx, item in enumerate(collection):
-        feat = item["features"]
-        arr = np.array(feat, dtype=np.float64)
-        if arr.ndim != 1:
-            raise ValidationError(
-                f"Item at index {idx}: 'features' must be a 1-D array, "
-                f"got shape {arr.shape}."
-            )
-        if len(arr) != reference_dim:
-            raise ValidationError(
-                f"Item at index {idx}: 'features' length {len(arr)} does not match "
-                f"reference dimensionality {reference_dim}. All items must share the same "
-                f"feature dimension."
-            )
-        arrays.append(arr)
-    return np.stack(arrays, axis=0)
-
-
-def _compute_nmi_weight_vector(
-    query_vec: np.ndarray,
-    collection_matrix: np.ndarray,
-    nmi_calculator: NormalizedMutualInformation,
-) -> np.ndarray:
-    n_items, n_dims = collection_matrix.shape
-    weights = np.zeros(n_dims, dtype=np.float64)
-    for dim_idx in range(n_dims):
-        feature_column = collection_matrix[:, dim_idx]
-        target_column = np.full(n_items, query_vec[dim_idx], dtype=np.float64)
-        nmi_value = nmi_calculator.compute(feature_column, target_column)
-        weights[dim_idx] = max(float(nmi_value), 0.0)
-    weight_sum = weights.sum()
-    if weight_sum > 0.0:
-        weights = weights / weight_sum
-    else:
-        weights = np.ones(n_dims, dtype=np.float64) / n_dims
-    return weights
-
-
-def _nmi_weighted_cosine_scores(
-    query_vec: np.ndarray,
-    collection_matrix: np.ndarray,
-    weights: np.ndarray,
-) -> np.ndarray:
-    weighted_query = weights * query_vec
-    weighted_collection = collection_matrix * weights[np.newaxis, :]
-    query_norm = np.linalg.norm(weighted_query)
-    collection_norms = np.linalg.norm(weighted_collection, axis=1)
-    if query_norm == 0.0:
-        raise ValidationError(
-            "Query feature vector is all-zeros after NMI weighting; "
-            "cosine similarity is undefined."
-        )
-    zero_mask = collection_norms == 0.0
-    scores = np.zeros(len(collection_matrix), dtype=np.float64)
-    nonzero = ~zero_mask
-    if nonzero.any():
-        dot_products = weighted_collection[nonzero] @ weighted_query
-        scores[nonzero] = dot_products / (collection_norms[nonzero] * query_norm)
-    return scores
-
-
-def _compute_transfer_entropy_signal(
-    query_vec: np.ndarray,
-    collection_matrix: np.ndarray,
-    te_calculator: TransferEntropy,
-) -> float:
-    mean_collection = collection_matrix.mean(axis=0)
-    te_value = te_calculator.compute(
-        source=query_vec,
-        target=mean_collection,
-        lag=1,
+    __slots__ = (
+        "matches",
+        "nmi_weights",
+        "confidence_interval",
+        "effective_dimensions",
+        "request_id",
     )
-    return float(te_value)
 
+    def __init__(self, payload: dict[str, Any]) -> None:
+        self.matches: list[dict[str, Any]] = payload.get("matches", [])
+        self.nmi_weights: list[float] = payload.get("nmi_weights", [])
+        self.confidence_interval: dict[str, float] = payload.get(
+            "confidence_interval", {}
+        )
+        self.effective_dimensions: int = payload.get("effective_dimensions", 0)
+        self.request_id: str = payload.get("request_id", "")
 
-def _derive_nash_threshold(
-    scores: np.ndarray,
-    nash_solver: NashEquilibrium,
-) -> float:
-    if len(scores) < 2:
-        return float(scores[0]) if len(scores) == 1 else 0.0
-    unique_scores = np.unique(scores)
-    if len(unique_scores) < 2:
-        return float(unique_scores[0])
-    payoff_matrix = np.array([
-        [float(unique_scores[-1]), float(unique_scores[0])],
-        [float(unique_scores[0]), float(unique_scores[-1])],
-    ])
-    equilibrium = nash_solver.solve(payoff_matrix)
-    threshold = float(equilibrium.mixed_strategy_value)
-    return threshold
-
-
-def _build_causal_feature_dag(
-    n_dims: int,
-    do_calculus: DoCalculus,
-    causal_dag: CausalDAG,
-) -> np.ndarray:
-    if n_dims <= 1:
-        return np.ones(n_dims, dtype=np.float64)
-    edges = [(i, i + 1) for i in range(min(n_dims - 1, 8))]
-    dag = causal_dag.build(n_nodes=n_dims, edges=edges)
-    causal_weights = do_calculus.compute_feature_relevance(dag)
-    arr = np.array(causal_weights, dtype=np.float64)
-    if arr.shape[0] != n_dims:
-        arr = np.ones(n_dims, dtype=np.float64)
-    w_sum = arr.sum()
-    if w_sum > 0.0:
-        arr = arr / w_sum
-    return arr
+    def __repr__(self) -> str:
+        return (
+            f"SimilaritySearchResult("
+            f"matches={len(self.matches)}, "
+            f"effective_dimensions={self.effective_dimensions}, "
+            f"confidence_interval={self.confidence_interval}, "
+            f"request_id={self.request_id!r})"
+        )
 
 
 class Client:
+    """
+    HTTP wrapper for the Similarity Search API.
+
+    Performs NMI-weighted cosine similarity over a query vector (or tokenised
+    text / tabular features) against a local corpus in a single stateless call.
+
+    Args:
+        api_key: Secret key issued by NEXUS. Falls back to the environment
+            variable SIMILARITY_SEARCH_API_KEY when omitted.
+        base_url: Override the production endpoint (useful for staging).
+        timeout: Per-request timeout in seconds.
+        max_retries: Number of automatic retries on 5xx or network errors.
+    """
+
     def __init__(
         self,
-        api_key: str,
+        api_key: str | None = None,
         base_url: str = _DEFAULT_BASE_URL,
         timeout: float = _DEFAULT_TIMEOUT_SECONDS,
-        enable_local_precompute: bool = True,
-    ):
-        if not api_key or not isinstance(api_key, str):
+        max_retries: int = _MAX_RETRIES,
+    ) -> None:
+        resolved_key = api_key or os.environ.get("SIMILARITY_SEARCH_API_KEY")
+        if not resolved_key:
             raise AuthenticationError(
-                "A valid non-empty 'api_key' string is required to initialize the Client."
+                401,
+                "No API key provided. Pass api_key= or set the "
+                "SIMILARITY_SEARCH_API_KEY environment variable.",
             )
-        self._api_key = api_key
+        if not isinstance(resolved_key, str) or not resolved_key.strip():
+            raise AuthenticationError(
+                401,
+                "api_key must be a non-empty string.",
+            )
+
+        self._api_key = resolved_key.strip()
         self._base_url = base_url.rstrip("/")
         self._timeout = timeout
-        self._enable_local_precompute = enable_local_precompute
-        self._session = requests.Session()
-        self._session.headers.update({
-            "Authorization": f"Bearer {self._api_key}",
-            "Content-Type": "application/json",
-            "X-SDK-Version": "1.0.0",
-        })
-        self._nmi = NormalizedMutualInformation()
-        self._te = TransferEntropy()
-        self._do = DoCalculus()
-        self._dag_builder = CausalDAG()
-        self._nash = NashEquilibrium()
+        self._max_retries = max_retries
 
-    def nmi_ranked_search(
-        self,
-        query: dict[str, Any],
-        collection: list[dict[str, Any]],
-        top_k: int = _DEFAULT_TOP_K,
-        use_causal_reweighting: bool = False,
-    ) -> SimilaritySearchResult:
-        if query is None or not isinstance(query, dict):
-            raise ValidationError(
-                "'query' must be a non-None dict with a 'features' key, "
-                f"got {type(query).__name__}."
-            )
-        _validate_item_structure(query, 0, "query")
-        _validate_nonempty_list(collection, "collection")
-        _validate_collection_size(collection, "collection")
-        for idx, item in enumerate(collection):
-            _validate_item_structure(item, idx, "collection")
-        if not isinstance(top_k, int) or isinstance(top_k, bool):
-            raise ValidationError(
-                f"'top_k' must be an integer, got {type(top_k).__name__}."
-            )
-        if top_k < _MIN_TOP_K or top_k > _MAX_TOP_K:
-            raise ValidationError(
-                f"'top_k' must be between {_MIN_TOP_K} and {_MAX_TOP_K}, got {top_k}."
-            )
-
-        if self._enable_local_precompute:
-            return self._local_nmi_ranked_search(
-                query=query,
-                collection=collection,
-                top_k=top_k,
-                use_causal_reweighting=use_causal_reweighting,
-            )
-        return self._remote_nmi_ranked_search(
-            query=query,
-            collection=collection,
-            top_k=top_k,
-            use_causal_reweighting=use_causal_reweighting,
+        self._http = httpx.Client(
+            headers={
+                "Authorization": f"Bearer {self._api_key}",
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "User-Agent": "nexus-similarity-sdk-python/1.0.0",
+            },
+            timeout=self._timeout,
         )
+
+    def nmi_cosine_search(
+        self,
+        query: list[float] | list[str] | list[list[float]],
+        corpus: list[list[float]] | list[str] | list[list[float]],
+        top_k: int = 10,
+        nmi_threshold: float = 0.05,
+        domain_hint: str | None = None,
+        include_nmi_weights: bool = False,
+    ) -> SimilaritySearchResult:
+        """
+        Run NMI-filtered cosine similarity between *query* and *corpus*.
+
+        Use this method when:
+        - You have a single query and an in-memory corpus (up to ~100k items).
+        - You need the NMI confidence interval for auditability or downstream
+          thresholding.
+        - You are working with raw vectors, tokenised text, or tabular feature
+          rows without a pre-built index.
+
+        Do NOT use this method when:
+        - Your corpus exceeds 500k items — use a dedicated vector DB instead.
+        - You need real-time streaming results — this call is synchronous.
+        - You want to persist or index the corpus on the server side — this
+          API is stateless by design.
+
+        Args:
+            query: A single feature vector (list of floats), a list of tokens
+                (list of strings), or a single tabular feature row
+                (list of floats). Must not be empty.
+            corpus: A list of items in the same representation as *query*.
+                Must contain at least one item and use a consistent type with
+                *query*.
+            top_k: Number of nearest neighbours to return. Must be between 1
+                and 1000 (inclusive).
+            nmi_threshold: Minimum NMI score for a feature dimension to be
+                included in the cosine distance calculation. Lower values
+                retain more dimensions; 0.0 disables NMI filtering. Must be
+                in [0.0, 1.0].
+            domain_hint: Optional string label (e.g. "biomedical", "ecommerce")
+                used to select the matching empirical NMI distribution in the
+                percentile backend, yielding tighter confidence intervals.
+                Ignored if the domain has fewer than 1000 observations.
+            include_nmi_weights: When True, the response includes the per-
+                dimension NMI weights used during the search.
+
+        Returns:
+            SimilaritySearchResult with ranked matches, confidence interval,
+            and effective dimensionality after NMI filtering.
+
+        Raises:
+            ValueError: On invalid or empty inputs.
+            AuthenticationError: On 401/403 responses.
+            RateLimitError: On 429 responses.
+            SimilaritySearchError: On all other non-2xx responses.
+        """
+        self._validate_nmi_cosine_inputs(query, corpus, top_k, nmi_threshold)
+
+        body: dict[str, Any] = {
+            "query": query,
+            "corpus": corpus,
+            "top_k": top_k,
+            "nmi_threshold": nmi_threshold,
+            "include_nmi_weights": include_nmi_weights,
+        }
+        if domain_hint is not None:
+            if not isinstance(domain_hint, str) or not domain_hint.strip():
+                raise ValueError("domain_hint must be a non-empty string when provided.")
+            body["domain_hint"] = domain_hint.strip()
+
+        response_payload = self._post_with_retries(
+            endpoint="/search/nmi-cosine", body=body
+        )
+        return SimilaritySearchResult(response_payload)
 
     def main_method(
         self,
         data: dict[str, Any],
-        top_k: int = _DEFAULT_TOP_K,
     ) -> SimilaritySearchResult:
-        if data is None or not isinstance(data, dict):
-            raise ValidationError(
-                "'data' must be a dict with keys 'query' (item) and 'collection' (list of items). "
-                f"Got {type(data).__name__}."
+        """
+        Convenience entry-point that delegates to nmi_cosine_search using a
+        structured dict payload.
+
+        Expected keys in *data*:
+            query (required): same as nmi_cosine_search query parameter.
+            corpus (required): same as nmi_cosine_search corpus parameter.
+            top_k (optional, default 10): int in [1, 1000].
+            nmi_threshold (optional, default 0.05): float in [0.0, 1.0].
+            domain_hint (optional): str.
+            include_nmi_weights (optional, default False): bool.
+
+        Raises:
+            TypeError: When *data* is not a dict.
+            KeyError: When required keys are absent.
+        """
+        if data is None:
+            raise TypeError(
+                "data must be a non-None dict. Received None."
             )
-        if "query" not in data:
-            raise ValidationError(
-                "'data' dict missing required key 'query'."
+        if not isinstance(data, dict):
+            raise TypeError(
+                f"data must be a dict, got {type(data).__name__}."
             )
-        if "collection" not in data:
-            raise ValidationError(
-                "'data' dict missing required key 'collection'."
+        missing = [k for k in ("query", "corpus") if k not in data]
+        if missing:
+            raise KeyError(
+                f"data is missing required key(s): {missing}. "
+                "Provide both 'query' and 'corpus'."
             )
-        return self.nmi_ranked_search(
+
+        return self.nmi_cosine_search(
             query=data["query"],
-            collection=data["collection"],
-            top_k=top_k,
-            use_causal_reweighting=data.get("use_causal_reweighting", False),
+            corpus=data["corpus"],
+            top_k=data.get("top_k", 10),
+            nmi_threshold=data.get("nmi_threshold", 0.05),
+            domain_hint=data.get("domain_hint"),
+            include_nmi_weights=data.get("include_nmi_weights", False),
         )
 
-    def _local_nmi_ranked_search(
-        self,
-        query: dict[str, Any],
-        collection: list[dict[str, Any]],
-        top_k: int,
-        use_causal_reweighting: bool,
-    ) -> SimilaritySearchResult:
-        t0 = time.perf_counter()
-        query_vec = np.array(query["features"], dtype=np.float64)
-        collection_matrix = _extract_feature_matrix(collection)
-        n_dims = query_vec.shape[0]
-        nmi_weights = _compute_nmi_weight_vector(
-            query_vec=query_vec,
-            collection_matrix=collection_matrix,
-            nmi_calculator=self._nmi,
-        )
-        if use_causal_reweighting and n_dims > 1:
-            causal_weights = _build_causal_feature_dag(
-                n_dims=n_dims,
-                do_calculus=self._do,
-                causal_dag=self._dag_builder,
-            )
-            combined = nmi_weights * causal_weights
-            w_sum = combined.sum()
-            nmi_weights = combined / w_sum if w_sum > 0.0 else nmi_weights
-        scores = _nmi_weighted_cosine_scores(
-            query_vec=query_vec,
-            collection_matrix=collection_matrix,
-            weights=nmi_weights,
-        )
-        te_signal = _compute_transfer_entropy_signal(
-            query_vec=query_vec,
-            collection_matrix=collection_matrix,
-            te_calculator=self._te,
-        )
-        nash_threshold = _derive_nash_threshold(
-            scores=scores,
-            nash_solver=self._nash,
-        )
-        ranked_indices = np.argsort(scores)[::-1]
-        k = min(top_k, len(collection))
-        top_indices = ranked_indices[:k]
-        matches = [
-            SimilarityMatch(
-                index=int(idx),
-                score=float(scores[idx]),
-                item=collection[int(idx)],
-                nmi_weights=nmi_weights.tolist(),
-            )
-            for idx in top_indices
-        ]
-        elapsed_ms = (time.perf_counter() - t0) * 1_000.0
-        return SimilaritySearchResult(
-            matches=matches,
-            query_item=query,
-            nmi_weight_vector=nmi_weights.tolist(),
-            computation_ms=round(elapsed_ms, 3),
-            model_version="nmi-cosine-hybrid-v1",
-            transfer_entropy_signal=te_signal,
-            nash_equilibrium_threshold=nash_threshold,
-        )
+    def health(self) -> dict[str, Any]:
+        """
+        Ping the API health endpoint.
 
-    def _remote_nmi_ranked_search(
-        self,
-        query: dict[str, Any],
-        collection: list[dict[str, Any]],
-        top_k: int,
-        use_causal_reweighting: bool,
-    ) -> SimilaritySearchResult:
-        payload = {
-            "query": {
-                "features": [float(f) for f in query["features"]],
-                **{k: v for k, v in query.items() if k != "features"},
-            },
-            "collection": [
-                {
-                    "features": [float(f) for f in item["features"]],
-                    **{k: v for k, v in item.items() if k != "features"},
-                }
-                for item in collection
-            ],
-            "top_k": top_k,
-            "use_causal_reweighting": use_causal_reweighting,
-        }
+        Returns a dict with at least {"status": "ok", "version": str}.
+        Raises SimilaritySearchError on any non-2xx response.
+
+        Use this to verify connectivity and credentials before a batch run.
+        Do NOT poll this endpoint in a tight loop — it counts against your
+        rate limit quota.
+        """
+        return self._get_with_retries("/health")
+
+    def close(self) -> None:
+        """Release the underlying HTTP connection pool."""
+        self._http.close()
+
+    def __enter__(self) -> "Client":
+        return self
+
+    def __exit__(self, *_: Any) -> None:
+        self.close()
+
+    def _post_with_retries(
+        self, endpoint: str, body: dict[str, Any]
+    ) -> dict[str, Any]:
+        url = f"{self._base_url}{endpoint}"
+        last_exc: Exception | None = None
+
+        for attempt in range(self._max_retries):
+            try:
+                response = self._http.post(url, json=body)
+            except httpx.TimeoutException as exc:
+                last_exc = exc
+                self._backoff(attempt)
+                continue
+            except httpx.RequestError as exc:
+                last_exc = exc
+                self._backoff(attempt)
+                continue
+
+            if response.status_code < 300:
+                return self._parse_json_response(response)
+
+            if response.status_code in (401, 403):
+                detail = self._extract_detail(response)
+                raise AuthenticationError(response.status_code, detail)
+
+            if response.status_code == 422:
+                detail = self._extract_detail(response)
+                raise ValueError(
+                    f"API rejected the request payload (HTTP 422): {detail}"
+                )
+
+            if response.status_code == 429:
+                detail = self._extract_detail(response)
+                raise RateLimitError(429, detail)
+
+            if response.status_code >= 500:
+                last_exc = SimilaritySearchError(
+                    response.status_code, self._extract_detail(response)
+                )
+                self._backoff(attempt)
+                continue
+
+            detail = self._extract_detail(response)
+            raise SimilaritySearchError(response.status_code, detail)
+
+        if last_exc is not None:
+            if isinstance(last_exc, SimilaritySearchError):
+                raise last_exc
+            raise SimilaritySearchError(
+                503,
+                f"Request failed after {self._max_retries} attempts: {last_exc}",
+            )
+        raise SimilaritySearchError(503, "Request failed for unknown reason.")
+
+    def _get_with_retries(self, endpoint: str) -> dict[str, Any]:
+        url = f"{self._base_url}{endpoint}"
+        last_exc: Exception | None = None
+
+        for attempt in range(self._max_retries):
+            try:
+                response = self._http.get(url)
+            except httpx.TimeoutException as exc:
+                last_exc = exc
+                self._backoff(attempt)
+                continue
+            except httpx.RequestError as exc:
+                last_exc = exc
+                self._backoff(attempt)
+                continue
+
+            if response.status_code < 300:
+                return self._parse_json_response(response)
+
+            if response.status_code in (401, 403):
+                raise AuthenticationError(
+                    response.status_code, self._extract_detail(response)
+                )
+
+            if response.status_code == 429:
+                raise RateLimitError(429, self._extract_detail(response))
+
+            if response.status_code >= 500:
+                last_exc = SimilaritySearchError(
+                    response.status_code, self._extract_detail(response)
+                )
+                self._backoff(attempt)
+                continue
+
+            raise SimilaritySearchError(
+                response.status_code, self._extract_detail(response)
+            )
+
+        if last_exc is not None:
+            if isinstance(last_exc, SimilaritySearchError):
+                raise last_exc
+            raise SimilaritySearchError(
+                503,
+                f"Request failed after {self._max_retries} attempts: {last_exc}",
+            )
+        raise SimilaritySearchError(503, "Request failed for unknown reason.")
+
+    @staticmethod
+    def _parse_json_response(response: httpx.Response) -> dict[str, Any]:
         try:
-            response = self._session.post(
-                f"{self._base_url}/search/nmi-ranked",
-                json=payload,
-                timeout=self._timeout,
+            return response.json()
+        except Exception as exc:
+            raise SimilaritySearchError(
+                response.status_code,
+                f"API returned non-JSON body: {exc}",
             )
-        except requests.exceptions.Timeout:
-            raise UpstreamAPIError(
-                f"Request timed out after {self._timeout}s. "
-                "Consider reducing collection size or increasing timeout.",
-                status_code=408,
-            )
-        except requests.exceptions.ConnectionError as exc:
-            raise UpstreamAPIError(
-                f"Connection error reaching {self._base_url}: {exc}",
-                status_code=503,
-            )
-        self._raise_for_status(response)
-        body = response.json()
-        return self._parse_remote_response(body)
 
-    def _raise_for_status(self, response: requests.Response) -> None:
-        status = response.status_code
-        if status == 200:
-            return
+    @staticmethod
+    def _extract_detail(response: httpx.Response) -> str:
         try:
             body = response.json()
+            return str(body.get("detail") or body.get("message") or body)
         except Exception:
-            body = {"raw": response.text}
-        if status == 401:
-            raise AuthenticationError(
-                "API key rejected (HTTP 401). Verify the key passed to Client()."
-            )
-        if status == 429:
-            retry_after = None
-            try:
-                retry_after = float(response.headers.get("Retry-After", 1.0))
-            except (TypeError, ValueError):
-                retry_after = 1.0
-            raise RateLimitError(
-                f"Rate limit exceeded (HTTP 429). Retry after {retry_after}s.",
-                retry_after=retry_after,
-            )
-        if status == 422:
-            raise ValidationError(
-                f"Server rejected payload (HTTP 422): {body}"
-            )
-        if 400 <= status < 500:
-            raise UpstreamAPIError(
-                f"Client error (HTTP {status}): {body}",
-                status_code=status,
-                response_body=body,
-            )
-        if status >= 500:
-            raise UpstreamAPIError(
-                f"Server error (HTTP {status}): {body}",
-                status_code=status,
-                response_body=body,
+            return response.text[:500] if response.text else "(empty body)"
+
+    @staticmethod
+    def _backoff(attempt: int) -> None:
+        delay = _RETRY_BACKOFF_BASE * (2 ** attempt)
+        time.sleep(delay)
+
+    @staticmethod
+    def _validate_nmi_cosine_inputs(
+        query: Any,
+        corpus: Any,
+        top_k: Any,
+        nmi_threshold: Any,
+    ) -> None:
+        if query is None:
+            raise ValueError("query must not be None.")
+        if not isinstance(query, list) or len(query) == 0:
+            raise ValueError(
+                "query must be a non-empty list of floats, strings, or lists."
             )
 
-    def _parse_remote_response(self, body: dict[str, Any]) -> SimilaritySearchResult:
-        if not isinstance(body, dict):
-            raise UpstreamAPIError(
-                f"Unexpected response shape: expected dict, got {type(body).__name__}.",
-                status_code=200,
-                response_body=body,
+        if corpus is None:
+            raise ValueError("corpus must not be None.")
+        if not isinstance(corpus, list) or len(corpus) == 0:
+            raise ValueError(
+                "corpus must be a non-empty list of items matching the type "
+                "of query."
             )
-        raw_matches = body.get("matches", [])
-        if not isinstance(raw_matches, list):
-            raise UpstreamAPIError(
-                "Response 'matches' field must be a list.",
-                status_code=200,
-                response_body=body,
+
+        if not isinstance(top_k, int) or isinstance(top_k, bool):
+            raise TypeError(
+                f"top_k must be an int, got {type(top_k).__name__}."
             )
-        matches = []
-        for m in raw_matches:
-            matches.append(
-                SimilarityMatch(
-                    index=int(m.get("index", -1)),
-                    score=float(m.get("score", 0.0)),
-                    item=m.get("item", {}),
-                    nmi_weights=m.get("nmi_weights", []),
-                )
+        if not (1 <= top_k <= 1000):
+            raise ValueError(
+                f"top_k must be between 1 and 1000 inclusive, got {top_k}."
             )
-        return SimilaritySearchResult(
-            matches=matches,
-            query_item=body.get("query_item", {}),
-            nmi_weight_vector=body.get("nmi_weight_vector", []),
-            computation_ms=float(body.get("computation_ms", 0.0)),
-            model_version=str(body.get("model_version", "unknown")),
-            transfer_entropy_signal=float(body.get("transfer_entropy_signal", 0.0)),
-            nash_equilibrium_threshold=float(body.get("nash_equilibrium_threshold", 0.0)),
-        )
+
+        if not isinstance(nmi_threshold, (int, float)) or isinstance(
+            nmi_threshold, bool
+        ):
+            raise TypeError(
+                f"nmi_threshold must be a float, got {type(nmi_threshold).__name__}."
+            )
+        if not (0.0 <= float(nmi_threshold) <= 1.0):
+            raise ValueError(
+                f"nmi_threshold must be in [0.0, 1.0], got {nmi_threshold}."
+            )
