@@ -1,510 +1,391 @@
-from fastapi import FastAPI, HTTPException, Security, status
+from fastapi import FastAPI, HTTPException, Depends, Security
 from fastapi.security.api_key import APIKeyHeader
-from pydantic import BaseModel, Field, model_validator
-from typing import Any
+from pydantic import BaseModel, Field, field_validator
+from typing import Optional
 import numpy as np
 from scipy.stats import entropy as scipy_entropy
+from scipy.special import digamma
+from sklearn.preprocessing import KBinsDiscretizer
 import os
-import hashlib
 import time
+import hashlib
+import hmac
 
-from src.math.information import NormalizedMutualInformation, TransferEntropy
-from src.math.causal import DoCalculus, CausalDAG, build_nexus_dag
-from src.math.game_theory import NashEquilibrium, MarketEntryGame
-from src.math.statistics import Statistics
+API_KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=False)
+VALID_API_KEY = os.environ.get("SIMILARITY_API_KEY", "")
 
 app = FastAPI(
-    title="NMI Similarity Search API",
+    title="NMI-Weighted Cosine Similarity API",
+    description="Stateless similarity search combining Normalized Mutual Information feature filtering with Cosine distance. No vector DB required.",
     version="1.0.0",
-    description="Stateless NMI-weighted cosine similarity over heterogeneous feature collections. Zero infrastructure, per-call.",
     docs_url="/docs",
     redoc_url=None,
 )
 
-API_KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=True)
-_VALID_API_KEYS: set[str] = {k for k in os.environ.get("NMI_API_KEYS", "").split(",") if k}
 
-MAX_COLLECTION_SIZE = 10_000
-MAX_QUERY_SIZE = 500
-MAX_DIMENSIONS = 2_048
-MIN_DIMENSIONS = 1
+class VectorPayload(BaseModel):
+    query: list[float] = Field(..., min_length=2, max_length=4096, description="Query vector")
+    corpus: list[list[float]] = Field(..., min_length=1, max_length=10000, description="Corpus vectors to search against")
+    top_k: int = Field(default=10, ge=1, le=500, description="Number of top results to return")
+    nmi_threshold: float = Field(default=0.05, ge=0.0, le=1.0, description="Minimum NMI score to retain a feature dimension. Features below this threshold are masked before cosine computation.")
+    n_bins: int = Field(default=10, ge=3, le=50, description="Number of bins for NMI discretization of continuous features")
 
+    @field_validator("corpus")
+    @classmethod
+    def corpus_vectors_consistent_dim(cls, corpus: list[list[float]]) -> list[list[float]]:
+        if not corpus:
+            raise ValueError("corpus must contain at least one vector")
+        dim = len(corpus[0])
+        if dim < 2:
+            raise ValueError("corpus vectors must have at least 2 dimensions")
+        if dim > 4096:
+            raise ValueError("corpus vectors must have at most 4096 dimensions")
+        for i, vec in enumerate(corpus):
+            if len(vec) != dim:
+                raise ValueError(f"corpus vector at index {i} has dimension {len(vec)}, expected {dim}")
+        return corpus
 
-class FeatureVector(BaseModel):
-    id: str = Field(..., min_length=1, max_length=256)
-    features: list[float | int | str] = Field(..., min_length=MIN_DIMENSIONS, max_length=MAX_DIMENSIONS)
-    metadata: dict[str, Any] | None = None
-
-
-class SimilaritySearchRequest(BaseModel):
-    query: list[FeatureVector] = Field(..., min_length=1, max_length=MAX_QUERY_SIZE)
-    collection: list[FeatureVector] = Field(..., min_length=1, max_length=MAX_COLLECTION_SIZE)
-    top_k: int = Field(default=10, ge=1, le=500)
-    nmi_weight_alpha: float = Field(
-        default=0.7,
-        ge=0.0,
-        le=1.0,
-        description="Convex blend: final_score = alpha * nmi_cosine + (1 - alpha) * pure_cosine. Alpha=1.0 is full NMI-weighted.",
-    )
-    feature_types: list[str] | None = Field(
-        default=None,
-        description="Per-dimension type hint: 'continuous' or 'categorical'. If None, auto-inferred.",
-    )
-
-    @model_validator(mode="after")
-    def validate_dimension_consistency(self) -> "SimilaritySearchRequest":
-        dims = {len(v.features) for v in self.query + self.collection}
-        if len(dims) > 1:
-            raise ValueError(
-                f"All feature vectors must share identical dimensionality. Found: {sorted(dims)}"
-            )
-        if self.feature_types is not None:
-            d = len(self.query[0].features)
-            if len(self.feature_types) != d:
-                raise ValueError(
-                    f"feature_types length ({len(self.feature_types)}) must equal feature dimensionality ({d})."
-                )
-            invalid = {t for t in self.feature_types if t not in ("continuous", "categorical")}
-            if invalid:
-                raise ValueError(f"Invalid feature_types values: {invalid}. Allowed: 'continuous', 'categorical'.")
-        return self
+    @field_validator("query")
+    @classmethod
+    def query_not_all_zero(cls, query: list[float]) -> list[float]:
+        if all(v == 0.0 for v in query):
+            raise ValueError("query vector must not be the zero vector")
+        return query
 
 
 class SimilarityResult(BaseModel):
-    query_id: str
-    matches: list[dict[str, Any]]
-    nmi_weights: list[float]
-    computation_ms: float
+    rank: int
+    corpus_index: int
+    cosine_similarity: float
+    nmi_weighted_cosine: float
+    confidence_lower: float
+    confidence_upper: float
+    active_features: int
+    total_features: int
 
 
-class SimilaritySearchResponse(BaseModel):
+class SimilarityResponse(BaseModel):
     results: list[SimilarityResult]
-    total_comparisons: int
-    api_version: str = "1.0.0"
+    nmi_feature_mask: list[float]
+    empirical_nmi_mean: float
+    empirical_nmi_std: float
+    latency_ms: float
+    dimensions_retained: int
+    dimensions_total: int
 
 
-class NMIWeightedSimilarityEngine:
-
-    def __init__(self, nmi_calculator: NormalizedMutualInformation, stats: Statistics):
-        self._nmi = nmi_calculator
-        self._stats = stats
-
-    def _infer_feature_types(self, matrix: np.ndarray) -> list[str]:
-        types = []
-        for dim_idx in range(matrix.shape[1]):
-            col = matrix[:, dim_idx]
-            unique_ratio = len(np.unique(col)) / len(col)
-            types.append("categorical" if unique_ratio < 0.05 else "continuous")
-        return types
-
-    def _freedman_diaconis_bins(self, data: np.ndarray) -> int:
-        n = len(data)
-        if n < 2:
-            return 1
-        iqr = np.percentile(data, 75) - np.percentile(data, 25)
-        if iqr == 0:
-            return max(1, int(np.sqrt(n)))
-        h = 2.0 * iqr * (n ** (-1.0 / 3.0))
-        data_range = data.max() - data.min()
-        if h == 0:
-            return max(1, int(np.sqrt(n)))
-        return max(1, int(np.ceil(data_range / h)))
-
-    def _encode_features_to_numeric(self, raw_features: list[list[Any]]) -> np.ndarray:
-        n = len(raw_features)
-        d = len(raw_features[0])
-        matrix = np.zeros((n, d), dtype=np.float64)
-        for dim_idx in range(d):
-            col_vals = [row[dim_idx] for row in raw_features]
-            if isinstance(col_vals[0], str):
-                unique_vals = list(dict.fromkeys(col_vals))
-                mapping = {v: i for i, v in enumerate(unique_vals)}
-                matrix[:, dim_idx] = np.array([float(mapping[v]) for v in col_vals])
-            else:
-                matrix[:, dim_idx] = np.array([float(v) for v in col_vals])
-        return matrix
-
-    def _compute_nmi_weights(
-        self,
-        collection_matrix: np.ndarray,
-        query_vector: np.ndarray,
-        feature_types: list[str],
-    ) -> np.ndarray:
-        n, d = collection_matrix.shape
-        weights = np.zeros(d, dtype=np.float64)
-
-        combined = np.vstack([collection_matrix, query_vector.reshape(1, -1)])
-
-        for dim_idx in range(d):
-            x_col = combined[:, dim_idx]
-            y_col = np.linalg.norm(combined, axis=1)
-
-            try:
-                if feature_types[dim_idx] == "categorical":
-                    nmi_val = self._nmi.compute_discrete(x_col, y_col)
-                else:
-                    n_bins = self._freedman_diaconis_bins(x_col)
-                    nmi_val = self._nmi.compute_continuous(x_col, y_col, bins=n_bins)
-            except Exception:
-                nmi_val = 0.0
-
-            weights[dim_idx] = max(0.0, float(nmi_val))
-
-        weight_sum = weights.sum()
-        if weight_sum < 1e-12:
-            weights = np.ones(d, dtype=np.float64) / d
-        else:
-            weights = weights / weight_sum
-
-        return weights
-
-    def _cosine_similarity_weighted(
-        self,
-        query_vec: np.ndarray,
-        collection_matrix: np.ndarray,
-        weights: np.ndarray,
-    ) -> np.ndarray:
-        w_sqrt = np.sqrt(weights)
-        q_weighted = query_vec * w_sqrt
-        c_weighted = collection_matrix * w_sqrt[np.newaxis, :]
-
-        q_norm = np.linalg.norm(q_weighted)
-        c_norms = np.linalg.norm(c_weighted, axis=1)
-
-        if q_norm < 1e-12:
-            return np.zeros(len(collection_matrix), dtype=np.float64)
-
-        dot_products = c_weighted @ q_weighted
-        denominator = c_norms * q_norm
-        denominator = np.where(denominator < 1e-12, 1e-12, denominator)
-
-        return dot_products / denominator
-
-    def _pure_cosine_similarity(
-        self,
-        query_vec: np.ndarray,
-        collection_matrix: np.ndarray,
-    ) -> np.ndarray:
-        q_norm = np.linalg.norm(query_vec)
-        if q_norm < 1e-12:
-            return np.zeros(len(collection_matrix), dtype=np.float64)
-        c_norms = np.linalg.norm(collection_matrix, axis=1)
-        dot_products = collection_matrix @ query_vec
-        denominator = c_norms * q_norm
-        denominator = np.where(denominator < 1e-12, 1e-12, denominator)
-        return dot_products / denominator
-
-    def search_single_query(
-        self,
-        query_vec: np.ndarray,
-        collection_matrix: np.ndarray,
-        feature_types: list[str],
-        top_k: int,
-        alpha: float,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        weights = self._compute_nmi_weights(collection_matrix, query_vec, feature_types)
-
-        nmi_scores = self._cosine_similarity_weighted(query_vec, collection_matrix, weights)
-        pure_scores = self._pure_cosine_similarity(query_vec, collection_matrix)
-
-        blended = alpha * nmi_scores + (1.0 - alpha) * pure_scores
-
-        top_k_clamped = min(top_k, len(blended))
-        top_indices = np.argpartition(blended, -top_k_clamped)[-top_k_clamped:]
-        top_indices = top_indices[np.argsort(blended[top_indices])[::-1]]
-
-        return top_indices, blended[top_indices], weights
+class HealthResponse(BaseModel):
+    status: str
+    version: str
+    timestamp: float
 
 
-def _require_valid_api_key(api_key: str = Security(API_KEY_HEADER)) -> str:
-    if not _VALID_API_KEYS:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="API key store not configured. Set NMI_API_KEYS environment variable.",
-        )
-    key_hash = hashlib.sha256(api_key.encode()).hexdigest()
-    valid_hashes = {hashlib.sha256(k.encode()).hexdigest() for k in _VALID_API_KEYS}
-    if key_hash not in valid_hashes:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid API key.",
-        )
+def _require_api_key(api_key: Optional[str] = Security(API_KEY_HEADER)) -> str:
+    if not VALID_API_KEY:
+        return "no-auth-configured"
+    if api_key is None:
+        raise HTTPException(status_code=401, detail="Missing X-API-Key header")
+    if not hmac.compare_digest(api_key, VALID_API_KEY):
+        raise HTTPException(status_code=403, detail="Invalid API key")
     return api_key
 
 
-def _build_engine() -> NMIWeightedSimilarityEngine:
-    nmi_calc = NormalizedMutualInformation()
-    stats = Statistics()
-    return NMIWeightedSimilarityEngine(nmi_calculator=nmi_calc, stats=stats)
+def _discretize_features(matrix: np.ndarray, n_bins: int) -> np.ndarray:
+    n_samples, n_features = matrix.shape
+    discretized = np.empty_like(matrix, dtype=np.int32)
+    for f in range(n_features):
+        col = matrix[:, f]
+        col_range = col.max() - col.min()
+        if col_range < 1e-12:
+            discretized[:, f] = 0
+            continue
+        actual_bins = min(n_bins, len(np.unique(col)))
+        actual_bins = max(actual_bins, 2)
+        kbd = KBinsDiscretizer(n_bins=actual_bins, encode="ordinal", strategy="quantile")
+        discretized[:, f] = kbd.fit_transform(col.reshape(-1, 1)).ravel().astype(np.int32)
+    return discretized
 
 
-_engine = _build_engine()
+def _compute_nmi_per_feature(query_vec: np.ndarray, corpus_matrix: np.ndarray, n_bins: int) -> np.ndarray:
+    n_corpus, n_features = corpus_matrix.shape
+    stacked = np.vstack([query_vec.reshape(1, -1), corpus_matrix])
+    disc = _discretize_features(stacked, n_bins)
+    query_disc = disc[0]
+    corpus_disc = disc[1:]
+    nmi_scores = np.zeros(n_features, dtype=np.float64)
+    for f in range(n_features):
+        qf = query_disc[f]
+        cf = corpus_disc[:, f]
+        combined = np.vstack([np.full(n_corpus, qf, dtype=np.int32), cf])
+        q_vals = np.unique(combined[0])
+        c_vals = np.unique(combined[1])
+        if len(q_vals) < 2 and len(c_vals) < 2:
+            nmi_scores[f] = 0.0
+            continue
+        joint_counts = np.zeros((len(q_vals), len(c_vals)), dtype=np.float64)
+        q_idx_map = {v: i for i, v in enumerate(q_vals)}
+        c_idx_map = {v: i for i, v in enumerate(c_vals)}
+        for qi, ci in zip(combined[0], combined[1]):
+            joint_counts[q_idx_map[qi], c_idx_map[ci]] += 1.0
+        joint_prob = joint_counts / joint_counts.sum()
+        p_q = joint_prob.sum(axis=1)
+        p_c = joint_prob.sum(axis=0)
+        h_q = scipy_entropy(p_q + 1e-12)
+        h_c = scipy_entropy(p_c + 1e-12)
+        h_qc = scipy_entropy(joint_prob.ravel() + 1e-12)
+        mi = h_q + h_c - h_qc
+        denom = h_q + h_c
+        if denom < 1e-12:
+            nmi_scores[f] = 0.0
+        else:
+            nmi_scores[f] = float(np.clip(2.0 * mi / denom, 0.0, 1.0))
+    return nmi_scores
 
 
-@app.post(
-    "/v1/similarity/nmi-ranked",
-    response_model=SimilaritySearchResponse,
-    summary="NMI-weighted cosine similarity search over an ad-hoc collection",
-    status_code=status.HTTP_200_OK,
-)
-async def nmi_ranked_similarity_search(
-    request: SimilaritySearchRequest,
-    _: str = Security(_require_valid_api_key),
-) -> SimilaritySearchResponse:
-    t_start = time.perf_counter()
+def _cosine_similarity_batch(query: np.ndarray, corpus: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    q_masked = query * mask
+    c_masked = corpus * mask
+    q_norm = np.linalg.norm(q_masked)
+    if q_norm < 1e-12:
+        return np.zeros(len(corpus), dtype=np.float64)
+    c_norms = np.linalg.norm(c_masked, axis=1)
+    c_norms = np.where(c_norms < 1e-12, 1e-12, c_norms)
+    dots = c_masked @ q_masked
+    return dots / (c_norms * q_norm)
 
-    all_vectors = request.query + request.collection
-    raw_features = [v.features for v in all_vectors]
-    full_matrix = _engine._encode_features_to_numeric(raw_features)
 
-    n_query = len(request.query)
-    collection_matrix = full_matrix[n_query:]
-
-    if request.feature_types is not None:
-        feature_types = request.feature_types
+def _nmi_weighted_cosine_batch(query: np.ndarray, corpus: np.ndarray, nmi_scores: np.ndarray) -> np.ndarray:
+    nmi_sum = nmi_scores.sum()
+    if nmi_sum < 1e-12:
+        weights = np.ones(len(nmi_scores), dtype=np.float64) / len(nmi_scores)
     else:
-        feature_types = _engine._infer_feature_types(full_matrix)
+        weights = nmi_scores / nmi_sum
+    q_weighted = query * weights
+    c_weighted = corpus * weights
+    q_norm = np.linalg.norm(q_weighted)
+    if q_norm < 1e-12:
+        return np.zeros(len(corpus), dtype=np.float64)
+    c_norms = np.linalg.norm(c_weighted, axis=1)
+    c_norms = np.where(c_norms < 1e-12, 1e-12, c_norms)
+    dots = c_weighted @ q_weighted
+    return dots / (c_norms * q_norm)
 
-    results: list[SimilarityResult] = []
 
-    for qi, qv in enumerate(request.query):
-        query_vec = full_matrix[qi]
-        q_start = time.perf_counter()
+def _bootstrap_confidence_interval(scores: np.ndarray, n_bootstrap: int = 500, ci: float = 0.95) -> tuple[np.ndarray, np.ndarray]:
+    n = len(scores)
+    if n == 0:
+        return np.array([]), np.array([])
+    rng = np.random.default_rng(seed=42)
+    alpha = (1.0 - ci) / 2.0
+    lower_all = np.empty(n, dtype=np.float64)
+    upper_all = np.empty(n, dtype=np.float64)
+    boot_samples = rng.choice(scores, size=(n_bootstrap, n), replace=True)
+    boot_means = boot_samples.mean(axis=1)
+    mean_score = scores.mean()
+    deltas = np.sort(boot_means - mean_score)
+    lower_delta = deltas[int(np.floor(alpha * n_bootstrap))]
+    upper_delta = deltas[int(np.ceil((1.0 - alpha) * n_bootstrap)) - 1]
+    lower_all[:] = np.clip(scores - upper_delta, -1.0, 1.0)
+    upper_all[:] = np.clip(scores - lower_delta, -1.0, 1.0)
+    return lower_all, upper_all
 
-        top_indices, scores, weights = _engine.search_single_query(
-            query_vec=query_vec,
-            collection_matrix=collection_matrix,
-            feature_types=feature_types,
-            top_k=request.top_k,
-            alpha=request.nmi_weight_alpha,
-        )
 
-        q_elapsed_ms = (time.perf_counter() - q_start) * 1_000
-
-        matches = []
-        for rank, (idx, score) in enumerate(zip(top_indices.tolist(), scores.tolist())):
-            item = request.collection[idx]
-            matches.append(
-                {
-                    "rank": rank + 1,
-                    "id": item.id,
-                    "score": round(float(score), 8),
-                    "metadata": item.metadata,
-                }
-            )
-
-        results.append(
-            SimilarityResult(
-                query_id=qv.id,
-                matches=matches,
-                nmi_weights=[round(float(w), 8) for w in weights.tolist()],
-                computation_ms=round(q_elapsed_ms, 3),
-            )
-        )
-
-    total_elapsed_ms = (time.perf_counter() - t_start) * 1_000
-
-    return SimilaritySearchResponse(
-        results=results,
-        total_comparisons=len(request.query) * len(request.collection),
+@app.get("/health", response_model=HealthResponse, tags=["ops"])
+def check_service_health() -> HealthResponse:
+    return HealthResponse(
+        status="ok",
+        version="1.0.0",
+        timestamp=time.time(),
     )
 
 
-@app.post(
-    "/v1/similarity/nmi-weights-only",
-    summary="Compute NMI weight vector for a collection without running full search",
-    status_code=status.HTTP_200_OK,
-)
-async def compute_nmi_feature_weights(
-    collection: list[FeatureVector] = ...,
-    feature_types: list[str] | None = None,
-    _: str = Security(_require_valid_api_key),
-) -> dict[str, Any]:
-    if not collection:
+@app.post("/search", response_model=SimilarityResponse, tags=["search"])
+def nmi_weighted_cosine_search(
+    payload: VectorPayload,
+    _api_key: str = Depends(_require_api_key),
+) -> SimilarityResponse:
+    t0 = time.perf_counter()
+
+    query_np = np.array(payload.query, dtype=np.float64)
+    corpus_np = np.array(payload.corpus, dtype=np.float64)
+
+    n_corpus, n_features = corpus_np.shape
+    if len(query_np) != n_features:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="collection must contain at least one vector.",
-        )
-    if len(collection) > MAX_COLLECTION_SIZE:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=f"collection exceeds maximum size of {MAX_COLLECTION_SIZE}.",
+            status_code=422,
+            detail=f"query dimension {len(query_np)} does not match corpus dimension {n_features}",
         )
 
-    dims = {len(v.features) for v in collection}
-    if len(dims) > 1:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=f"Inconsistent feature dimensions in collection: {sorted(dims)}.",
-        )
+    nmi_scores = _compute_nmi_per_feature(query_np, corpus_np, payload.n_bins)
 
-    raw_features = [v.features for v in collection]
-    matrix = _engine._encode_features_to_numeric(raw_features)
+    feature_mask = (nmi_scores >= payload.nmi_threshold).astype(np.float64)
+    active_count = int(feature_mask.sum())
 
-    if feature_types is not None:
-        d = matrix.shape[1]
-        if len(feature_types) != d:
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail=f"feature_types length ({len(feature_types)}) does not match dimensionality ({d}).",
+    if active_count == 0:
+        feature_mask = np.ones(n_features, dtype=np.float64)
+        active_count = n_features
+
+    cosine_sims = _cosine_similarity_batch(query_np, corpus_np, feature_mask)
+    nmi_weighted_sims = _nmi_weighted_cosine_batch(query_np, corpus_np, nmi_scores * feature_mask)
+
+    lower_bounds, upper_bounds = _bootstrap_confidence_interval(nmi_weighted_sims)
+
+    top_k = min(payload.top_k, n_corpus)
+    top_indices = np.argpartition(nmi_weighted_sims, -top_k)[-top_k:]
+    top_indices = top_indices[np.argsort(nmi_weighted_sims[top_indices])[::-1]]
+
+    results = []
+    for rank, idx in enumerate(top_indices):
+        results.append(
+            SimilarityResult(
+                rank=rank + 1,
+                corpus_index=int(idx),
+                cosine_similarity=float(np.clip(cosine_sims[idx], -1.0, 1.0)),
+                nmi_weighted_cosine=float(np.clip(nmi_weighted_sims[idx], -1.0, 1.0)),
+                confidence_lower=float(lower_bounds[idx]),
+                confidence_upper=float(upper_bounds[idx]),
+                active_features=active_count,
+                total_features=n_features,
             )
-        invalid = {t for t in feature_types if t not in ("continuous", "categorical")}
-        if invalid:
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail=f"Invalid feature_types: {invalid}.",
-            )
-    else:
-        feature_types = _engine._infer_feature_types(matrix)
+        )
 
-    centroid = matrix.mean(axis=0)
-    weights = _engine._compute_nmi_weights(matrix, centroid, feature_types)
+    empirical_nmi_mean = float(nmi_scores.mean())
+    empirical_nmi_std = float(nmi_scores.std())
+    latency_ms = (time.perf_counter() - t0) * 1000.0
+
+    return SimilarityResponse(
+        results=results,
+        nmi_feature_mask=nmi_scores.tolist(),
+        empirical_nmi_mean=empirical_nmi_mean,
+        empirical_nmi_std=empirical_nmi_std,
+        latency_ms=round(latency_ms, 3),
+        dimensions_retained=active_count,
+        dimensions_total=n_features,
+    )
+
+
+@app.post("/explain", response_model=dict, tags=["search"])
+def explain_nmi_feature_contributions(
+    payload: VectorPayload,
+    _api_key: str = Depends(_require_api_key),
+) -> dict:
+    t0 = time.perf_counter()
+
+    query_np = np.array(payload.query, dtype=np.float64)
+    corpus_np = np.array(payload.corpus, dtype=np.float64)
+    n_corpus, n_features = corpus_np.shape
+
+    if len(query_np) != n_features:
+        raise HTTPException(
+            status_code=422,
+            detail=f"query dimension {len(query_np)} does not match corpus dimension {n_features}",
+        )
+
+    nmi_scores = _compute_nmi_per_feature(query_np, corpus_np, payload.n_bins)
+    feature_mask = (nmi_scores >= payload.nmi_threshold).astype(np.float64)
+
+    sorted_feature_indices = np.argsort(nmi_scores)[::-1].tolist()
+    latency_ms = (time.perf_counter() - t0) * 1000.0
 
     return {
-        "nmi_weights": [round(float(w), 8) for w in weights.tolist()],
-        "feature_types_used": feature_types,
-        "dimensions": int(matrix.shape[1]),
-        "collection_size": len(collection),
-    }
-
-
-@app.post(
-    "/v1/similarity/cross-collection-nmi",
-    summary="Compute pairwise NMI-weighted similarity matrix between two collections",
-    status_code=status.HTTP_200_OK,
-)
-async def cross_collection_nmi_matrix(
-    collection_a: list[FeatureVector] = ...,
-    collection_b: list[FeatureVector] = ...,
-    nmi_weight_alpha: float = 0.7,
-    feature_types: list[str] | None = None,
-    _: str = Security(_require_valid_api_key),
-) -> dict[str, Any]:
-    if not collection_a or not collection_b:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="Both collection_a and collection_b must be non-empty.",
-        )
-    cross_size = len(collection_a) * len(collection_b)
-    if cross_size > 250_000:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=f"Cross-product size {cross_size} exceeds limit of 250,000. Reduce collection sizes.",
-        )
-
-    dims_a = {len(v.features) for v in collection_a}
-    dims_b = {len(v.features) for v in collection_b}
-    all_dims = dims_a | dims_b
-    if len(all_dims) > 1:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=f"Dimension mismatch across collections: {sorted(all_dims)}.",
-        )
-
-    if not (0.0 <= nmi_weight_alpha <= 1.0):
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="nmi_weight_alpha must be in [0.0, 1.0].",
-        )
-
-    combined_raw = [v.features for v in collection_a] + [v.features for v in collection_b]
-    combined_matrix = _engine._encode_features_to_numeric(combined_raw)
-
-    na = len(collection_a)
-    matrix_a = combined_matrix[:na]
-    matrix_b = combined_matrix[na:]
-
-    if feature_types is not None:
-        d = combined_matrix.shape[1]
-        if len(feature_types) != d:
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail=f"feature_types length mismatch.",
-            )
-    else:
-        feature_types = _engine._infer_feature_types(combined_matrix)
-
-    similarity_matrix: list[list[float]] = []
-
-    for i, row_a in enumerate(matrix_a):
-        weights = _engine._compute_nmi_weights(matrix_b, row_a, feature_types)
-        nmi_scores = _engine._cosine_similarity_weighted(row_a, matrix_b, weights)
-        pure_scores = _engine._pure_cosine_similarity(row_a, matrix_b)
-        blended = nmi_weight_alpha * nmi_scores + (1.0 - nmi_weight_alpha) * pure_scores
-        similarity_matrix.append([round(float(s), 8) for s in blended.tolist()])
-
-    return {
-        "similarity_matrix": similarity_matrix,
-        "row_ids": [v.id for v in collection_a],
-        "col_ids": [v.id for v in collection_b],
-        "shape": [len(collection_a), len(collection_b)],
-        "total_comparisons": cross_size,
-    }
-
-
-@app.get(
-    "/v1/healthz",
-    summary="API liveness check with NMI engine self-test",
-    status_code=status.HTTP_200_OK,
-)
-async def nmi_engine_health_check() -> dict[str, Any]:
-    try:
-        probe_a = np.array([1.0, 2.0, 3.0, 4.0, 5.0])
-        probe_b = np.array([2.0, 4.0, 1.0, 3.0, 5.0])
-        nmi_val = _engine._nmi.compute_continuous(probe_a, probe_b, bins=3)
-        engine_ok = isinstance(nmi_val, (float, int, np.floating)) and not np.isnan(nmi_val)
-    except Exception as exc:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"NMI engine self-test failed: {exc}",
-        )
-
-    return {
-        "status": "ok" if engine_ok else "degraded",
-        "nmi_engine_probe": round(float(nmi_val), 6),
-        "max_collection_size": MAX_COLLECTION_SIZE,
-        "max_query_size": MAX_QUERY_SIZE,
-        "max_dimensions": MAX_DIMENSIONS,
-        "api_version": "1.0.0",
-    }
-
-
-@app.get(
-    "/v1/pricing",
-    summary="Per-call pricing schedule for NMI similarity operations",
-    status_code=status.HTTP_200_OK,
-)
-async def nmi_similarity_pricing_schedule() -> dict[str, Any]:
-    return {
-        "model": "per_call",
-        "currency": "USD",
-        "tiers": [
+        "feature_nmi_scores": [
             {
-                "operation": "nmi-ranked",
-                "description": "NMI-weighted cosine search over ad-hoc collection",
-                "base_price_usd": 0.002,
-                "unit": "per query vector",
-                "overage_per_1k_collection_items": 0.0005,
-            },
-            {
-                "operation": "nmi-weights-only",
-                "description": "NMI weight vector computation only, no search",
-                "base_price_usd": 0.0008,
-                "unit": "per call",
-                "overage_per_1k_collection_items": 0.0002,
-            },
-            {
-                "operation": "cross-collection-nmi",
-                "description": "Full pairwise NMI similarity matrix between two collections",
-                "base_price_usd": 0.005,
-                "unit": "per call",
-                "overage_per_10k_comparisons": 0.001,
-            },
+                "feature_index": int(fi),
+                "nmi_score": float(round(nmi_scores[fi], 6)),
+                "retained": bool(feature_mask[fi] > 0.5),
+            }
+            for fi in sorted_feature_indices
         ],
-        "free_tier": {
-            "calls_per_day": 100,
-            "max_collection_size": 200,
-            "max_dimensions": 64,
-        },
-        "complexity_note": "O(n*d*log(d)) per query where n=collection_size, d=dimensions. Billed on actual comparisons.",
+        "nmi_threshold_applied": payload.nmi_threshold,
+        "features_retained": int(feature_mask.sum()),
+        "features_total": n_features,
+        "nmi_mean": float(nmi_scores.mean()),
+        "nmi_std": float(nmi_scores.std()),
+        "nmi_p25": float(np.percentile(nmi_scores, 25)),
+        "nmi_p75": float(np.percentile(nmi_scores, 75)),
+        "latency_ms": round(latency_ms, 3),
     }
+
+
+@app.post("/batch_search", response_model=list[SimilarityResponse], tags=["search"])
+def nmi_weighted_cosine_batch_search(
+    payloads: list[VectorPayload] = Field(..., min_length=1, max_length=50),
+    _api_key: str = Depends(_require_api_key),
+) -> list[SimilarityResponse]:
+    if not payloads:
+        raise HTTPException(status_code=422, detail="payloads list must not be empty")
+    if len(payloads) > 50:
+        raise HTTPException(status_code=422, detail="batch size must not exceed 50 queries")
+    responses = []
+    for p in payloads:
+        resp = nmi_weighted_cosine_search.__wrapped__(p) if hasattr(nmi_weighted_cosine_search, "__wrapped__") else nmi_weighted_cosine_search(p, _api_key="bypass")
+        responses.append(resp)
+    return responses
+
+
+def _run_batch_search_internal(payloads: list[VectorPayload]) -> list[SimilarityResponse]:
+    responses = []
+    for p in payloads:
+        t0 = time.perf_counter()
+        query_np = np.array(p.query, dtype=np.float64)
+        corpus_np = np.array(p.corpus, dtype=np.float64)
+        n_corpus, n_features = corpus_np.shape
+        if len(query_np) != n_features:
+            raise HTTPException(
+                status_code=422,
+                detail=f"batch item: query dimension {len(query_np)} does not match corpus dimension {n_features}",
+            )
+        nmi_scores = _compute_nmi_per_feature(query_np, corpus_np, p.n_bins)
+        feature_mask = (nmi_scores >= p.nmi_threshold).astype(np.float64)
+        active_count = int(feature_mask.sum())
+        if active_count == 0:
+            feature_mask = np.ones(n_features, dtype=np.float64)
+            active_count = n_features
+        cosine_sims = _cosine_similarity_batch(query_np, corpus_np, feature_mask)
+        nmi_weighted_sims = _nmi_weighted_cosine_batch(query_np, corpus_np, nmi_scores * feature_mask)
+        lower_bounds, upper_bounds = _bootstrap_confidence_interval(nmi_weighted_sims)
+        top_k = min(p.top_k, n_corpus)
+        top_indices = np.argpartition(nmi_weighted_sims, -top_k)[-top_k:]
+        top_indices = top_indices[np.argsort(nmi_weighted_sims[top_indices])[::-1]]
+        results = []
+        for rank, idx in enumerate(top_indices):
+            results.append(
+                SimilarityResult(
+                    rank=rank + 1,
+                    corpus_index=int(idx),
+                    cosine_similarity=float(np.clip(cosine_sims[idx], -1.0, 1.0)),
+                    nmi_weighted_cosine=float(np.clip(nmi_weighted_sims[idx], -1.0, 1.0)),
+                    confidence_lower=float(lower_bounds[idx]),
+                    confidence_upper=float(upper_bounds[idx]),
+                    active_features=active_count,
+                    total_features=n_features,
+                )
+            )
+        latency_ms = (time.perf_counter() - t0) * 1000.0
+        responses.append(
+            SimilarityResponse(
+                results=results,
+                nmi_feature_mask=nmi_scores.tolist(),
+                empirical_nmi_mean=float(nmi_scores.mean()),
+                empirical_nmi_std=float(nmi_scores.std()),
+                latency_ms=round(latency_ms, 3),
+                dimensions_retained=active_count,
+                dimensions_total=n_features,
+            )
+        )
+    return responses
+
+
+app.routes = [r for r in app.routes if not (hasattr(r, "path") and r.path == "/batch_search")]
+
+
+@app.post("/batch_search", response_model=list[SimilarityResponse], tags=["search"])
+def nmi_weighted_cosine_batch_search_v2(
+    payloads: list[VectorPayload],
+    _api_key: str = Depends(_require_api_key),
+) -> list[SimilarityResponse]:
+    if not payloads:
+        raise HTTPException(status_code=422, detail="payloads list must not be empty")
+    if len(payloads) > 50:
+        raise HTTPException(status_code=422, detail="batch size must not exceed 50 queries")
+    return _run_batch_search_internal(payloads)
