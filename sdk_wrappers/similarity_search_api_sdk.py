@@ -1,589 +1,490 @@
-from __future__ import annotations
-
 import hashlib
+import json
 import time
+from dataclasses import dataclass, field
 from typing import Any
 
-import httpx
+import numpy as np
+import requests
 
-from src.math.information import NormalizedMutualInformation, TransferEntropy
-from src.math.causal import DoCalculus, CausalDAG
+from src.math.causal import CausalDAG, DoCalculus
 from src.math.game_theory import NashEquilibrium
+from src.math.information import NormalizedMutualInformation, TransferEntropy
 
 
-class SimilaritySearchError(Exception):
-    def __init__(self, message: str, status_code: int | None = None, request_id: str | None = None):
-        super().__init__(message)
-        self.status_code = status_code
-        self.request_id = request_id
+@dataclass
+class FeaturePartition:
+    categorical_keys: list[str]
+    continuous_keys: list[str]
+    marginal_entropies: dict[str, float]
+    w_nmi: float
+    w_cosine: float
 
 
-class AuthenticationError(SimilaritySearchError):
-    pass
+@dataclass
+class ComponentScore:
+    nmi_score: float
+    cosine_score: float
+    hybrid_score: float
+    w_nmi: float
+    w_cosine: float
+    dominant_component: str
+    feature_partition: dict[str, list[str]]
 
 
-class RateLimitError(SimilaritySearchError):
-    def __init__(self, message: str, retry_after: float | None = None):
-        super().__init__(message, status_code=429)
-        self.retry_after = retry_after
-
-
-class ValidationError(SimilaritySearchError):
-    pass
-
-
-class CorpusIngestResult:
-    def __init__(self, raw: dict[str, Any]):
-        self.corpus_id: str = raw["corpus_id"]
-        self.item_count: int = raw["item_count"]
-        self.marginal_entropy: float = raw["marginal_entropy"]
-        self.vocabulary_size: int = raw["vocabulary_size"]
-        self.alpha: float = raw["alpha"]
-        self.ingest_latency_ms: float = raw["ingest_latency_ms"]
-        self._raw = raw
-
-    def __repr__(self) -> str:
-        return (
-            f"CorpusIngestResult(corpus_id={self.corpus_id!r}, "
-            f"item_count={self.item_count}, alpha={self.alpha:.4f})"
-        )
-
-
+@dataclass
 class SimilarityMatch:
-    def __init__(self, raw: dict[str, Any]):
-        self.item_id: str = raw["item_id"]
-        self.hybrid_score: float = raw["hybrid_score"]
-        self.cosine_score: float = raw["cosine_score"]
-        self.nmi_score: float = raw["nmi_score"]
-        self.alpha_used: float = raw["alpha_used"]
-        self.rank: int = raw["rank"]
-        self.payload: dict[str, Any] = raw.get("payload", {})
-        self._raw = raw
-
-    def __repr__(self) -> str:
-        return (
-            f"SimilarityMatch(item_id={self.item_id!r}, "
-            f"hybrid_score={self.hybrid_score:.4f}, rank={self.rank})"
-        )
+    candidate_id: str
+    candidate_payload: dict[str, Any]
+    score: ComponentScore
+    rank: int
 
 
-class QueryResult:
-    def __init__(self, raw: dict[str, Any]):
-        self.query_id: str = raw["query_id"]
-        self.corpus_id: str = raw["corpus_id"]
-        self.matches: list[SimilarityMatch] = [
-            SimilarityMatch(m) for m in raw["matches"]
-        ]
-        self.alpha: float = raw["alpha"]
-        self.transfer_entropy_influence: float = raw["transfer_entropy_influence"]
-        self.latency_ms: float = raw["latency_ms"]
-        self._raw = raw
-
-    def __repr__(self) -> str:
-        return (
-            f"QueryResult(query_id={self.query_id!r}, "
-            f"corpus_id={self.corpus_id!r}, matches={len(self.matches)})"
-        )
+@dataclass
+class HybridSearchResult:
+    query_id: str
+    matches: list[SimilarityMatch]
+    latency_ms: float
+    payload_signature: str
+    calibration_metadata: dict[str, Any]
 
 
-class EntropyProfileResult:
-    def __init__(self, raw: dict[str, Any]):
-        self.corpus_id: str = raw["corpus_id"]
-        self.marginal_entropy: float = raw["marginal_entropy"]
-        self.conditional_entropy: float = raw["conditional_entropy"]
-        self.alpha: float = raw["alpha"]
-        self.vocabulary_size: int = raw["vocabulary_size"]
-        self.transfer_entropy_lag1: float = raw["transfer_entropy_lag1"]
-        self.nash_equilibrium_alpha: float = raw["nash_equilibrium_alpha"]
-        self.causal_dag_edges: list[dict[str, Any]] = raw.get("causal_dag_edges", [])
-        self._raw = raw
-
-    def __repr__(self) -> str:
-        return (
-            f"EntropyProfileResult(corpus_id={self.corpus_id!r}, "
-            f"alpha={self.alpha:.4f}, H_marginal={self.marginal_entropy:.4f})"
-        )
-
-
-class _HybridScoreLocalEngine:
-    """
-    Local computation engine that mirrors the server-side hybrid scoring
-    using NEXUS proprietary math modules. Used for pre-flight validation,
-    alpha estimation, and offline score approximation before network call.
-    """
+class FeatureTypeClassifier:
+    ENTROPY_THRESHOLD_BITS: float = 1.5
 
     def __init__(self):
         self._nmi_calculator = NormalizedMutualInformation()
         self._transfer_entropy = TransferEntropy()
-        self._do_calculus = DoCalculus()
+
+    def _compute_marginal_entropy(self, values: list[Any]) -> float:
+        if not values:
+            return 0.0
+        try:
+            numeric = np.array([float(v) for v in values], dtype=np.float64)
+            if np.all(np.isnan(numeric)):
+                raise ValueError("all nan")
+            bins = max(2, min(int(np.sqrt(len(numeric))), 50))
+            hist, _ = np.histogram(numeric[~np.isnan(numeric)], bins=bins, density=False)
+            hist = hist[hist > 0].astype(np.float64)
+            hist /= hist.sum()
+            return float(-np.sum(hist * np.log2(hist + 1e-12)))
+        except (ValueError, TypeError):
+            unique, counts = np.unique([str(v) for v in values], return_counts=True)
+            probs = counts.astype(np.float64) / counts.sum()
+            return float(-np.sum(probs * np.log2(probs + 1e-12)))
+
+    def partition_payload_features(
+        self,
+        query_payload: dict[str, Any],
+        candidates: list[dict[str, Any]],
+    ) -> FeaturePartition:
+        all_keys = set(query_payload.keys())
+        for c in candidates:
+            all_keys.update(c.keys())
+        all_keys = sorted(all_keys)
+
+        marginal_entropies: dict[str, float] = {}
+        for key in all_keys:
+            all_values = [query_payload.get(key)] + [c.get(key) for c in candidates]
+            all_values = [v for v in all_values if v is not None]
+            if not all_values:
+                marginal_entropies[key] = 0.0
+                continue
+            marginal_entropies[key] = self._compute_marginal_entropy(all_values)
+
+        categorical_keys = [
+            k for k, h in marginal_entropies.items()
+            if h < self.ENTROPY_THRESHOLD_BITS
+        ]
+        continuous_keys = [
+            k for k, h in marginal_entropies.items()
+            if h >= self.ENTROPY_THRESHOLD_BITS
+        ]
+
+        sum_h_cat = sum(marginal_entropies[k] for k in categorical_keys)
+        sum_h_cont = sum(marginal_entropies[k] for k in continuous_keys)
+        total = sum_h_cat + sum_h_cont
+
+        if total < 1e-12:
+            w_nmi, w_cosine = 0.5, 0.5
+        else:
+            w_nmi = sum_h_cat / total
+            w_cosine = sum_h_cont / total
+
+        return FeaturePartition(
+            categorical_keys=categorical_keys,
+            continuous_keys=continuous_keys,
+            marginal_entropies=marginal_entropies,
+            w_nmi=w_nmi,
+            w_cosine=w_cosine,
+        )
+
+
+class HybridSimilarityScorer:
+    def __init__(self):
+        self._nmi_calculator = NormalizedMutualInformation()
+        self._causal_dag = CausalDAG()
+        self._do_calculus = DoCalculus(dag=self._causal_dag)
         self._nash = NashEquilibrium()
 
-    def estimate_alpha(self, corpus_items: list[str]) -> float:
-        if not corpus_items:
-            raise ValidationError("corpus_items must be non-empty to estimate alpha")
-        tokens_per_item = [item.split() for item in corpus_items]
-        all_tokens: list[str] = []
-        for tokens in tokens_per_item:
-            all_tokens.extend(tokens)
-        if not all_tokens:
-            return 0.5
-        from collections import Counter
-        import math
-        freq = Counter(all_tokens)
-        vocab_size = len(freq)
-        total = sum(freq.values())
-        marginal_entropy = -sum(
-            (c / total) * math.log2(c / total)
-            for c in freq.values()
-            if c > 0
-        )
-        log_vocab = math.log2(vocab_size) if vocab_size > 1 else 1.0
-        alpha = min(1.0, max(0.0, marginal_entropy / log_vocab))
-        return alpha
-
-    def compute_local_nmi(self, query_tokens: list[str], doc_tokens: list[str]) -> float:
-        if not query_tokens or not doc_tokens:
-            return 0.0
-        return self._nmi_calculator.compute(query_tokens, doc_tokens)
-
-    def compute_transfer_entropy_influence(
+    def _extract_categorical_vectors(
         self,
-        token_sequence: list[str],
-        lag: int = 1,
+        query: dict[str, Any],
+        candidate: dict[str, Any],
+        keys: list[str],
+    ) -> tuple[list[Any], list[Any]]:
+        q_vals = [str(query.get(k, "")) for k in keys]
+        c_vals = [str(candidate.get(k, "")) for k in keys]
+        return q_vals, c_vals
+
+    def _extract_continuous_vectors(
+        self,
+        query: dict[str, Any],
+        candidate: dict[str, Any],
+        keys: list[str],
+    ) -> tuple[np.ndarray, np.ndarray]:
+        q_vec, c_vec = [], []
+        for k in keys:
+            try:
+                q_vec.append(float(query.get(k, 0.0) or 0.0))
+                c_vec.append(float(candidate.get(k, 0.0) or 0.0))
+            except (TypeError, ValueError):
+                q_vec.append(0.0)
+                c_vec.append(0.0)
+        return np.array(q_vec, dtype=np.float64), np.array(c_vec, dtype=np.float64)
+
+    def _nmi_score_from_categorical_vectors(
+        self,
+        q_vals: list[Any],
+        c_vals: list[Any],
     ) -> float:
-        if len(token_sequence) < lag + 2:
+        if not q_vals:
             return 0.0
-        source = token_sequence[:-lag]
-        target = token_sequence[lag:]
-        return self._transfer_entropy.compute(source, target, lag=lag)
+        all_cats = list(set(q_vals) | set(c_vals))
+        if len(all_cats) == 1:
+            return 1.0 if q_vals == c_vals else 0.0
+        cat_to_idx = {c: i for i, c in enumerate(all_cats)}
+        q_enc = np.array([cat_to_idx[v] for v in q_vals], dtype=np.int32)
+        c_enc = np.array([cat_to_idx[v] for v in c_vals], dtype=np.int32)
+        try:
+            return float(self._nmi_calculator.compute(q_enc, c_enc))
+        except Exception:
+            matches = sum(1 for a, b in zip(q_vals, c_vals) if a == b)
+            return matches / len(q_vals)
 
-    def resolve_alpha_via_nash(
-        self,
-        alpha_from_entropy: float,
-        nmi_weight_preference: float,
-        cosine_weight_preference: float,
-    ) -> float:
-        """
-        Uses Nash equilibrium between NMI and cosine as two players
-        competing for weight in the hybrid score. The equilibrium alpha
-        is used as a sanity check against the entropy-derived alpha.
-        """
-        payoff_matrix = [
-            [alpha_from_entropy, 1.0 - alpha_from_entropy],
-            [nmi_weight_preference, cosine_weight_preference],
-        ]
-        equilibrium = self._nash.compute_mixed_strategy(payoff_matrix)
-        return float(equilibrium[0])
+    def _cosine_score(self, q_vec: np.ndarray, c_vec: np.ndarray) -> float:
+        if q_vec.size == 0:
+            return 0.0
+        q_norm = np.linalg.norm(q_vec)
+        c_norm = np.linalg.norm(c_vec)
+        if q_norm < 1e-12 or c_norm < 1e-12:
+            return 0.0
+        raw = float(np.dot(q_vec, c_vec) / (q_norm * c_norm))
+        return (raw + 1.0) / 2.0
 
-    def build_causal_dag_for_corpus(
+    def _resolve_weight_conflict_via_nash(
         self,
-        features: list[str],
-        observed_correlations: dict[tuple[str, str], float],
-    ) -> dict[str, Any]:
-        """
-        Constructs a CausalDAG from token co-occurrence correlations and
-        applies do-calculus to identify which features causally influence
-        similarity score rather than being spuriously correlated.
-        """
-        dag = CausalDAG(nodes=features)
-        for (src, dst), weight in observed_correlations.items():
-            if weight > 0.3:
-                dag.add_edge(src, dst, weight=weight)
-        interventional_effects = self._do_calculus.compute_interventional_distribution(
-            dag=dag,
-            intervention_node=features[0] if features else "root",
-            outcome_node=features[-1] if len(features) > 1 else "root",
+        w_nmi_entropy: float,
+        w_cosine_entropy: float,
+        nmi_raw: float,
+        cosine_raw: float,
+    ) -> tuple[float, float]:
+        payoff_matrix = np.array([
+            [nmi_raw * w_nmi_entropy, cosine_raw * w_cosine_entropy],
+            [cosine_raw * w_nmi_entropy, nmi_raw * w_cosine_entropy],
+        ])
+        try:
+            eq = self._nash.compute_mixed_strategy(payoff_matrix)
+            w1 = float(eq[0])
+            w2 = float(eq[1])
+            total = w1 + w2
+            if total < 1e-12:
+                return w_nmi_entropy, w_cosine_entropy
+            return w1 / total, w2 / total
+        except Exception:
+            return w_nmi_entropy, w_cosine_entropy
+
+    def score(
+        self,
+        query: dict[str, Any],
+        candidate: dict[str, Any],
+        partition: FeaturePartition,
+    ) -> ComponentScore:
+        q_cat, c_cat = self._extract_categorical_vectors(
+            query, candidate, partition.categorical_keys
         )
-        return {
-            "dag_edges": dag.edges(),
-            "causal_effects": interventional_effects,
-        }
+        nmi_raw = self._nmi_score_from_categorical_vectors(q_cat, c_cat)
+
+        q_cont, c_cont = self._extract_continuous_vectors(
+            query, candidate, partition.continuous_keys
+        )
+        cosine_raw = self._cosine_score(q_cont, c_cont)
+
+        w_nmi, w_cosine = self._resolve_weight_conflict_via_nash(
+            partition.w_nmi,
+            partition.w_cosine,
+            nmi_raw,
+            cosine_raw,
+        )
+
+        hybrid = w_nmi * nmi_raw + w_cosine * cosine_raw
+        dominant = "nmi" if w_nmi >= w_cosine else "cosine"
+
+        return ComponentScore(
+            nmi_score=nmi_raw,
+            cosine_score=cosine_raw,
+            hybrid_score=hybrid,
+            w_nmi=w_nmi,
+            w_cosine=w_cosine,
+            dominant_component=dominant,
+            feature_partition={
+                "categorical": partition.categorical_keys,
+                "continuous": partition.continuous_keys,
+            },
+        )
+
+
+def _payload_signature(payload: dict[str, Any]) -> str:
+    canonical = json.dumps(payload, sort_keys=True, default=str)
+    return hashlib.sha256(canonical.encode()).hexdigest()[:16]
+
+
+class SimilaritySearchAPIError(Exception):
+    def __init__(self, message: str, status_code: int | None = None, response_body: str | None = None):
+        super().__init__(message)
+        self.status_code = status_code
+        self.response_body = response_body
 
 
 class Client:
-    """
-    SDK client for Similarity Search API.
-
-    Exposes NMI-based hybrid similarity search over raw text, categorical,
-    or discrete time-series data without requiring a pre-built vector index.
-
-    Hybrid score: H(q,d) = alpha(C)*cosine(q,d) + (1-alpha(C))*NMI(q,d)
-    where alpha(C) = H_marginal(corpus) / log2(|V|), recomputed per corpus ingest.
-
-    Usage:
-        client = Client(api_key="sk-...")
-        corpus = client.ingest_corpus(items=[...], corpus_id="my-corpus")
-        result = client.query_similar(query="...", corpus_id=corpus.corpus_id)
-    """
-
-    BASE_URL = "https://api.similaritysearch.nexus/v1"
-    DEFAULT_TIMEOUT = 30.0
-    MAX_RETRIES = 3
-    RETRY_BACKOFF_BASE = 1.5
+    BASE_URL: str = "https://api.similaritysearch.io/v1"
+    DEFAULT_TIMEOUT_SECONDS: float = 30.0
+    MAX_CANDIDATES: int = 10_000
+    MIN_CANDIDATES: int = 1
+    MAX_TOP_K: int = 500
 
     def __init__(
         self,
         api_key: str,
         base_url: str | None = None,
-        timeout: float = DEFAULT_TIMEOUT,
-        max_retries: int = MAX_RETRIES,
+        timeout: float = DEFAULT_TIMEOUT_SECONDS,
     ):
         if not api_key or not isinstance(api_key, str):
-            raise AuthenticationError(
-                "api_key must be a non-empty string. "
-                "Obtain your key at https://similaritysearch.nexus/dashboard"
-            )
-        if not api_key.startswith("sk-"):
-            raise AuthenticationError(
-                f"api_key format invalid: expected prefix 'sk-', got {api_key[:6]!r}. "
-                "Verify your key at https://similaritysearch.nexus/dashboard"
-            )
-        self._api_key = api_key
+            raise ValueError("api_key must be a non-empty string")
+        if len(api_key.strip()) == 0:
+            raise ValueError("api_key must not be blank")
+        self._api_key = api_key.strip()
         self._base_url = (base_url or self.BASE_URL).rstrip("/")
         self._timeout = timeout
-        self._max_retries = max_retries
-        self._local_engine = _HybridScoreLocalEngine()
-        self._http = httpx.Client(
-            headers={
-                "Authorization": f"Bearer {self._api_key}",
-                "Content-Type": "application/json",
-                "User-Agent": "similarity-search-sdk-python/1.0.0",
-            },
-            timeout=self._timeout,
-        )
+        self._session = requests.Session()
+        self._session.headers.update({
+            "X-API-Key": self._api_key,
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": "similarity-search-sdk-python/1.0.0",
+        })
+        self._classifier = FeatureTypeClassifier()
+        self._scorer = HybridSimilarityScorer()
 
-    def main_method(self, data: Any) -> QueryResult:
-        """
-        Primary entrypoint for one-off similarity search over raw data.
-
-        Accepts either:
-          - dict with keys 'query' (str) and 'corpus' (list[str])
-          - dict with keys 'query' (str) and 'corpus_id' (str) for a pre-ingested corpus
-
-        Returns the top-k hybrid-scored matches.
-
-        Example:
-            result = client.main_method({
-                "query": "renewable energy policy",
-                "corpus": ["solar panels", "wind turbines", "coal extraction"],
-                "top_k": 2,
-            })
-        """
-        if data is None:
-            raise ValidationError(
-                "data must not be None. Pass a dict with 'query' and either "
-                "'corpus' (list[str]) or 'corpus_id' (str)."
-            )
-        if not isinstance(data, dict):
-            raise ValidationError(
-                f"data must be a dict, got {type(data).__name__}. "
-                "Expected keys: 'query', and either 'corpus' or 'corpus_id'."
-            )
-        query = data.get("query")
-        if not query or not isinstance(query, str):
-            raise ValidationError(
-                "data['query'] must be a non-empty string."
-            )
-        if len(query.strip()) == 0:
-            raise ValidationError(
-                "data['query'] must contain at least one non-whitespace character."
-            )
-        corpus_id = data.get("corpus_id")
-        corpus = data.get("corpus")
-        top_k = data.get("top_k", 10)
-        if not isinstance(top_k, int) or top_k < 1 or top_k > 1000:
-            raise ValidationError(
-                f"data['top_k'] must be an integer between 1 and 1000, got {top_k!r}."
-            )
-        if corpus_id is not None:
-            if not isinstance(corpus_id, str) or not corpus_id.strip():
-                raise ValidationError("data['corpus_id'] must be a non-empty string.")
-            return self.query_similar(
-                query=query,
-                corpus_id=corpus_id,
-                top_k=top_k,
-            )
-        if corpus is not None:
-            if not isinstance(corpus, list) or len(corpus) == 0:
-                raise ValidationError(
-                    "data['corpus'] must be a non-empty list of strings."
-                )
-            if not all(isinstance(item, str) and item.strip() for item in corpus):
-                raise ValidationError(
-                    "Every item in data['corpus'] must be a non-empty string."
-                )
-            ingest_result = self.ingest_corpus(
-                items=corpus,
-                corpus_id=self._deterministic_corpus_id(corpus),
-            )
-            return self.query_similar(
-                query=query,
-                corpus_id=ingest_result.corpus_id,
-                top_k=top_k,
-            )
-        raise ValidationError(
-            "data must contain either 'corpus' (list[str]) for on-the-fly ingest "
-            "or 'corpus_id' (str) for a previously ingested corpus."
-        )
-
-    def ingest_corpus(
-        self,
-        items: list[str],
-        corpus_id: str | None = None,
-        metadata: dict[str, Any] | None = None,
-    ) -> CorpusIngestResult:
-        """
-        Ingests raw text items into the API and computes the corpus-level
-        entropy profile that determines alpha for the hybrid score.
-
-        The local engine pre-estimates alpha via NMI and transfer entropy
-        to validate corpus quality before the network call.
-
-        Args:
-            items: Raw text strings. No embedding required.
-            corpus_id: Optional stable identifier. Auto-generated if not provided.
-            metadata: Arbitrary key-value pairs stored alongside the corpus.
-
-        Returns:
-            CorpusIngestResult with corpus_id and entropy profile.
-
-        Raises:
-            ValidationError: If items is empty or contains non-string values.
-            SimilaritySearchError: On API error.
-        """
-        if not items or not isinstance(items, list):
-            raise ValidationError(
-                "items must be a non-empty list of strings."
-            )
-        if len(items) > 100_000:
-            raise ValidationError(
-                f"items length {len(items)} exceeds maximum of 100,000 per ingest call. "
-                "Split into batches."
-            )
-        if not all(isinstance(item, str) and item.strip() for item in items):
-            raise ValidationError(
-                "Every item in 'items' must be a non-empty string. "
-                "Remove None values, empty strings, and non-string types."
-            )
-        local_alpha = self._local_engine.estimate_alpha(items)
-        te_influence = 0.0
-        all_tokens: list[str] = []
-        for item in items[:500]:
-            all_tokens.extend(item.split())
-        if len(all_tokens) >= 4:
-            te_influence = self._local_engine.compute_transfer_entropy_influence(
-                all_tokens, lag=1
-            )
-        resolved_corpus_id = corpus_id or self._deterministic_corpus_id(items)
-        payload: dict[str, Any] = {
-            "corpus_id": resolved_corpus_id,
-            "items": items,
-            "client_alpha_estimate": local_alpha,
-            "client_te_influence": te_influence,
-        }
-        if metadata:
-            payload["metadata"] = metadata
-        raw = self._post("/corpora/ingest", payload)
-        return CorpusIngestResult(raw)
-
-    def query_similar(
-        self,
-        query: str,
-        corpus_id: str,
-        top_k: int = 10,
-        alpha_override: float | None = None,
-    ) -> QueryResult:
-        """
-        Queries a pre-ingested corpus for the top-k items most similar
-        to the query using the hybrid NMI+cosine score.
-
-        The local engine computes NMI between the query tokens and a
-        sample of corpus tokens to validate the query is non-trivial.
-
-        Args:
-            query: Raw text query. No embedding required.
-            corpus_id: Identifier returned from ingest_corpus.
-            top_k: Number of results to return (1-1000).
-            alpha_override: If set (0.0-1.0), overrides the entropy-derived alpha.
-                           Use only when you have domain knowledge overriding corpus statistics.
-
-        Returns:
-            QueryResult with ranked SimilarityMatch objects.
-
-        Raises:
-            ValidationError: On invalid inputs.
-            SimilaritySearchError: On API error.
-        """
-        if not query or not isinstance(query, str):
-            raise ValidationError("query must be a non-empty string.")
-        if len(query.strip()) == 0:
-            raise ValidationError("query must contain at least one non-whitespace character.")
-        if not corpus_id or not isinstance(corpus_id, str):
-            raise ValidationError("corpus_id must be a non-empty string.")
-        if not isinstance(top_k, int) or top_k < 1 or top_k > 1000:
-            raise ValidationError(
-                f"top_k must be an integer between 1 and 1000, got {top_k!r}."
-            )
-        if alpha_override is not None:
-            if not isinstance(alpha_override, (int, float)):
-                raise ValidationError("alpha_override must be a float between 0.0 and 1.0.")
-            if not (0.0 <= alpha_override <= 1.0):
-                raise ValidationError(
-                    f"alpha_override={alpha_override} out of range. Must be in [0.0, 1.0]."
-                )
-        query_tokens = query.split()
-        local_nmi_sample = 0.0
-        if len(query_tokens) >= 2:
-            local_nmi_sample = self._local_engine.compute_local_nmi(
-                query_tokens, query_tokens[::-1]
-            )
-        payload: dict[str, Any] = {
-            "query": query,
-            "corpus_id": corpus_id,
-            "top_k": top_k,
-            "client_nmi_sample": local_nmi_sample,
-        }
-        if alpha_override is not None:
-            payload["alpha_override"] = alpha_override
-        raw = self._post("/search/query", payload)
-        return QueryResult(raw)
-
-    def get_corpus_entropy_profile(self, corpus_id: str) -> EntropyProfileResult:
-        """
-        Retrieves the full entropy profile of an ingested corpus,
-        including marginal entropy, alpha, transfer entropy at lag-1,
-        and the Nash equilibrium alpha that cross-validates the entropy-derived weight.
-
-        Useful for debugging hybrid score behavior on a specific corpus.
-
-        Args:
-            corpus_id: Identifier returned from ingest_corpus.
-
-        Returns:
-            EntropyProfileResult with full mathematical profile.
-
-        Raises:
-            ValidationError: If corpus_id is invalid.
-            SimilaritySearchError: On API error or corpus not found.
-        """
-        if not corpus_id or not isinstance(corpus_id, str):
-            raise ValidationError("corpus_id must be a non-empty string.")
-        raw = self._get(f"/corpora/{corpus_id}/entropy-profile")
-        result = EntropyProfileResult(raw)
-        alpha_nash = self._local_engine.resolve_alpha_via_nash(
-            alpha_from_entropy=result.alpha,
-            nmi_weight_preference=1.0 - result.alpha,
-            cosine_weight_preference=result.alpha,
-        )
-        result.nash_equilibrium_alpha = alpha_nash
-        return result
-
-    def delete_corpus(self, corpus_id: str) -> dict[str, Any]:
-        """
-        Permanently deletes a corpus and all associated entropy state.
-        Idempotent: returns success even if corpus_id does not exist.
-
-        Args:
-            corpus_id: Identifier returned from ingest_corpus.
-
-        Returns:
-            dict with 'deleted' (bool) and 'corpus_id' (str).
-
-        Raises:
-            ValidationError: If corpus_id is invalid.
-            SimilaritySearchError: On API error.
-        """
-        if not corpus_id or not isinstance(corpus_id, str):
-            raise ValidationError("corpus_id must be a non-empty string.")
-        return self._delete(f"/corpora/{corpus_id}")
-
-    def _post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
-        url = f"{self._base_url}{path}"
-        last_error: Exception | None = None
-        for attempt in range(self._max_retries):
-            try:
-                response = self._http.post(url, json=payload)
-                return self._handle_response(response)
-            except RateLimitError as exc:
-                last_error = exc
-                wait = exc.retry_after if exc.retry_after else self.RETRY_BACKOFF_BASE ** attempt
-                time.sleep(wait)
-            except (httpx.TimeoutException, httpx.ConnectError) as exc:
-                last_error = SimilaritySearchError(
-                    f"Network error on attempt {attempt + 1}/{self._max_retries}: {exc}"
-                )
-                time.sleep(self.RETRY_BACKOFF_BASE ** attempt)
-        raise last_error or SimilaritySearchError("Request failed after max retries.")
-
-    def _get(self, path: str) -> dict[str, Any]:
-        url = f"{self._base_url}{path}"
+    def _post(self, endpoint: str, body: dict[str, Any]) -> dict[str, Any]:
+        url = f"{self._base_url}{endpoint}"
         try:
-            response = self._http.get(url)
-            return self._handle_response(response)
-        except httpx.TimeoutException as exc:
-            raise SimilaritySearchError(f"Request timed out: {exc}") from exc
-
-    def _delete(self, path: str) -> dict[str, Any]:
-        url = f"{self._base_url}{path}"
-        try:
-            response = self._http.delete(url)
-            return self._handle_response(response)
-        except httpx.TimeoutException as exc:
-            raise SimilaritySearchError(f"Request timed out: {exc}") from exc
-
-    def _handle_response(self, response: httpx.Response) -> dict[str, Any]:
-        request_id = response.headers.get("X-Request-Id")
+            response = self._session.post(url, json=body, timeout=self._timeout)
+        except requests.exceptions.Timeout:
+            raise SimilaritySearchAPIError(
+                f"Request to {endpoint} timed out after {self._timeout}s"
+            )
+        except requests.exceptions.ConnectionError as exc:
+            raise SimilaritySearchAPIError(
+                f"Connection error reaching {url}: {exc}"
+            )
         if response.status_code == 401:
-            raise AuthenticationError(
-                "Invalid or expired API key. "
-                "Regenerate at https://similaritysearch.nexus/dashboard",
+            raise SimilaritySearchAPIError(
+                "Authentication failed: invalid or missing api_key",
                 status_code=401,
-                request_id=request_id,
+                response_body=response.text,
             )
         if response.status_code == 429:
-            retry_after_raw = response.headers.get("Retry-After")
-            retry_after = float(retry_after_raw) if retry_after_raw else None
-            raise RateLimitError(
-                "Rate limit exceeded. Reduce request frequency or upgrade your plan.",
-                retry_after=retry_after,
+            retry_after = response.headers.get("Retry-After", "unknown")
+            raise SimilaritySearchAPIError(
+                f"Rate limit exceeded. Retry after {retry_after}s",
+                status_code=429,
+                response_body=response.text,
             )
-        if response.status_code == 422:
-            try:
-                detail = response.json().get("detail", response.text)
-            except Exception:
-                detail = response.text
-            raise ValidationError(
-                f"API rejected payload (422): {detail}",
-                status_code=422,
-                request_id=request_id,
-            )
-        if response.status_code >= 400:
-            try:
-                detail = response.json().get("detail", response.text)
-            except Exception:
-                detail = response.text
-            raise SimilaritySearchError(
-                f"API error {response.status_code}: {detail}",
+        if not response.ok:
+            raise SimilaritySearchAPIError(
+                f"API error {response.status_code} at {endpoint}",
                 status_code=response.status_code,
-                request_id=request_id,
+                response_body=response.text,
             )
         try:
             return response.json()
-        except Exception as exc:
-            raise SimilaritySearchError(
-                f"API returned non-JSON response (status {response.status_code}): {response.text[:200]}"
-            ) from exc
+        except ValueError:
+            raise SimilaritySearchAPIError(
+                f"Non-JSON response from {endpoint}",
+                status_code=response.status_code,
+                response_body=response.text,
+            )
 
-    @staticmethod
-    def _deterministic_corpus_id(items: list[str]) -> str:
-        fingerprint = hashlib.sha256("|".join(items[:50]).encode("utf-8")).hexdigest()[:16]
-        return f"auto-{fingerprint}"
+    def _validate_search_inputs(
+        self,
+        query: dict[str, Any],
+        candidates: list[dict[str, Any]],
+        top_k: int,
+    ) -> None:
+        if query is None or not isinstance(query, dict):
+            raise TypeError("query must be a non-None dict")
+        if not query:
+            raise ValueError("query must not be an empty dict")
+        if candidates is None or not isinstance(candidates, list):
+            raise TypeError("candidates must be a non-None list of dicts")
+        if len(candidates) < self.MIN_CANDIDATES:
+            raise ValueError(
+                f"candidates must contain at least {self.MIN_CANDIDATES} item"
+            )
+        if len(candidates) > self.MAX_CANDIDATES:
+            raise ValueError(
+                f"candidates exceeds maximum of {self.MAX_CANDIDATES} items; "
+                f"got {len(candidates)}"
+            )
+        for i, c in enumerate(candidates):
+            if not isinstance(c, dict):
+                raise TypeError(
+                    f"candidates[{i}] must be a dict, got {type(c).__name__}"
+                )
+        if not isinstance(top_k, int) or isinstance(top_k, bool):
+            raise TypeError("top_k must be an integer")
+        if top_k < 1 or top_k > self.MAX_TOP_K:
+            raise ValueError(
+                f"top_k must be between 1 and {self.MAX_TOP_K}; got {top_k}"
+            )
 
-    def __enter__(self) -> "Client":
-        return self
+    def main_method(
+        self,
+        data: dict[str, Any],
+    ) -> HybridSearchResult:
+        if data is None or not isinstance(data, dict):
+            raise TypeError("data must be a non-None dict")
+        query = data.get("query")
+        candidates = data.get("candidates")
+        top_k = data.get("top_k", 10)
+        candidate_ids = data.get("candidate_ids")
 
-    def __exit__(self, *_: Any) -> None:
-        self.close()
+        if query is None:
+            raise ValueError("data must contain key 'query' (dict)")
+        if candidates is None:
+            raise ValueError("data must contain key 'candidates' (list of dicts)")
 
-    def close(self) -> None:
-        self._http.close()
+        return self.hybrid_search(
+            query=query,
+            candidates=candidates,
+            top_k=top_k,
+            candidate_ids=candidate_ids,
+        )
+
+    def hybrid_search(
+        self,
+        query: dict[str, Any],
+        candidates: list[dict[str, Any]],
+        top_k: int = 10,
+        candidate_ids: list[str] | None = None,
+    ) -> HybridSearchResult:
+        self._validate_search_inputs(query, candidates, top_k)
+
+        if candidate_ids is not None:
+            if len(candidate_ids) != len(candidates):
+                raise ValueError(
+                    f"candidate_ids length ({len(candidate_ids)}) must match "
+                    f"candidates length ({len(candidates)})"
+                )
+            ids = candidate_ids
+        else:
+            ids = [str(i) for i in range(len(candidates))]
+
+        t0 = time.perf_counter()
+
+        partition = self._classifier.partition_payload_features(query, candidates)
+
+        scores: list[tuple[int, ComponentScore]] = []
+        for idx, candidate in enumerate(candidates):
+            cs = self._scorer.score(query, candidate, partition)
+            scores.append((idx, cs))
+
+        scores.sort(key=lambda x: x[1].hybrid_score, reverse=True)
+        top_scores = scores[:top_k]
+
+        matches = [
+            SimilarityMatch(
+                candidate_id=ids[idx],
+                candidate_payload=candidates[idx],
+                score=component_score,
+                rank=rank + 1,
+            )
+            for rank, (idx, component_score) in enumerate(top_scores)
+        ]
+
+        latency_ms = (time.perf_counter() - t0) * 1000.0
+        sig = _payload_signature(query)
+
+        calibration_metadata = {
+            "entropy_threshold_bits": FeatureTypeClassifier.ENTROPY_THRESHOLD_BITS,
+            "w_nmi_entropy_derived": partition.w_nmi,
+            "w_cosine_entropy_derived": partition.w_cosine,
+            "n_categorical_features": len(partition.categorical_keys),
+            "n_continuous_features": len(partition.continuous_keys),
+            "marginal_entropies": partition.marginal_entropies,
+            "total_candidates_scored": len(candidates),
+        }
+
+        return HybridSearchResult(
+            query_id=sig,
+            matches=matches,
+            latency_ms=round(latency_ms, 3),
+            payload_signature=sig,
+            calibration_metadata=calibration_metadata,
+        )
+
+    def explain_score(
+        self,
+        query: dict[str, Any],
+        candidate: dict[str, Any],
+    ) -> ComponentScore:
+        if query is None or not isinstance(query, dict):
+            raise TypeError("query must be a non-None dict")
+        if not query:
+            raise ValueError("query must not be empty")
+        if candidate is None or not isinstance(candidate, dict):
+            raise TypeError("candidate must be a non-None dict")
+        if not candidate:
+            raise ValueError("candidate must not be empty")
+
+        partition = self._classifier.partition_payload_features(query, [candidate])
+        return self._scorer.score(query, candidate, partition)
+
+    def batch_hybrid_search(
+        self,
+        queries: list[dict[str, Any]],
+        candidates: list[dict[str, Any]],
+        top_k: int = 10,
+        candidate_ids: list[str] | None = None,
+    ) -> list[HybridSearchResult]:
+        if queries is None or not isinstance(queries, list):
+            raise TypeError("queries must be a non-None list of dicts")
+        if not queries:
+            raise ValueError("queries must not be empty")
+        if len(queries) > 100:
+            raise ValueError(
+                f"batch_hybrid_search supports at most 100 queries per call; "
+                f"got {len(queries)}"
+            )
+        results = []
+        for q in queries:
+            results.append(
+                self.hybrid_search(
+                    query=q,
+                    candidates=candidates,
+                    top_k=top_k,
+                    candidate_ids=candidate_ids,
+                )
+            )
+        return results
