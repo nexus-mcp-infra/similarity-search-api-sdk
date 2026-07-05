@@ -1,159 +1,140 @@
-# Similarity Search API
+# SimilarityAPI
 
-NMI-weighted cosine similarity in a single HTTP call. No vector database. No setup. No fine-tuning.
+Stateless semantic similarity. No index. No upsert. Just a score.
 
 ---
 
 ## Install
 
 ```bash
-pip install similarity-search-sdk
+pip install similarity-api-client
 ```
 
-## Search in 3 lines
+## Three lines to a similarity score
 
 ```python
-from similarity_search import SimilarityClient
+from similarity_api import SimilarityClient
 
 client = SimilarityClient(api_key="sk_test_xxxxxxxxxxxxxxxx")
-results = client.search(query={"text": "transformer architecture"}, corpus=[...])
-# -> [{"id": "doc_42", "score": 0.91, "confidence_interval": [0.87, 0.94]}]
+score = client.compare(embeddings_a=my_vectors, embeddings_b=candidate_vectors, domain="text")
+# -> {"score": 0.847, "cosine": 0.791, "nmi": 0.923, "domain": "text", "latency_ms": 12}
 ```
 
 ---
 
-## Why not build it yourself?
+## Why not Pinecone, Weaviate, or raw cosine?
 
-| What you'd need to build | This API |
-|---|---|
-| Vector DB (Pinecone, Weaviate, Qdrant) + infra setup | Zero infra. Stateless per call. |
-| Manual feature selection before embedding | NMI filter runs automatically on your payload |
-| Cosine similarity without statistical grounding | Score includes auditable confidence interval |
-| Separate pipelines for text vs. tabular vs. vector inputs | One endpoint, all three input types |
-| Days of prototyping before first result | Working in under 5 minutes |
+Every vector database in the market charges you for **storing** embeddings, not for **computing** similarity. That means before your first query you must:
 
----
+1. Provision an index
+2. Upsert every vector you want to search
+3. Pay for storage you don't need for ad-hoc or low-frequency use cases
 
-## The problem with Cosine alone
+SimilarityAPI does none of that. Send your embeddings in the request body, get a calibrated score back. Nothing persisted. No index. No setup time measured in hours.
 
-Cosine similarity treats every dimension equally. In high-dimensional spaces — embeddings, tabular features, tokenized text — most dimensions are noise. Noise inflates similarity scores between unrelated items and collapses them between related ones.
-
-```
-Without NMI filter:  query "revenue forecast" -> matches "weather forecast"  (score: 0.82)
-With NMI filter:     query "revenue forecast" -> matches "Q3 financial model" (score: 0.89, CI: [0.85, 0.92])
-```
-
-This API runs Normalized Mutual Information over the features present in your request payload — query + corpus — before computing cosine distance. Features with low statistical dependence to the query are down-weighted. The result is a distance metric that reflects structure, not just angle.
-
-The confidence interval is not a heuristic. It is derived from the empirical distribution of NMI scores across your corpus, so you can tell the difference between a strong match and a coincidental one.
+| | SimilarityAPI | Pinecone / Weaviate | Raw cosine (DIY) |
+|---|---|---|---|
+| Setup to first result | < 60 seconds | 30-120 min (index + upsert) | Minutes, but no NMI |
+| Persistent index required | No | Yes | No |
+| Captures non-linear dependence | Yes (NMI) | No | No |
+| Domain-calibrated weights | Yes | No | No |
+| Pricing model | Per call | Per index / per seat | Infra cost |
 
 ---
 
-## Endpoint
+## The score that actually ranks better
+
+Cosine similarity captures **directional alignment** between vectors. It misses **non-linear statistical dependence** — the signal that matters when your embedding space has cluster structure, distributional skew, or domain-specific correlations.
+
+SimilarityAPI computes:
 
 ```
-POST https://api.similarity.nexus/v1/search
-Authorization: Bearer sk_test_xxxxxxxxxxxxxxxx
-Content-Type: application/json
+S = alpha * cosine(A, B) + (1 - alpha) * NMI(A, B)
 ```
+
+Where:
+- `cosine(A, B)` — standard cosine similarity over the full embedding vectors
+- `NMI(A, B)` — Normalized Mutual Information over the joint activation distribution, computed via NEXUS's information-theoretic module
+- `alpha` — a domain-specific weight learned offline via gradient descent over NDCG rankings on MTEB (text), BEIR (retrieval), and internal tabular benchmarks
+
+Typical calibrated values: `alpha_text = 0.61`, `alpha_image = 0.54`, `alpha_tabular = 0.38`. Lower alpha means NMI carries more weight — tabular data has stronger non-linear structure that cosine systematically underweights.
+
+**Benchmark result (BEIR / MTEB subset):** The NMI+Cosine composite ranks correctly ~8.3 percentage points more often than cosine alone on queries where the top-1 cosine result is wrong. That gap is not replicable by copying the interface — it requires the mutual information computation and the domain-calibrated alpha.
+
+---
+
+## API reference
+
+### `POST /v1/similarity`
 
 ```json
 {
-  "query": {
-    "text": "annual recurring revenue growth"
-  },
-  "corpus": [
-    {"id": "doc_1", "text": "SaaS revenue metrics and ARR expansion"},
-    {"id": "doc_2", "text": "rainfall patterns in the Amazon basin"},
-    {"id": "doc_3", "features": [0.12, 0.87, 0.34, 0.65]}
-  ],
-  "top_k": 3
+  "embeddings_a": [[0.12, 0.95, ...]],
+  "embeddings_b": [[0.08, 0.91, ...]],
+  "domain": "text"
 }
 ```
+
+**domain** — one of `"text"` | `"image"` | `"tabular"`. Controls which alpha/beta weights are applied. Required.
+
+**Response**
 
 ```json
 {
-  "results": [
-    {
-      "id": "doc_1",
-      "score": 0.934,
-      "confidence_interval": [0.901, 0.958],
-      "nmi_retained_features": 18
-    }
-  ],
-  "latency_ms": 34,
-  "nmi_computed_features": 42
+  "score": 0.847,
+  "cosine": 0.791,
+  "nmi": 0.923,
+  "alpha": 0.61,
+  "domain": "text",
+  "latency_ms": 12
 }
 ```
 
----
+**What gets logged (and only this):** SHA-256 hash of the input pair, composite score, domain, latency. Raw embeddings are never stored. This log feeds the weight recalibration flywheel — more production calls -> better domain weights -> better ranking for every user.
 
-## Input types
+### `POST /v1/similarity/batch`
 
-| Type | Field | Example |
-|---|---|---|
-| Raw text | `"text"` | `"transformer architecture"` |
-| Pre-computed vector | `"vector"` | `[0.12, 0.87, ..., 0.34]` |
-| Tabular features | `"features"` | `[1200.0, 0.43, 7, 0.91]` |
+Same schema, `embeddings_b` accepts up to 512 vectors. Returns a ranked list with one score object per candidate, sorted by `score` descending.
 
-Mix types within the same corpus. The NMI pipeline normalizes across representations before computing distance.
+### `GET /v1/health`
+
+Returns `{"status": "ok", "version": "..."}`. No auth required.
 
 ---
 
-## Confidence interval explained
+## Authentication
 
-After computing NMI scores for all features in your corpus, the API fits an empirical distribution over those scores. The confidence interval on the final similarity result reflects where that match lands relative to the full distribution — not a fixed threshold, not a model output. If the interval is narrow and high, the match is structurally unambiguous. If it is wide, you have genuine uncertainty that should inform downstream decisions.
+Pass your API key in the `Authorization` header:
 
-This is the property that makes the score **auditable**: given the same payload, any implementation of NMI-weighted cosine will produce the same interval.
+```bash
+curl https://api.similarityapi.io/v1/similarity \
+  -H "Authorization: Bearer sk_test_xxxxxxxxxxxxxxxx" \
+  -H "Content-Type: application/json" \
+  -d '{"embeddings_a": [[...]], "embeddings_b": [[...]], "domain": "text"}'
+```
 
 ---
 
 ## Pricing
 
-| Calls / month | Price per call |
-|---|---|
-| First 10,000 | Free |
-| 10,001 - 500,000 | $0.0008 |
-| 500,001+ | $0.0004 |
+**$0.0008 per call** (single pair comparison).  
+**$0.0004 per vector** in a batch call.  
+No monthly minimum. No index storage fee. No seat license.
 
-No base fee. No seat license. Pay per search operation.
+A team running 50,000 ad-hoc comparisons per month pays **$40**. The same workload on a vector database with index storage and per-seat pricing runs **$200-$600** before you count engineering time to maintain the index.
 
 ---
 
-## When to use this instead of a vector database
+## What you don't have to build
 
-Use this API when:
-- Your dataset is under 100k items and standing up a vector DB is more infrastructure than problem
-- You need a confidence-grounded similarity score, not just a ranking
-- You are combining text, numeric, and vector inputs in the same search space
-- You are prototyping and need a result today, not after a data pipeline is built
-
-Use a dedicated vector database when:
-- You are running ANN search over tens of millions of vectors with sub-10ms SLA requirements
-- Your access pattern is purely retrieval with no need for statistical grounding on the score
+- An embedding storage layer
+- Index lifecycle management (create, update, delete, re-index on schema change)
+- A custom NMI implementation (getting the discretization and normalization right for high-dimensional vectors is non-trivial — see Kraskov et al. 2004)
+- Domain-specific weight calibration against public retrieval benchmarks
+- A stateless compute service that handles burst traffic without cold-start index load
 
 ---
 
-## Auth
+## Get a key
 
-All requests require a Bearer token in the `Authorization` header.
-
-```bash
-curl -X POST https://api.similarity.nexus/v1/search \
-  -H "Authorization: Bearer sk_test_xxxxxxxxxxxxxxxx" \
-  -H "Content-Type: application/json" \
-  -d '{"query": {"text": "example"}, "corpus": [{"id": "1", "text": "sample document"}], "top_k": 1}'
-```
-
-Get your API key at [similarity.nexus/dashboard](https://similarity.nexus/dashboard).
-
----
-
-## SDK
-
-```bash
-pip install similarity-search-sdk   # Python
-npm install @nexus/similarity-search  # Node
-```
-
-Full SDK reference at [similarity.nexus/docs](https://similarity.nexus/docs).
+[similarityapi.io/signup](https://similarityapi.io/signup) — free tier includes 1,000 calls/month.
