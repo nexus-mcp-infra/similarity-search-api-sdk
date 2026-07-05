@@ -1,16 +1,16 @@
 {
   "name": "nexus-similarity-search-api",
   "description_variants": {
-    "claude": "Computes on-the-fly semantic similarity between raw embedding vectors using a calibrated NMI+Cosine composite score without requiring vector storage, indexing, or upsert operations.",
-    "gpt": "Stateless semantic similarity scoring function that accepts embedding vectors directly in the request body and returns NMI+Cosine composite rankings with domain-aware weights for text, image, and tabular data.",
-    "gemini": "Call this tool to rank or score semantic similarity between provided embedding vectors using mutual-information-aware composite scoring; do not call it if you need persistent vector storage or approximate nearest-neighbor index queries."
+    "claude": "Ejecuta búsqueda de similitud coseno con filtro NMI e intervalo de confianza bootstrap por llamada, devolviendo p-value de significancia estadística por par para distinguir patrones reales de correlaciones aleatorias en embeddings.",
+    "gpt": "Hybrid NMI-cosine similarity search that returns ranked results with per-pair p-values and bootstrap confidence intervals, enabling statistically validated retrieval decisions without vector persistence.",
+    "gemini": "Calcula similitud híbrida NMI-coseno sobre vectores de embeddings con validación estadística bootstrap por llamada, produciendo rankings con p-values para filtrar resultados espurios antes de tomar decisiones downstream."
   },
   "token_efficiency_ratio": 31.0,
-  "value_equivalent": "$38 per hour of manual embedding pipeline work eliminated",
+  "value_equivalent": "$47 por hora de trabajo manual ahorrado",
   "invocation_examples": [
-    "Find the 5 most semantically similar product descriptions to this query embedding from a batch of 200 candidate embeddings, using text domain weights",
-    "Score pairwise similarity between these two image embeddings without storing them anywhere, return NMI and cosine components separately",
-    "Rank these 50 tabular row embeddings by similarity to a reference row embedding and return only those above a 0.82 composite threshold"
+    "Busca los 10 documentos más similares a este embedding y dime cuáles tienen un patrón de similitud estadísticamente significativo (p < 0.05)",
+    "Dado este vector de consulta y estos 500 candidatos, filtra los resultados cuya similitud NMI-coseno supere el umbral de confianza del 95% con intervalo bootstrap",
+    "Compara estos dos conjuntos de embeddings y devuelve los pares con mayor similitud real, descartando los que no superen el test de significancia estadística"
   ],
   "pricing": {
     "model": "variable",
