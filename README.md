@@ -1,199 +1,104 @@
-# Similarity Search API
+# Hybrid Similarity Search API
 
-Find what's similar. No infrastructure required.
+Stateless NMI+cosine scoring over arbitrary payloads. No indexes. No embeddings pipeline. No infrastructure.
+
+---
+
+## Install
 
 ```bash
-pip install similarity-search-sdk
+pip install hybrid-similarity-client
 ```
-
-```python
-from similarity_search import SimilarityClient
-
-client = SimilarityClient(api_key="sk_live_...")
-results = client.search(query=product, collection=catalog, top_k=10)
-```
-
-Your top-10 results, ranked by Information-Geometric Similarity, in one round-trip.
-
----
-
-## The problem with every other option
-
-You have a collection of 800 items. You want to find the 10 most similar to a query. Here is what the current landscape forces you to do:
-
-**Vector store route** — Spin up Pinecone, Weaviate, or Qdrant. Vectorize every item. Push embeddings to the index. Keep the index synchronized when the collection changes. Pay $70–300/month whether you run 10 queries or 10,000. Total time before your first result: 45–90 minutes, and that is if nothing breaks.
-
-**Roll your own route** — Implement cosine similarity in NumPy. Realize cosine alone misses categorical structure. Add NMI. Debug the entropy estimator. Handle edge cases in sparse distributions. Write the fusion function. Tune the weights. Two days later you have something that works on your test fixture and fails silently on production data.
-
-**Similarity Search API route** — One HTTP call. No index. No sync. No monthly commitment. First result in under 200 ms.
-
----
-
-## When to use this
-
-- Collections that change frequently and would be expensive to keep indexed
-- Ad-hoc similarity on ephemeral datasets (search-before-you-commit workflows)
-- Collections under 100k items where a full vector store is architectural overkill
-- Any case where you are paying for infrastructure you use less than 10k times per month
-- Items with mixed structure: numeric features alongside categorical fields (product catalogs, job listings, medical codes, content metadata)
-
-## When **not** to use this
-
-- Collections above 100k items where ANN indexes give you sub-linear query time you cannot match stateless
-- Workloads requiring persistent vector state across sessions (recommendation engines with user history)
-- Real-time streaming ingestion at high write volume
-
----
-
-## Why the ranking is better
-
-Every stateless similarity API you can find today uses cosine distance alone. Cosine is a geometric metric — it measures the angle between two vectors. It is excellent for dense continuous features and terrible for categorical distributions, because two items with completely different category distributions can have a small angle if their magnitudes are similar.
-
-NMI (Normalized Mutual Information) measures how much knowing one item's category distribution reduces uncertainty about the other's. It captures structural overlap that cosine cannot see.
-
-The problem is they are not directly composable — they live in different mathematical spaces. Cosine is bounded in [-1, 1] geometrically; NMI is bounded in [0, 1] information-theoretically. Naively averaging them produces scores that are neither interpretable nor well-calibrated.
-
-**The Information-Geometric Similarity Score (IGS)** solves this with adaptive fusion:
-
-```
-IGS(a, b | d) = w_nmi(d) * NMI(a, b) + w_cos(d) * Cosine(a, b)
-
-where w_nmi(d) + w_cos(d) = 1
-and w_nmi(d) is a function of the categorical density of domain d,
-estimated per-request using the Miller-Madow entropy corrector
-to handle small-sample bias in sparse category distributions.
-```
-
-The weights are not hyperparameters you tune once and forget. They are estimated from the structure of each collection you pass in the request, then recalibrated offline every 24 hours using accepted/rejected ranking signals accumulated across all queries. The result: the fusion becomes more accurate the more the API is used, without any action required from you.
-
-This is not reproducible by copying the endpoint interface. The moat is in the calibrated fusion function and the data flywheel behind the weight recalibration — not in the HTTP surface.
-
----
 
 ## Quickstart
 
 ```python
-from similarity_search import SimilarityClient, Item
+from hybrid_similarity import SimilarityClient
 
-client = SimilarityClient(api_key="sk_live_...")
-
-query = Item(
-    id="product-001",
-    features={"embedding": [0.12, 0.87, ...], "category": "electronics", "price_tier": "mid"}
-)
-
-collection = [
-    Item(id="product-042", features={"embedding": [...], "category": "electronics", "price_tier": "mid"}),
-    Item(id="product-107", features={"embedding": [...], "category": "accessories", "price_tier": "low"}),
-    # ... up to 100k items
-]
-
-results = client.search(query=query, collection=collection, top_k=10)
-
-for r in results:
-    print(r.id, r.igs_score, r.nmi_component, r.cosine_component)
+client = SimilarityClient(api_key="sk-...")
+results = client.search(query={"category": "electronics", "price": 299.0, "brand": "sony"}, corpus=product_catalog, top_k=10)
 ```
 
-The response includes the decomposed score — `igs_score`, `nmi_component`, `cosine_component` — so your ranking is auditable. You can see exactly how much of the similarity is geometric versus distributional. No black box.
+Every result includes `score`, `nmi_component`, `cosine_component`, and `dominant_signal` — no black box.
 
 ---
 
-## API reference
+## Why not build this yourself
 
-### `POST /v1/search`
+The hard part is not cosine similarity. The hard part is knowing *when* to use cosine versus NMI, and how to combine them without introducing a manually-tuned weight that breaks on every new dataset.
 
-Find the top-k most similar items to a query within a collection passed in the request body. Stateless — nothing is stored.
+This API solves exactly that:
 
-**Request**
+**The weight is derived from entropy, not from your intuition.**
 
-```json
-{
-  "query": {
-    "id": "string",
-    "features": { "field": "value or [float]" }
-  },
-  "collection": [
-    { "id": "string", "features": { "field": "value or [float]" } }
-  ],
-  "top_k": 10,
-  "weights": "adaptive"
-}
+For each feature in your payload, the API computes marginal entropy H at query time. Features where H < 1.5 bits (low-variability, categorical by behavior) route through Normalized Mutual Information. Features where H >= 1.5 bits route through cosine similarity. The relative weight is:
+
+```
+w_nmi = sum(H_categorical) / (sum(H_categorical) + sum(H_continuous))
 ```
 
-`weights` accepts `"adaptive"` (default, uses IGS with Miller-Madow estimation) or `{"nmi": 0.4, "cosine": 0.6}` if you want to fix the fusion manually.
+This means a payload of `{category, subcategory, price, embedding_vector}` auto-calibrates to weight NMI heavily. A payload of `{title_embedding, description_embedding, click_rate}` auto-calibrates toward cosine. You never touch a weight parameter.
 
-**Response**
+Replicating this requires: per-feature entropy estimation at runtime, NMI computation invariant to cardinality differences across fields, adaptive fusion without distributional leakage between components, and a stateless design that does all of this per-request without persisting any index. That is several engineering weeks, not an afternoon.
+
+---
+
+## What problem this replaces
+
+| Approach | What you manage | Cost at < 100k items |
+|---|---|---|
+| Pinecone / Weaviate | Index provisioning, embedding pipeline, infra uptime | $70–$140/mo minimum |
+| Custom NMI + cosine pipeline | Feature typing, weight tuning, data drift recalibration | 2–4 weeks engineering |
+| **This API** | Nothing | Pay per call |
+
+If your corpus fits in a request payload (under 10MB), you do not need a vector database. You need a search call that returns in under 200ms with an explainable score.
+
+---
+
+## Response anatomy
 
 ```json
 {
   "results": [
     {
-      "id": "product-042",
-      "rank": 1,
-      "igs_score": 0.891,
-      "nmi_component": 0.934,
-      "cosine_component": 0.847,
-      "w_nmi": 0.61,
-      "w_cos": 0.39
+      "id": "item_0042",
+      "score": 0.847,
+      "nmi_component": 0.91,
+      "cosine_component": 0.76,
+      "dominant_signal": "nmi",
+      "w_nmi": 0.63,
+      "w_cosine": 0.37
     }
   ],
-  "collection_size": 847,
-  "latency_ms": 143,
-  "miller_madow_correction_applied": true
+  "payload_profile": {
+    "categorical_features": ["category", "brand"],
+    "continuous_features": ["price"],
+    "entropy_weights_computed_at": "request_time"
+  }
 }
 ```
 
-### `POST /v1/score`
-
-Compute the IGS score for a single pair. Useful for threshold checks without ranking a full collection.
-
-### `GET /v1/health`
-
-Returns API status and current model recalibration timestamp.
+`dominant_signal` tells you which component drove the match. If it says `nmi`, the items are similar because their categorical distributions align — not because their numeric values are close. That distinction matters for debugging recommendations, fraud signals, and catalog deduplication.
 
 ---
 
 ## Pricing
 
-Pay per call. No monthly seat. No infrastructure.
-
-| Volume | Price per call |
-|---|---|
-| 0 – 10k calls/month | $0.004 |
-| 10k – 100k calls/month | $0.002 |
-| 100k+ calls/month | $0.001 |
-
-A team running 5,000 queries per month pays $20. The equivalent Pinecone starter plan costs $70/month before you write a single line of code.
+$0.004 per search call (query against corpus up to 10,000 items).
+$0.018 per search call (corpus 10,001–100,000 items).
+No base fee. No index storage. No minimum spend.
 
 ---
 
-## Error handling
+## Limits
 
-The SDK raises typed exceptions. You do not need to parse error strings.
-
-```python
-from similarity_search.exceptions import (
-    CollectionTooLargeError,   # collection exceeds 100k items
-    FeatureShapeMismatchError, # query and collection embedding dims differ
-    InsufficientFeaturesError, # NMI requires at least one categorical field
-    AuthenticationError,       # invalid or missing API key
-    RateLimitError,            # retry with exponential backoff
-)
-```
-
----
-
-## Security
-
-- TLS 1.3 on all endpoints
-- API keys are scoped (read / write / admin) and revocable from the dashboard
-- Request bodies are not logged or stored — stateless by design, not just by claim
-- SOC 2 Type II audit in progress
+- Corpus size: up to 100,000 items per call
+- Payload fields per item: up to 64
+- Field value types: `str`, `int`, `float`, `bool`, `list[str]`
+- Latency SLA: p95 < 220ms at 10k corpus, p95 < 800ms at 100k corpus
 
 ---
 
 ## Get an API key
 
-[dashboard.similaritysearch.dev](https://dashboard.similaritysearch.dev) — key in 30 seconds, no credit card required for the first 1,000 calls.
-
-Questions: [support@similaritysearch.dev](mailto:support@similaritysearch.dev)
+[dashboard.hybridsimilarity.dev](https://dashboard.hybridsimilarity.dev) -> New key -> copy `sk-...`
