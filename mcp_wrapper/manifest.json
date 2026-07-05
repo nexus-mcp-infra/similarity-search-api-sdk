@@ -1,16 +1,16 @@
 {
   "name": "nexus-similarity-search-api",
   "description_variants": {
-    "claude": "Computes hybrid NMI+Cosine similarity over raw text, categorical, or discrete time-series data on-the-fly, without requiring pre-built vector indexes or embedding pipelines, using entropy-weighted scoring to surface statistically dependent items that cosine similarity misses.",
-    "gpt": "Call this function to find similar items in raw datasets using Normalized Mutual Information combined with cosine similarity; use it when inputs are unembedded text or categorical data and you need non-linear statistical dependence detection without a vector store.",
-    "gemini": "Tool for on-the-fly similarity search over raw structured or unstructured data using an entropy-weighted NMI+Cosine hybrid metric; invoke when no vector index exists and similarity must capture non-linear variable dependence beyond what dot-product metrics provide."
+    "claude": "Ejecuta búsqueda híbrida stateless sobre colecciones arbitrarias fusionando NMI para features categóricas y coseno para features continuas en un score único con desglose por componente, sin índices ni infraestructura persistente.",
+    "gpt": "Hybrid similarity search endpoint that auto-detects feature types and computes entropy-weighted NMI+cosine scores across arbitrary JSON payloads, returning ranked results with per-component score breakdown in a single stateless call.",
+    "gemini": "Busca los registros más similares a un query en una colección JSON arbitraria usando NMI ponderado por entropía para campos categóricos y similitud coseno para campos numéricos, fusionados adaptativamente sin configuración manual de pesos."
   },
   "token_efficiency_ratio": 31.0,
-  "value_equivalent": "$140 por hora de trabajo manual ahorrado",
+  "value_equivalent": "$94 por hora de trabajo manual ahorrado",
   "invocation_examples": [
-    "Find the 5 product descriptions most similar to this new listing without running an embedding pipeline first",
-    "Rank these 200 customer support tickets by statistical similarity to this reference complaint using mutual information",
-    "Detect duplicate or near-duplicate categorical survey responses across this dataset without a pre-built index"
+    "Encuentra los 5 productos más similares a este SKU considerando categoría, marca y vector de atributos numéricos sin montar índice",
+    "Busca los clientes más parecidos a este perfil híbrido con campos como segmento, región y métricas de comportamiento continuas",
+    "Dado este log de evento con campos categóricos y numéricos mixtos, encuentra los 10 registros históricos más cercanos para detección de anomalías"
   ],
   "pricing": {
     "model": "variable",
