@@ -1,29 +1,21 @@
-# Justificación Matemática: Similarity Search API (NMI+Cosine Stateless)
+# Justificación Matemática: Similarity Search API (NMI+Cosine Fusion)
 
-## 1. Máximo 5 Endpoints — Hick's Law
+## 1. Máximo 5 Endpoints (Hick's Law)
 
-$$T = b \cdot \log_2(n+1)$$
+El tiempo de decisión del desarrollador sobre cómo integrar una API sigue $T = b \cdot \log_2(n+1)$. Con $n=5$ endpoints, $T \approx 2.58b$; con $n=12$, $T \approx 3.70b$ — un 43% más de fricción cognitiva antes de la primera llamada exitosa. Para una primitiva cuyo diferenciador es eliminar setup, aumentar $n$ contradice directamente la propuesta de valor: cada endpoint adicional implica una decisión de routing que el cliente debe tomar antes de recibir valor.
 
-Con $n=5$ opciones, el tiempo de decisión del integrador es $T = b \cdot \log_2(6) \approx 2.58b$, frente a $3.46b$ con $n=10$. La API expone exactamente las operaciones atómicas no solapadas que el problema requiere: comparar, rankear, y calibrar — nada más. Cada endpoint adicional sin responsabilidad única aumenta la carga cognitiva sin aumentar la superficie de valor, lo que eleva el tiempo de integración y reduce la tasa de conversión comercial.
+## 2. Pricing Per-Call vs Por Asiento (Elasticidad Precio-Demanda)
 
-## 2. Pricing Per-Call — Elasticidad Precio-Demanda
+La elasticidad precio-demanda para herramientas de infraestructura de evaluación es altamente elástica ($|\varepsilon| > 1$) en la fase de prueba: un costo fijo de \$70/mes genera una barrera de adopción independiente del volumen, colapsando la demanda a cero para el segmento de 500 queries/día. El modelo per-call alinea $\text{Costo} = p \cdot q$ con la curva de valor real del cliente — quien procesa 500 queries/día paga proporcional a 500, no a la capacidad de un pod ocioso. Esto maximiza el área bajo la curva de adopción en la cola larga del mercado.
 
-$$E_d = \frac{\partial Q / Q}{\partial P / P}$$
+## 3. Estructura de Datos: Payload Raw sin Índice (Complejidad Algorítmica)
 
-El caso de uso central es comparación ad-hoc sin estado persistente: un developer que resuelve un problema puntual no tolera suscripción fija con coste amortizado sobre volumen incierto. La elasticidad por operación es negativa y alta en magnitud ($|E_d| > 1$) para uso esporádico, lo que significa que una suscripción fija destruye demanda en la cola larga. Per-call convierte el coste marginal del usuario en función lineal del valor recibido, alineando incentivos sin fricción de commit.
+Un índice HNSW persistente tiene costo de construcción $O(n \log n)$ y costo de query $O(\log n)$, pero requiere $O(n \cdot d)$ almacenamiento y estado mutable. Para catálogos pequeños ($n \leq 10^4$ items), la búsqueda exhaustiva sobre payload raw tiene costo $O(n \cdot d)$ por query — igual orden que HNSW en la práctica para $n$ moderado, pero con costo de setup $O(1)$ y cero estado. La estructura elegida es una matriz densa efímera $\mathbf{X} \in \mathbb{R}^{n \times d}$ construida en memoria por request y descartada al responder, eliminando el overhead de serialización/deserialización de índice.
 
-## 3. Estructura de Datos — Complejidad Algorítmica
+## 4. Invariante Matemático del Scoring Unificado
 
-El payload ad-hoc se representa como matriz $X \in \mathbb{R}^{n \times d}$ procesada en memoria sin persistencia. El cálculo de entropía marginal $H(X_i) = -\sum_k p_k \log_2 p_k$ por dimensión es $O(n)$ con estimación por histograma discretizado; la ponderación $w_i = H(X_i) / \sum_j H(X_j)$ es $O(d)$; cosine similarity sobre vectores densos es $O(d)$; NMI entre dos dimensiones es $O(n \log n)$ por el sort implícito en la estimación conjunta. El coste total por llamada es $O(n \cdot d \cdot \log n)$ — dominado por NMI, no por cosine, lo que justifica que el cuello de botella esté en la estimación de distribución conjunta, no en el álgebra lineal.
+El invariante central es que el score fusionado $S = \alpha \cdot \cos(\mathbf{u}, \mathbf{v}) + (1-\alpha) \cdot \widehat{\text{NMI}}(f_i, f_j)$ permanece en $[0, 1]$ para todo $\alpha \in [0,1]$, dado que $\cos \in [-1,1]$ se normaliza a $\frac{1+\cos}{2} \in [0,1]$ y $\text{NMI} \in [0,1]$ por construcción: $\text{NMI}(X,Y) = \frac{2 \cdot I(X;Y)}{H(X)+H(Y)}$ con $H$ estimada via conteos suavizados con corrección de Laplace ($+1$ por bin), garantizando $H > 0$ incluso en distribuciones degeneradas. Este invariante hace el ranking total-ordenado y comparable entre llamadas con distintos $\alpha$, sin normalización post-hoc.
 
-## 4. Invariante Matemático
+## 5. Límites Teóricos del Sistema
 
-El score compuesto garantiza el siguiente invariante: para cualquier payload donde las dimensiones sean estadísticamente independientes ($I(X_i; X_j) = 0$ para todo $i \neq j$), el score colapsa a cosine puro ponderado por entropía uniforme. Formalmente:
-
-$$S = \sum_i w_i \cdot \left[\alpha \cdot \text{NMI}(X_i, Y_i) + (1-\alpha) \cdot \cos(x_i, y_i)\right], \quad w_i = \frac{H(X_i)}{\sum_j H(X_j)}$$
-
-Este invariante garantiza que el score nunca amplifica dimensiones de entropía cero (constantes), que no aportarían información mutua ni dirección vectorial — la ponderación las anula automáticamente sin intervención del usuario.
-
-## 5. Límites Teóricos
-
-La estimación de $H(X_i)$ asume que el histograma discretizado converge a la distribución real con $n \geq 30$ observaciones por dimensión (teorema central del límite sobre frecuencias relativas); con $n < 30$, la entropía marginal está sesgada hacia arriba y los pesos $w_i$ pierden calibración. El sistema no puede operar en streaming incremental sin acumular el payload completo, porque NMI requiere la distribución conjunta global — esto es una consecuencia directa del principio de procesamiento de información de Shannon: la información mutua entre variables no se puede estimar localmente sobre una submuestra sin sesgo garantizado. Por el mismo motivo, el score no es aditivo entre llamadas parciales: $I(X;Y|Z) \neq I(X;Y) + I(Z;Y)$ en el caso general.
+El diseño stateless impone $n \leq O(10^4)$ items por llamada antes de que la latencia por request supere umbrales aceptables (~200ms): la complejidad $O(n^2)$ del cálculo NMI entre pares de features crece cuadráticamente con el catálogo, haciendo este sistema **incorrecto por diseño** para repositorios de millones de items — exactamente el caso de uso donde Pinecone tiene ventaja asintótica. Adicionalmente, NMI requiere variables con soporte discreto finito; features continuas de alta cardinalidad ($|\mathcal{V}| \to \infty$) colapsan la estimación de entropía hacia ruido, por lo que el pipeline no puede sustituir embeddings semánticos densos en dominios puramente textuales de vocabulario abierto.
