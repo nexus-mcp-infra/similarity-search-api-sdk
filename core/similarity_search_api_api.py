@@ -1,512 +1,380 @@
-from fastapi import FastAPI, HTTPException, Security, status
-from fastapi.security.api_key import APIKeyHeader
-from pydantic import BaseModel, Field, model_validator
-from typing import Optional
+from fastapi import FastAPI, HTTPException, Depends, Header
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from pydantic import BaseModel, Field, field_validator, model_validator
+from typing import Any, Optional
 import numpy as np
 from scipy.stats import entropy as scipy_entropy
-from sklearn.metrics import normalized_mutual_info_score
-from sklearn.preprocessing import KBinsDiscretizer
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.preprocessing import LabelEncoder
+import hashlib
 import os
 import time
-import hashlib
-import hmac
-
-API_KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=False)
-_VALID_API_KEY = os.environ.get("SIMILARITY_API_KEY", "")
+import math
 
 app = FastAPI(
-    title="Stateless Similarity Search API",
-    description=(
-        "Fuses NMI and cosine similarity into a single entropy-weighted score. "
-        "No indexing, no persistent state, no prior upload required."
-    ),
+    title="Similarity Search API",
+    description="Stateless NMI+cosine unified scoring over raw JSON payloads — no index, no embedding, no setup.",
     version="1.0.0",
-    docs_url="/docs",
-    redoc_url=None,
 )
 
+security = HTTPBearer()
 
-class VectorPayload(BaseModel):
-    query: list[float] = Field(..., min_length=1, max_length=16384)
-    candidates: list[list[float]] = Field(..., min_length=1, max_length=2048)
-    top_k: int = Field(default=10, ge=1, le=512)
-    nmi_bins: int = Field(
-        default=10,
-        ge=3,
-        le=64,
-        description=(
-            "Number of bins for NMI discretization. "
-            "Increase for larger candidate sets; reduce for sparse data."
-        ),
-    )
-    alpha: Optional[float] = Field(
-        default=None,
+API_KEY = os.environ.get("SIMILARITY_API_KEY", "dev-insecure-key")
+
+
+def verify_api_key(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    if credentials.credentials != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing API key.")
+    return credentials.credentials
+
+
+class SimilarityItem(BaseModel):
+    id: str = Field(..., min_length=1, max_length=256)
+    features: dict[str, Any] = Field(..., min_length=1)
+
+    @field_validator("features")
+    @classmethod
+    def features_not_empty(cls, v):
+        if not v:
+            raise ValueError("features dict must contain at least one key-value pair.")
+        return v
+
+
+class RankedSimilarityRequest(BaseModel):
+    query: SimilarityItem
+    corpus: list[SimilarityItem] = Field(..., min_length=1, max_length=5000)
+    top_k: int = Field(default=10, ge=1, le=500)
+    alpha: float = Field(
+        default=0.6,
         ge=0.0,
         le=1.0,
-        description=(
-            "Fixed NMI weight override [0,1]. If None (recommended), "
-            "weight is derived dynamically from marginal entropy of query dimensions."
-        ),
+        description="Weight for cosine score. NMI weight = 1 - alpha. Use alpha closer to 1.0 for numeric-heavy payloads, closer to 0.0 for categorical-heavy.",
     )
 
     @model_validator(mode="after")
-    def validate_dimensions(self) -> "VectorPayload":
-        dim = len(self.query)
-        if dim == 0:
-            raise ValueError("query vector must have at least one dimension")
-        for i, cand in enumerate(self.candidates):
-            if len(cand) != dim:
-                raise ValueError(
-                    f"candidate[{i}] has {len(cand)} dimensions, expected {dim}"
-                )
+    def corpus_ids_unique(self):
+        ids = [item.id for item in self.corpus]
+        if len(ids) != len(set(ids)):
+            raise ValueError("corpus item IDs must be unique.")
         return self
 
 
-class BatchPayload(BaseModel):
-    queries: list[list[float]] = Field(..., min_length=1, max_length=256)
-    candidates: list[list[float]] = Field(..., min_length=1, max_length=2048)
-    top_k: int = Field(default=10, ge=1, le=512)
-    nmi_bins: int = Field(default=10, ge=3, le=64)
-    alpha: Optional[float] = Field(default=None, ge=0.0, le=1.0)
-
-    @model_validator(mode="after")
-    def validate_batch_dimensions(self) -> "BatchPayload":
-        dim = len(self.queries[0])
-        for i, q in enumerate(self.queries):
-            if len(q) != dim:
-                raise ValueError(
-                    f"queries[{i}] has {len(q)} dimensions, expected {dim}"
-                )
-        for i, c in enumerate(self.candidates):
-            if len(c) != dim:
-                raise ValueError(
-                    f"candidates[{i}] has {len(c)} dimensions, expected {dim}"
-                )
-        return self
-
-
-class SimilarityResult(BaseModel):
-    index: int
-    composite_score: float
-    nmi_score: float
+class ScoredItem(BaseModel):
+    id: str
+    score: float
     cosine_score: float
-    nmi_weight: float
+    nmi_score: float
 
 
-class SearchResponse(BaseModel):
-    results: list[SimilarityResult]
-    query_dim: int
-    candidate_count: int
-    nmi_weight_used: float
+class RankedSimilarityResponse(BaseModel):
+    results: list[ScoredItem]
+    query_id: str
+    alpha: float
+    corpus_size: int
     latency_ms: float
 
 
-class BatchSearchResponse(BaseModel):
-    results: list[list[SimilarityResult]]
-    query_count: int
-    candidate_count: int
-    latency_ms: float
-
-
-class MetricsResponse(BaseModel):
-    query: list[float]
-    reference: list[float]
-    nmi_score: float
-    cosine_score: float
-    composite_score: float
-    nmi_weight: float
-    marginal_entropies: list[float]
-
-
-class MetricsPayload(BaseModel):
-    query: list[float] = Field(..., min_length=1, max_length=16384)
-    reference: list[float] = Field(..., min_length=1, max_length=16384)
-    nmi_bins: int = Field(default=10, ge=3, le=64)
-    alpha: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+class BatchRequest(BaseModel):
+    queries: list[SimilarityItem] = Field(..., min_length=1, max_length=50)
+    corpus: list[SimilarityItem] = Field(..., min_length=1, max_length=5000)
+    top_k: int = Field(default=10, ge=1, le=500)
+    alpha: float = Field(default=0.6, ge=0.0, le=1.0)
 
     @model_validator(mode="after")
-    def validate_same_dim(self) -> "MetricsPayload":
-        if len(self.query) != len(self.reference):
-            raise ValueError(
-                f"query and reference must have equal dimensions: "
-                f"{len(self.query)} != {len(self.reference)}"
-            )
+    def corpus_ids_unique(self):
+        ids = [item.id for item in self.corpus]
+        if len(ids) != len(set(ids)):
+            raise ValueError("corpus item IDs must be unique.")
         return self
 
 
-def _require_api_key(api_key: Optional[str] = Security(API_KEY_HEADER)) -> str:
-    if not _VALID_API_KEY:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="SIMILARITY_API_KEY environment variable is not set on this server.",
-        )
-    if api_key is None:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Missing X-API-Key header.",
-        )
-    if not hmac.compare_digest(
-        hashlib.sha256(api_key.encode()).digest(),
-        hashlib.sha256(_VALID_API_KEY.encode()).digest(),
-    ):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Invalid API key.",
-        )
-    return api_key
+class BatchResponse(BaseModel):
+    results: list[RankedSimilarityResponse]
+    total_latency_ms: float
 
 
-def _marginal_entropy_per_dim(matrix: np.ndarray, n_bins: int) -> np.ndarray:
-    """
-    Estimate marginal Shannon entropy H(X_i) for each column of matrix
-    using equal-width histogram binning.
+class InspectFeaturesRequest(BaseModel):
+    items: list[SimilarityItem] = Field(..., min_length=2, max_length=5000)
 
-    H(X_i) = -sum_k p_k * log2(p_k)
 
-    Returns array of shape (D,) with entropy in bits for each dimension.
-    Dimensions with zero variance receive H=0 (fully deterministic).
-    """
-    n_samples, n_dims = matrix.shape
-    entropies = np.zeros(n_dims, dtype=np.float64)
+class FeatureProfile(BaseModel):
+    key: str
+    inferred_type: str
+    coverage_ratio: float
+    unique_ratio: float
+    recommended_alpha_adjustment: str
 
-    for d in range(n_dims):
-        col = matrix[:, d]
-        col_min, col_max = col.min(), col.max()
-        if col_max - col_min < 1e-12:
-            entropies[d] = 0.0
+
+class InspectFeaturesResponse(BaseModel):
+    profiles: list[FeatureProfile]
+    recommended_alpha: float
+    notes: str
+
+
+def _laplace_entropy(values: list[Any], pseudocount: float = 1.0) -> float:
+    from collections import Counter
+    counts = Counter(str(v) for v in values)
+    total = sum(counts.values()) + pseudocount * len(counts)
+    probs = np.array([(c + pseudocount) / total for c in counts.values()])
+    return float(-np.sum(probs * np.log(probs + 1e-12)))
+
+
+def _pairwise_nmi(query_features: dict[str, Any], corpus_features: list[dict[str, Any]]) -> np.ndarray:
+    keys = list(query_features.keys())
+    n = len(corpus_features)
+    nmi_scores = np.zeros(n)
+
+    for key in keys:
+        query_val = query_features.get(key)
+        if query_val is None:
             continue
-        counts, _ = np.histogram(col, bins=n_bins, range=(col_min, col_max))
-        probs = counts / counts.sum()
-        entropies[d] = scipy_entropy(probs, base=2)
 
-    return entropies
+        corpus_vals = [cf.get(key) for cf in corpus_features]
+        non_null_indices = [i for i, v in enumerate(corpus_vals) if v is not None]
+        if not non_null_indices:
+            continue
 
+        for i in non_null_indices:
+            c_val = corpus_vals[i]
+            joint_population = [str(query_val), str(c_val)]
+            marginal_q = [str(query_val)]
+            marginal_c = [str(c_val)]
 
-def _entropy_weighted_nmi_alpha(query: np.ndarray, n_bins: int) -> tuple[float, np.ndarray]:
-    """
-    Derive dynamic NMI weight alpha from query marginal entropy.
+            h_q = _laplace_entropy(marginal_q)
+            h_c = _laplace_entropy(marginal_c)
+            h_joint = _laplace_entropy(joint_population)
 
-    alpha = mean(H(X_i)) / log2(n_bins)
+            mi = max(0.0, h_q + h_c - h_joint)
+            denominator = math.sqrt(h_q * h_c) if h_q > 0 and h_c > 0 else 0.0
+            nmi = mi / denominator if denominator > 1e-12 else 0.0
+            nmi_scores[i] += min(nmi, 1.0)
 
-    This maps alpha into [0,1]: high-entropy queries (spread, informative)
-    push alpha toward 1 (NMI dominates); low-entropy queries (concentrated,
-    near-constant) push alpha toward 0 (cosine dominates).
+    if keys:
+        nmi_scores /= len(keys)
 
-    Returns (alpha, marginal_entropies_per_dim).
-    """
-    entropies = _marginal_entropy_per_dim(query.reshape(1, -1), n_bins)
-    max_entropy = np.log2(n_bins) if n_bins > 1 else 1.0
-    alpha = float(np.clip(entropies.mean() / max_entropy, 0.0, 1.0))
-    return alpha, entropies
-
-
-def _cosine_similarity_batch(query: np.ndarray, candidates: np.ndarray) -> np.ndarray:
-    """
-    Cosine similarity between query (D,) and candidates (N, D).
-
-    cos(q, c_i) = (q . c_i) / (||q|| * ||c_i||)
-
-    Returns array of shape (N,). Vectors with zero norm yield score 0.0.
-    """
-    query_norm = np.linalg.norm(query)
-    if query_norm < 1e-12:
-        return np.zeros(len(candidates), dtype=np.float64)
-
-    cand_norms = np.linalg.norm(candidates, axis=1)
-    dot_products = candidates @ query
-    denom = cand_norms * query_norm
-    safe_denom = np.where(denom < 1e-12, 1.0, denom)
-    cosine_scores = np.where(denom < 1e-12, 0.0, dot_products / safe_denom)
-    return cosine_scores.astype(np.float64)
+    return np.clip(nmi_scores, 0.0, 1.0)
 
 
-def _nmi_per_candidate(
-    query: np.ndarray, candidates: np.ndarray, n_bins: int
-) -> np.ndarray:
-    """
-    Compute NMI between query and each candidate using sklearn's
-    normalized_mutual_info_score on discretized values.
+def _feature_dict_to_text(features: dict[str, Any]) -> str:
+    parts = []
+    for k, v in sorted(features.items()):
+        if isinstance(v, (int, float)):
+            parts.append(f"{k} {v}")
+        elif isinstance(v, list):
+            parts.append(f"{k} {' '.join(str(x) for x in v)}")
+        else:
+            parts.append(f"{k} {v}")
+    return " ".join(parts)
 
-    NMI(X,Y) = 2*MI(X,Y) / (H(X) + H(Y))
 
-    Discretization uses equal-width binning into n_bins bins per dimension,
-    then the joint sequence (query_discretized, candidate_discretized) is
-    treated as paired categorical observations for NMI computation.
-
-    Returns array of shape (N,).
-    """
-    kbd = KBinsDiscretizer(n_bins=n_bins, encode="ordinal", strategy="uniform", subsample=None)
-    n_cands = len(candidates)
-
-    all_vectors = np.vstack([query.reshape(1, -1), candidates])
+def _cosine_similarity_tfidf(query_features: dict[str, Any], corpus_features: list[dict[str, Any]]) -> np.ndarray:
+    documents = [_feature_dict_to_text(query_features)] + [
+        _feature_dict_to_text(cf) for cf in corpus_features
+    ]
     try:
-        kbd.fit(all_vectors)
-        discretized = kbd.transform(all_vectors).astype(int)
+        vectorizer = TfidfVectorizer(analyzer="word", token_pattern=r"(?u)\S+")
+        tfidf_matrix = vectorizer.fit_transform(documents)
     except ValueError:
-        return np.zeros(n_cands, dtype=np.float64)
+        return np.zeros(len(corpus_features))
 
-    query_disc_flat = discretized[0].flatten()
-    nmi_scores = np.zeros(n_cands, dtype=np.float64)
+    query_vec = tfidf_matrix[0]
+    corpus_matrix = tfidf_matrix[1:]
 
-    for i in range(n_cands):
-        cand_disc_flat = discretized[i + 1].flatten()
-        try:
-            score = normalized_mutual_info_score(
-                query_disc_flat,
-                cand_disc_flat,
-                average_method="arithmetic",
-            )
-        except Exception:
-            score = 0.0
-        nmi_scores[i] = score
+    dot_products = (corpus_matrix @ query_vec.T).toarray().flatten()
+    query_norm = np.sqrt(query_vec.multiply(query_vec).sum())
+    corpus_norms = np.sqrt(np.array(corpus_matrix.multiply(corpus_matrix).sum(axis=1)).flatten())
 
-    return nmi_scores
+    denominators = corpus_norms * query_norm
+    cosine_scores = np.where(denominators > 1e-12, dot_products / denominators, 0.0)
+    return np.clip(cosine_scores, 0.0, 1.0)
 
 
-def _compute_composite_scores(
-    query: np.ndarray,
-    candidates: np.ndarray,
-    n_bins: int,
-    alpha_override: Optional[float],
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, float, np.ndarray]:
-    """
-    Orchestrates entropy-weighted composite score computation.
+def _numeric_cosine(query_features: dict[str, Any], corpus_features: list[dict[str, Any]]) -> np.ndarray:
+    numeric_keys = [
+        k for k, v in query_features.items()
+        if isinstance(v, (int, float)) and not isinstance(v, bool)
+    ]
+    if not numeric_keys:
+        return np.zeros(len(corpus_features))
 
-    composite_i = alpha * NMI(query, candidate_i)
-                + (1 - alpha) * cosine(query, candidate_i)
+    q_vec = np.array([float(query_features[k]) for k in numeric_keys])
+    c_matrix = np.array([
+        [float(cf.get(k, 0.0)) if isinstance(cf.get(k), (int, float)) else 0.0 for k in numeric_keys]
+        for cf in corpus_features
+    ])
 
-    Where alpha is derived from marginal entropy of the query unless overridden.
+    q_norm = np.linalg.norm(q_vec)
+    c_norms = np.linalg.norm(c_matrix, axis=1)
+    if q_norm < 1e-12:
+        return np.zeros(len(corpus_features))
 
-    Returns (composite_scores, nmi_scores, cosine_scores, alpha_used, marginal_entropies).
-    """
-    if alpha_override is not None:
-        alpha = float(np.clip(alpha_override, 0.0, 1.0))
-        marginal_entropies = _marginal_entropy_per_dim(
-            np.vstack([query.reshape(1, -1), candidates]), n_bins
-        )
-    else:
-        alpha, marginal_entropies = _entropy_weighted_nmi_alpha(query, n_bins)
-
-    cosine_scores = _cosine_similarity_batch(query, candidates)
-    nmi_scores = _nmi_per_candidate(query, candidates, n_bins)
-
-    composite = alpha * nmi_scores + (1.0 - alpha) * cosine_scores
-    return composite, nmi_scores, cosine_scores, alpha, marginal_entropies
+    dots = c_matrix @ q_vec
+    denominators = c_norms * q_norm
+    return np.where(denominators > 1e-12, dots / denominators, 0.0)
 
 
-@app.post(
-    "/v1/similarity/search",
-    response_model=SearchResponse,
-    summary="Entropy-weighted NMI+Cosine similarity search (stateless)",
-    tags=["Similarity"],
-)
-def search_similar_vectors(
-    payload: VectorPayload,
-    _key: str = Security(_require_api_key),
-) -> SearchResponse:
-    """
-    Find the top-k candidates most similar to query using the composite
-    NMI+Cosine score weighted by the query's marginal entropy distribution.
+def _unified_cosine(query_features: dict[str, Any], corpus_features: list[dict[str, Any]]) -> np.ndarray:
+    tfidf_cos = _cosine_similarity_tfidf(query_features, corpus_features)
+    numeric_cos = _numeric_cosine(query_features, corpus_features)
 
-    Use when: you have a query vector and a candidate set per call, with no
-    persistent index. Suitable for datasets with mixed linear/nonlinear feature
-    dependencies.
-
-    Do NOT use when: you need approximate nearest-neighbor over millions of
-    pre-indexed vectors -- use Pinecone/Weaviate instead.
-    """
-    t0 = time.perf_counter()
-
-    query_arr = np.array(payload.query, dtype=np.float64)
-    candidates_arr = np.array(payload.candidates, dtype=np.float64)
-
-    if not np.all(np.isfinite(query_arr)):
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="query contains non-finite values (NaN or Inf).",
-        )
-    if not np.all(np.isfinite(candidates_arr)):
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="candidates contains non-finite values (NaN or Inf).",
-        )
-
-    composite, nmi_scores, cosine_scores, alpha, _ = _compute_composite_scores(
-        query_arr, candidates_arr, payload.nmi_bins, payload.alpha
+    has_numeric = any(
+        isinstance(v, (int, float)) and not isinstance(v, bool)
+        for v in query_features.values()
     )
+    if has_numeric:
+        return np.clip(0.5 * tfidf_cos + 0.5 * numeric_cos, 0.0, 1.0)
+    return tfidf_cos
 
-    top_k = min(payload.top_k, len(candidates_arr))
-    top_indices = np.argpartition(composite, -top_k)[-top_k:]
-    top_indices = top_indices[np.argsort(composite[top_indices])[::-1]]
+
+def _run_ranked_similarity(
+    query: SimilarityItem,
+    corpus: list[SimilarityItem],
+    top_k: int,
+    alpha: float,
+) -> tuple[list[ScoredItem], float]:
+    t0 = time.perf_counter()
+    corpus_features = [item.features for item in corpus]
+
+    cosine_scores = _unified_cosine(query.features, corpus_features)
+    nmi_scores = _pairwise_nmi(query.features, corpus_features)
+
+    unified_scores = alpha * cosine_scores + (1.0 - alpha) * nmi_scores
+
+    top_k_actual = min(top_k, len(corpus))
+    top_indices = np.argpartition(unified_scores, -top_k_actual)[-top_k_actual:]
+    top_indices = top_indices[np.argsort(unified_scores[top_indices])[::-1]]
 
     results = [
-        SimilarityResult(
-            index=int(idx),
-            composite_score=round(float(composite[idx]), 8),
-            nmi_score=round(float(nmi_scores[idx]), 8),
-            cosine_score=round(float(cosine_scores[idx]), 8),
-            nmi_weight=round(alpha, 8),
+        ScoredItem(
+            id=corpus[i].id,
+            score=float(round(unified_scores[i], 6)),
+            cosine_score=float(round(cosine_scores[i], 6)),
+            nmi_score=float(round(nmi_scores[i], 6)),
         )
-        for idx in top_indices
+        for i in top_indices
     ]
 
     latency_ms = (time.perf_counter() - t0) * 1000.0
+    return results, latency_ms
 
-    return SearchResponse(
+
+@app.post("/rank", response_model=RankedSimilarityResponse, summary="Rank corpus items by NMI+cosine similarity to a query item.")
+def rank_by_nmi_cosine_similarity(
+    request: RankedSimilarityRequest,
+    _: str = Depends(verify_api_key),
+) -> RankedSimilarityResponse:
+    results, latency_ms = _run_ranked_similarity(
+        request.query, request.corpus, request.top_k, request.alpha
+    )
+    return RankedSimilarityResponse(
         results=results,
-        query_dim=len(payload.query),
-        candidate_count=len(payload.candidates),
-        nmi_weight_used=round(alpha, 8),
+        query_id=request.query.id,
+        alpha=request.alpha,
+        corpus_size=len(request.corpus),
         latency_ms=round(latency_ms, 3),
     )
 
 
-@app.post(
-    "/v1/similarity/batch",
-    response_model=BatchSearchResponse,
-    summary="Batch entropy-weighted NMI+Cosine search for multiple queries",
-    tags=["Similarity"],
-)
-def batch_search_similar_vectors(
-    payload: BatchPayload,
-    _key: str = Security(_require_api_key),
-) -> BatchSearchResponse:
-    """
-    Run similarity search for multiple queries against the same candidate set
-    in a single HTTP call. Each query gets its own alpha derived independently
-    from its marginal entropy.
-
-    Use when: you have 2-256 queries to evaluate against the same candidate pool.
-
-    Do NOT use when: queries have heterogeneous dimensions or candidate sets --
-    use /v1/similarity/search per query instead.
-    """
+@app.post("/rank/batch", response_model=BatchResponse, summary="Rank corpus items for multiple queries in a single HTTP call.")
+def batch_rank_by_nmi_cosine_similarity(
+    request: BatchRequest,
+    _: str = Depends(verify_api_key),
+) -> BatchResponse:
     t0 = time.perf_counter()
-
-    queries_arr = np.array(payload.queries, dtype=np.float64)
-    candidates_arr = np.array(payload.candidates, dtype=np.float64)
-
-    if not np.all(np.isfinite(queries_arr)):
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="queries contains non-finite values (NaN or Inf).",
+    all_results = []
+    for query in request.queries:
+        results, latency_ms = _run_ranked_similarity(
+            query, request.corpus, request.top_k, request.alpha
         )
-    if not np.all(np.isfinite(candidates_arr)):
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="candidates contains non-finite values (NaN or Inf).",
-        )
-
-    all_results: list[list[SimilarityResult]] = []
-
-    for q_idx, query_vec in enumerate(queries_arr):
-        composite, nmi_scores, cosine_scores, alpha, _ = _compute_composite_scores(
-            query_vec, candidates_arr, payload.nmi_bins, payload.alpha
-        )
-        top_k = min(payload.top_k, len(candidates_arr))
-        top_indices = np.argpartition(composite, -top_k)[-top_k:]
-        top_indices = top_indices[np.argsort(composite[top_indices])[::-1]]
-
-        query_results = [
-            SimilarityResult(
-                index=int(idx),
-                composite_score=round(float(composite[idx]), 8),
-                nmi_score=round(float(nmi_scores[idx]), 8),
-                cosine_score=round(float(cosine_scores[idx]), 8),
-                nmi_weight=round(alpha, 8),
+        all_results.append(
+            RankedSimilarityResponse(
+                results=results,
+                query_id=query.id,
+                alpha=request.alpha,
+                corpus_size=len(request.corpus),
+                latency_ms=round(latency_ms, 3),
             )
-            for idx in top_indices
-        ]
-        all_results.append(query_results)
-
-    latency_ms = (time.perf_counter() - t0) * 1000.0
-
-    return BatchSearchResponse(
-        results=all_results,
-        query_count=len(payload.queries),
-        candidate_count=len(payload.candidates),
-        latency_ms=round(latency_ms, 3),
-    )
-
-
-@app.post(
-    "/v1/similarity/metrics",
-    response_model=MetricsResponse,
-    summary="Decomposed NMI, cosine, and composite score between two vectors",
-    tags=["Similarity"],
-)
-def decompose_similarity_metrics(
-    payload: MetricsPayload,
-    _key: str = Security(_require_api_key),
-) -> MetricsResponse:
-    """
-    Return the full score decomposition (NMI, cosine, composite, alpha, per-dim entropies)
-    for a query-reference pair. Useful for debugging, calibration, and understanding
-    why the composite score takes a specific value.
-
-    Use when: you want to audit or explain a similarity score between exactly two vectors.
-
-    Do NOT use when: you have a pool of candidates -- /v1/similarity/search is more efficient.
-    """
-    query_arr = np.array(payload.query, dtype=np.float64)
-    reference_arr = np.array(payload.reference, dtype=np.float64)
-
-    if not np.all(np.isfinite(query_arr)):
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="query contains non-finite values (NaN or Inf).",
         )
-    if not np.all(np.isfinite(reference_arr)):
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="reference contains non-finite values (NaN or Inf).",
+    total_latency_ms = (time.perf_counter() - t0) * 1000.0
+    return BatchResponse(results=all_results, total_latency_ms=round(total_latency_ms, 3))
+
+
+@app.post("/inspect/features", response_model=InspectFeaturesResponse, summary="Profile feature types in a dataset and recommend alpha for NMI+cosine blend.")
+def inspect_features_and_recommend_alpha(
+    request: InspectFeaturesRequest,
+    _: str = Depends(verify_api_key),
+) -> InspectFeaturesResponse:
+    all_keys: set[str] = set()
+    for item in request.items:
+        all_keys.update(item.features.keys())
+
+    profiles = []
+    categorical_count = 0
+    numeric_count = 0
+    n = len(request.items)
+
+    for key in sorted(all_keys):
+        values = [item.features.get(key) for item in request.items]
+        present = [v for v in values if v is not None]
+        coverage = len(present) / n
+
+        numeric_vals = [v for v in present if isinstance(v, (int, float)) and not isinstance(v, bool)]
+        is_numeric = len(numeric_vals) / len(present) > 0.7 if present else False
+
+        unique_count = len(set(str(v) for v in present))
+        unique_ratio = unique_count / len(present) if present else 0.0
+
+        if is_numeric:
+            inferred_type = "numeric"
+            numeric_count += 1
+            adjustment = "favors cosine (increase alpha)"
+        elif unique_ratio < 0.2:
+            inferred_type = "categorical_low_cardinality"
+            categorical_count += 1
+            adjustment = "strongly favors NMI (decrease alpha significantly)"
+        elif unique_ratio < 0.6:
+            inferred_type = "categorical_high_cardinality"
+            categorical_count += 1
+            adjustment = "favors NMI (decrease alpha moderately)"
+        else:
+            inferred_type = "text_or_id"
+            adjustment = "favors cosine TF-IDF (increase alpha slightly)"
+
+        profiles.append(
+            FeatureProfile(
+                key=key,
+                inferred_type=inferred_type,
+                coverage_ratio=round(coverage, 4),
+                unique_ratio=round(unique_ratio, 4),
+                recommended_alpha_adjustment=adjustment,
+            )
         )
 
-    composite, nmi_scores, cosine_scores, alpha, marginal_entropies = _compute_composite_scores(
-        query_arr,
-        reference_arr.reshape(1, -1),
-        payload.nmi_bins,
-        payload.alpha,
+    total_typed = categorical_count + numeric_count
+    if total_typed == 0:
+        recommended_alpha = 0.6
+    else:
+        recommended_alpha = round(0.3 + 0.7 * (numeric_count / total_typed), 2)
+        recommended_alpha = max(0.1, min(0.9, recommended_alpha))
+
+    cat_pct = round(100 * categorical_count / max(total_typed, 1))
+    num_pct = 100 - cat_pct
+    notes = (
+        f"Dataset has {cat_pct}% categorical features and {num_pct}% numeric features. "
+        f"Recommended alpha={recommended_alpha} (cosine weight). "
+        f"Pass this value as 'alpha' in /rank calls for optimal NMI+cosine balance."
     )
 
-    return MetricsResponse(
-        query=payload.query,
-        reference=payload.reference,
-        nmi_score=round(float(nmi_scores[0]), 8),
-        cosine_score=round(float(cosine_scores[0]), 8),
-        composite_score=round(float(composite[0]), 8),
-        nmi_weight=round(alpha, 8),
-        marginal_entropies=[round(float(e), 8) for e in marginal_entropies],
+    return InspectFeaturesResponse(
+        profiles=profiles,
+        recommended_alpha=recommended_alpha,
+        notes=notes,
     )
 
 
-@app.get(
-    "/v1/health",
-    summary="Liveness check — confirms API is up and math dependencies are importable",
-    tags=["Ops"],
-)
+@app.get("/health", summary="Liveness probe — returns service status and version.")
 def health_check() -> dict:
-    """
-    Use when: load balancer or orchestrator needs a liveness probe.
-
-    Do NOT use when: you need to verify auth or score correctness -- this endpoint
-    does not require an API key and performs no score computation.
-    """
-    try:
-        _test = normalized_mutual_info_score([0, 1, 0], [0, 1, 1])
-        _test2 = float(scipy_entropy([0.5, 0.5], base=2))
-        deps_ok = np.isfinite(_test) and np.isfinite(_test2)
-    except Exception as exc:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"Math dependency check failed: {exc}",
-        )
-
-    return {
-        "status": "ok",
-        "deps_ok": deps_ok,
-        "numpy_version": np.__version__,
-    }
+    return {"status": "ok", "version": "1.0.0", "math_backend": "numpy+scipy+sklearn"}
 
 # --- NEXUS: servidor MCP real montado en el mismo proceso (inyectado por forge_agent) ---
 # Reemplaza el wrapper Node/TypeScript separado -- un solo deploy, sin
@@ -540,35 +408,35 @@ async def _nexus_mcp_call_core(method: str, path: str, params: dict) -> Any:
         return resp.json()
 
 
-@_nexus_mcp.tool(name='nexus_similarity_search_api_rank_vectors_by_nmi_cosine_fusion', description='Ranks a candidate set of vectors against a query vector using a composite score that fuses Normalized Mutual Information (for nonlinear feature dependencies) and cosine similarity (for directional alignment), weighted by the marginal entropy of each dimension computed from the candidate distribution. Use when you need stateless ad-hoc similarity ranking without a database, especially when the feature space contains categorical-encoded or mixed-type dimensions where cosine alone underperforms. Do NOT use when you have more than 50,000 candidates per call (latency will exceed SLA) or when all features are already known to be linearly independent and continuous (cosine alone is sufficient and cheaper).')
-async def rank_vectors_by_nmi_cosine_fusion(query_vector: Annotated[list[float], Field(..., description='The reference vector to rank against. Must have the same dimensionality as every vector in candidate_matrix. Values must be finite floats; NaN or Inf will be rejected.', min_length=2, max_length=4096)], candidate_matrix: Annotated[list[list[float]], Field(..., description='2-D array of candidate vectors. Each row is one candidate; columns must match the dimensionality of query_vector. Min 1 row, max 50,000 rows.', min_length=1, max_length=50000)], top_k: Annotated[float, Field(10, description='Number of top-ranked candidates to return. Must be between 1 and the total number of candidates. Defaults to 10.', ge=1, le=50000)], nmi_bins: Annotated[float, Field(None, description='Number of histogram bins used to discretize each continuous dimension for NMI estimation. Higher values increase fidelity for smooth distributions but raise compute cost quadratically per dimension. Valid range: 2-64. If omitted, set automatically via Sturges rule applied to the candidate count.', ge=2, le=64)], fusion_mode: Annotated[str, Field('entropy_weighted', description="Controls how NMI and cosine scores are combined. 'entropy_weighted' (default): each dimension's contribution to NMI vs cosine is weighted by its marginal entropy, making the balance data-driven. 'equal': unweighted arithmetic mean of NMI and cosine scores. Use 'equal' only for ablation studies or when you want to decouple the adaptive weighting.", min_length=5, max_length=16)]) -> dict[str, Any]:
-    """NMI+Cosine Fusion Ranking"""
-    params = {"query_vector": query_vector, "candidate_matrix": candidate_matrix, "top_k": top_k, "nmi_bins": nmi_bins, "fusion_mode": fusion_mode}
+@_nexus_mcp.tool(name='nexus_similarity_search_api_rank_by_nmi_cosine_fusion', description='Ranks a corpus of mixed-type items (text, categorical, numeric) against a query item using a unified score that fuses Normalized Mutual Information (for categorical/discrete feature dependencies) with cosine similarity (for continuous/text features). Use when your dataset has heterogeneous feature types and you need a single ranked list without precomputed embeddings or a persistent index. Do NOT use when all features are purely continuous/dense vectors (use a pure ANN index instead), when corpus exceeds 10 000 items per call (latency will degrade), or when you need approximate results at scale.')
+async def rank_by_nmi_cosine_fusion(query: Annotated[str, Field(..., description='JSON-serialized object representing the query item. Keys are feature names; values are strings (categorical/text) or numbers (numeric). Must share at least one key with corpus items.', min_length=2, max_length=8192)], corpus: Annotated[list[str], Field(..., description='Array of JSON-serialized objects, each representing a corpus item with the same feature schema as the query. Minimum 2 items required. Items with zero overlapping keys with the query are scored 0.', min_length=2, max_length=10000)], nmi_weight: Annotated[float, Field(0.5, description='Weight assigned to the NMI component in the fused score (0.0 to 1.0). Cosine weight is derived as 1 - nmi_weight. Set closer to 1.0 when categorical features dominate; closer to 0.0 for mostly numeric/text corpora.', ge=0.0, le=1.0)], top_k: Annotated[float, Field(10, description='Number of top-ranked results to return. Must be between 1 and the corpus size. Results beyond top_k are discarded before returning.', ge=1, le=500)], numeric_bins: Annotated[float, Field(10, description='Number of equal-width bins used to discretize numeric features before NMI computation. Higher values capture finer distinctions but require larger corpora to be statistically stable. Ignored when there are no numeric features.', ge=2, le=50)]) -> dict[str, Any]:
+    """NMI+Cosine Fused Similarity Rank"""
+    params = {"query": query, "corpus": corpus, "nmi_weight": nmi_weight, "top_k": top_k, "numeric_bins": numeric_bins}
     return await _nexus_mcp_call_core('POST', '/v1/similarity/rank', params)
 
-@_nexus_mcp.tool(name='nexus_similarity_search_api_compute_pairwise_nmi_cosine_matrix', description='Computes the full N x N composite NMI+Cosine similarity matrix for a set of vectors. Each cell (i, j) is the fusion score between vector i and vector j, with entropy-based dimensional weighting derived from the full set distribution. Use when you need an all-pairs similarity structure for clustering, graph construction, or manifold analysis. Do NOT use for query-vs-candidates ranking (use rank_vectors_by_nmi_cosine_fusion instead) or for sets larger than 2,000 vectors (O(N^2 * D) cost becomes prohibitive).')
-async def compute_pairwise_nmi_cosine_matrix(vector_matrix: Annotated[list[list[float]], Field(..., description='2-D array where each row is a vector. All rows must share the same dimensionality. Min 2 rows, max 2,000 rows.', min_length=2, max_length=2000)], nmi_bins: Annotated[float, Field(None, description='Histogram bins for NMI discretization. Valid range: 2-64. Auto-set via Sturges rule if omitted.', ge=2, le=64)], diagonal_value: Annotated[float, Field(1.0, description='Value to place on the matrix diagonal (self-similarity). Typically 1.0 for normalized scores. Set to 0.0 if the matrix will be used as a distance or graph-edge weight where self-loops should be ignored.', ge=0.0, le=1.0)]) -> dict[str, Any]:
-    """Pairwise Fusion Score Matrix"""
-    params = {"vector_matrix": vector_matrix, "nmi_bins": nmi_bins, "diagonal_value": diagonal_value}
-    return await _nexus_mcp_call_core('POST', '/v1/similarity/pairwise-matrix', params)
+@_nexus_mcp.tool(name='nexus_similarity_search_api_score_nmi_cosine_pair', description='Computes the fused NMI+cosine similarity score between exactly two items and returns the decomposed components (nmi_score, cosine_score, fused_score) alongside per-feature contributions. Use for explainability, threshold calibration, or validating why two specific items are ranked close or far apart. Do NOT use as a substitute for rank_by_nmi_cosine_fusion when ranking a corpus — calling this in a loop over N items is O(N) round-trips and will be slower and costlier than a single ranking call.')
+async def score_nmi_cosine_pair(item_a: Annotated[str, Field(..., description='JSON-serialized object for the first item. Keys are feature names; values are strings or numbers.', min_length=2, max_length=4096)], item_b: Annotated[str, Field(..., description='JSON-serialized object for the second item. Must share at least one feature key with item_a to produce a non-zero score.', min_length=2, max_length=4096)], nmi_weight: Annotated[float, Field(0.5, description='Weight of the NMI component in the fused score. Cosine weight = 1 - nmi_weight. Must match the weight used in ranking calls if this is used for threshold calibration.', ge=0.0, le=1.0)], numeric_bins: Annotated[float, Field(10, description='Bin count for numeric discretization, consistent with what would be used in corpus ranking. Default 10.', ge=2, le=50)]) -> dict[str, Any]:
+    """Pairwise NMI+Cosine Score"""
+    params = {"item_a": item_a, "item_b": item_b, "nmi_weight": nmi_weight, "numeric_bins": numeric_bins}
+    return await _nexus_mcp_call_core('POST', '/v1/similarity/score-pair', params)
 
-@_nexus_mcp.tool(name='nexus_similarity_search_api_decompose_fusion_score_by_dimension', description='Returns the per-dimension breakdown of the NMI+Cosine fusion score between a query vector and a single target vector: the marginal entropy weight, raw NMI contribution, raw cosine contribution, and weighted fusion contribution for each dimension. Use when you need to explain why two vectors scored as they did, identify which dimensions drive similarity, or audit the entropy-weighting behavior on a specific pair. Do NOT use for bulk ranking or matrix computation — it is designed for single-pair interpretability, not throughput.')
-async def decompose_fusion_score_by_dimension(query_vector: Annotated[list[float], Field(..., description='Reference vector. Must have the same length as target_vector. Min 2 elements, max 4096 elements.', min_length=2, max_length=4096)], target_vector: Annotated[list[float], Field(..., description='Target vector to compare against the query. Must match query_vector dimensionality exactly.', min_length=2, max_length=4096)], reference_distribution: Annotated[list[list[float]], Field(None, description='Optional background matrix used to estimate marginal entropy weights per dimension. If omitted, entropy is estimated from query_vector and target_vector alone (two-sample estimate, lower fidelity). Providing the same candidate_matrix used in the ranking call ensures entropy weights are consistent with the ranking context. Max 50,000 rows.', min_length=2, max_length=50000)], nmi_bins: Annotated[float, Field(None, description='Histogram bins for NMI discretization. Valid range: 2-64.', ge=2, le=64)]) -> dict[str, Any]:
-    """Per-Dimension Score Decomposition"""
-    params = {"query_vector": query_vector, "target_vector": target_vector, "reference_distribution": reference_distribution, "nmi_bins": nmi_bins}
-    return await _nexus_mcp_call_core('POST', '/v1/similarity/decompose', params)
+@_nexus_mcp.tool(name='nexus_similarity_search_api_detect_dominant_feature_type', description='Analyzes a corpus payload and returns a breakdown of feature types (categorical, numeric, text) with their relative dominance and the recommended nmi_weight for optimal fusion. Use this as a calibration step before the first ranking call when you are unsure what nmi_weight to use. Do NOT use on every call in a hot path — run once per dataset schema and cache the recommended weight; schema does not change per query.')
+async def detect_dominant_feature_type(corpus_sample: Annotated[list[str], Field(..., description='Array of JSON-serialized items (a representative sample, not necessarily the full corpus). Minimum 10 items recommended for stable type inference. Maximum 500 items accepted in a single detection call.', min_length=2, max_length=500)], cardinality_threshold: Annotated[float, Field(20, description='Maximum number of distinct values a numeric feature may have before it is reclassified as categorical for NMI purposes. Features with unique-value count below this threshold are treated as categorical.', ge=2, le=200)]) -> dict[str, Any]:
+    """Feature-Type Dominance Detector"""
+    params = {"corpus_sample": corpus_sample, "cardinality_threshold": cardinality_threshold}
+    return await _nexus_mcp_call_core('POST', '/v1/similarity/detect-feature-types', params)
 
-@_nexus_mcp.tool(name='nexus_similarity_search_api_estimate_dimensional_entropy_profile', description='Estimates the marginal Shannon entropy of each dimension across a vector matrix and returns the normalized entropy weights that the fusion scorer will apply internally. Use this as a diagnostic before running bulk ranking or pairwise-matrix calls, to understand which dimensions dominate the fusion score and whether the input distribution has degenerate (zero-entropy) dimensions that should be dropped. Do NOT use as a substitute for the full fusion score — it returns weights only, not similarity scores.')
-async def estimate_dimensional_entropy_profile(vector_matrix: Annotated[list[list[float]], Field(..., description='2-D array of vectors whose dimensional entropy profile you want to inspect. Min 2 rows, max 50,000 rows. Min 2 columns, max 4096 columns.', min_length=2, max_length=50000)], nmi_bins: Annotated[float, Field(None, description='Histogram bins for entropy discretization. Valid range: 2-64. Auto-set via Sturges rule if omitted.', ge=2, le=64)], flag_degenerate_threshold: Annotated[float, Field(0.01, description='Normalized entropy value below which a dimension is flagged as degenerate (near-constant, contributing near-zero information to the fusion score). Range: 0.0-0.5. Default 0.01 means dimensions with less than 1% of max possible entropy are flagged.', ge=0.0, le=0.5)]) -> dict[str, Any]:
-    """Entropy Profile Estimator"""
-    params = {"vector_matrix": vector_matrix, "nmi_bins": nmi_bins, "flag_degenerate_threshold": flag_degenerate_threshold}
-    return await _nexus_mcp_call_core('POST', '/v1/similarity/entropy-profile', params)
+@_nexus_mcp.tool(name='nexus_similarity_search_api_batch_rank_nmi_cosine_multi_query', description='Executes multiple independent similarity ranking operations in a single HTTP call, each with its own query item and shared corpus. Returns one ranked list per query. Use when you need to rank the same corpus against several query items simultaneously (e.g., recommendation for a batch of users, or multi-anchor nearest-neighbor search). Do NOT use when queries share no features with the corpus, when corpus differs per query (submit separate rank calls instead), or when batch size exceeds 50 queries (memory pressure per request).')
+async def batch_rank_nmi_cosine_multi_query(queries: Annotated[list[str], Field(..., description='Array of JSON-serialized query objects. Each query is ranked independently against the shared corpus. Maximum 50 queries per batch call.', min_length=1, max_length=50)], corpus: Annotated[list[str], Field(..., description='Shared corpus of JSON-serialized items ranked against every query. Minimum 2 items, maximum 5 000 items when used in batch mode (lower than single-query mode due to per-request memory constraints).', min_length=2, max_length=5000)], nmi_weight: Annotated[float, Field(0.5, description='Shared NMI weight applied uniformly across all queries in the batch. Per-query weight overrides are not supported in batch mode to keep the response schema deterministic.', ge=0.0, le=1.0)], top_k: Annotated[float, Field(10, description='Number of top results returned per query. Applied uniformly to all queries in the batch.', ge=1, le=200)], numeric_bins: Annotated[float, Field(10, description='Bin count for numeric discretization, applied uniformly across all queries.', ge=2, le=50)]) -> dict[str, Any]:
+    """Multi-Query Batch NMI+Cosine Rank"""
+    params = {"queries": queries, "corpus": corpus, "nmi_weight": nmi_weight, "top_k": top_k, "numeric_bins": numeric_bins}
+    return await _nexus_mcp_call_core('POST', '/v1/similarity/batch-rank', params)
 
-@_nexus_mcp.tool(name='nexus_similarity_search_api_threshold_filter_by_fusion_score', description='Returns only the candidates whose NMI+Cosine fusion score against the query vector meets or exceeds a specified threshold, without returning a ranked list. Use when the downstream system needs a binary in/out decision (e.g., deduplication, membership testing, anomaly gating) and the score threshold is already calibrated. Do NOT use when you need ranked ordering or when the threshold is unknown and you want to explore score distributions — use rank_vectors_by_nmi_cosine_fusion with top_k instead.')
-async def threshold_filter_by_fusion_score(query_vector: Annotated[list[float], Field(..., description='Reference vector. Must match the dimensionality of every row in candidate_matrix. Min 2 elements, max 4096 elements.', min_length=2, max_length=4096)], candidate_matrix: Annotated[list[list[float]], Field(..., description='2-D array of candidate vectors to filter. Each row is one candidate. Min 1 row, max 50,000 rows.', min_length=1, max_length=50000)], min_fusion_score: Annotated[float, Field(..., description='Minimum composite NMI+Cosine fusion score (inclusive) for a candidate to be included in the response. Must be in [0.0, 1.0]. A value of 0.8 is a strong similarity threshold; 0.5 is permissive. Choosing a value without prior calibration via rank_vectors_by_nmi_cosine_fusion is discouraged.', ge=0.0, le=1.0)], nmi_bins: Annotated[float, Field(None, description='Histogram bins for NMI discretization. Valid range: 2-64. Should match the value used during threshold calibration to ensure score comparability.', ge=2, le=64)], fusion_mode: Annotated[str, Field('entropy_weighted', description="Score fusion mode: 'entropy_weighted' (default, data-driven weighting) or 'equal' (unweighted mean). Must match the fusion_mode used during threshold calibration.", min_length=5, max_length=16)]) -> dict[str, Any]:
-    """Fusion Score Threshold Filter"""
-    params = {"query_vector": query_vector, "candidate_matrix": candidate_matrix, "min_fusion_score": min_fusion_score, "nmi_bins": nmi_bins, "fusion_mode": fusion_mode}
-    return await _nexus_mcp_call_core('POST', '/v1/similarity/filter', params)
+@_nexus_mcp.tool(name='nexus_similarity_search_api_explain_nmi_contribution_per_feature', description='Given a query and a single ranked result item, decomposes the fused score into per-feature NMI and cosine contributions, identifying which features drove similarity and which suppressed it. Use for debugging unexpected rankings, for building explainability layers in downstream products, or for feature importance analysis. Do NOT use as part of a ranking pipeline — it operates on a single (query, result) pair and does not scale to corpus-level ranking; it is a diagnostic tool only.')
+async def explain_nmi_contribution_per_feature(query: Annotated[str, Field(..., description='JSON-serialized query item used in the original ranking call.', min_length=2, max_length=4096)], result_item: Annotated[str, Field(..., description='JSON-serialized corpus item whose score you want explained. Should be one of the items returned by a prior rank_by_nmi_cosine_fusion call.', min_length=2, max_length=4096)], nmi_weight: Annotated[float, Field(0.5, description='Must match the nmi_weight used in the ranking call that produced this result, otherwise the decomposed score will not match the original fused score.', ge=0.0, le=1.0)], numeric_bins: Annotated[float, Field(10, description='Must match the numeric_bins value used in the original ranking call for the NMI decomposition to be consistent.', ge=2, le=50)]) -> dict[str, Any]:
+    """Per-Feature NMI Contribution Explainer"""
+    params = {"query": query, "result_item": result_item, "nmi_weight": nmi_weight, "numeric_bins": numeric_bins}
+    return await _nexus_mcp_call_core('POST', '/v1/similarity/explain-feature-nmi', params)
 
 
 # Crea el sub-app ASGI de streamable HTTP -- DEBE llamarse antes de
