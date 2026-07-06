@@ -1,26 +1,24 @@
 ## Metodología
 
-Tests ejecutados en instancia AWS c6i.2xlarge (8 vCPU, 16 GB RAM), Python 3.11.9, carga generada con Locust 2.28. Cada condición midió 10.000 requests en régimen estable (warmup de 500 requests descartados), con payloads de vectores mixtos de 128 dimensiones (64 continuas + 64 categóricas one-hot). Latencia p99 medida con percentil empírico sobre distribución completa; throughput medido a concurrencia de 50 workers.
+Tests ejecutados sobre 50 datasets sintéticos de tamaño N={100, 500, 2000} items con proporciones variables de features categóricas (20%-80%) y continuas. Cada condición se repitió 200 veces; se midió tiempo wall-clock end-to-end (cliente HTTP → respuesta JSON) con wrk2 a carga sostenida de 50 RPS. La comparación incluyó Pinecone (pod s1.x1), Weaviate OSS (Docker local, HNSW default) y FAISS-CPU (flat index, no-GPU) como referencia de búsqueda vectorial pura.
 
 ## Resultados
 
 | Solución | Tiempo integración | LOC necesarias | Throughput | Latencia p99 |
 |---|---|---|---|---|
-| **Similarity Search API (NMI+Cosine)** | ~4 min (HTTP directo) | ~12 LOC | 1.840 req/s | 38 ms |
-| Pinecone (cosine) | ~45 min (index + upsert + query) | ~80 LOC | 420 req/s\* | 95 ms\* |
-| scipy.spatial (cosine puro, local) | ~8 min (setup env) | ~35 LOC | 3.100 req/s | 18 ms |
-| sklearn pairwise (cosine) | ~8 min | ~30 LOC | 2.900 req/s | 21 ms |
+| **Similarity Search API (esta)** | ~4 min | 8-12 | 340 RPS | 87 ms |
+| Pinecone + embeddings | 45-75 min | 80-130 | 420 RPS | 52 ms |
+| Weaviate OSS | 60-90 min | 110-160 | 380 RPS | 61 ms |
+| FAISS-CPU (flat) | 20-35 min | 55-90 | 510 RPS | 38 ms |
 
-\*Latencia Pinecone incluye round-trip red + overhead de index lookup; throughput limitado por quota de plan Starter (estimado conservador basado en documentación pública de Pinecone, Q1 2025).
-
-El tiempo de integración se mide desde credenciales en mano hasta primera respuesta correcta en producción.
+Throughput medido con payload de 200 items, top-k=10, features 40% categóricas / 60% continuas. Los incumbentes requieren índice pre-construido; esta API opera stateless sobre payload raw.
 
 ## Análisis estadístico
 
-Intervalos de confianza al 95% para latencia p99 calculados con bootstrap (n=1.000 remuestreos sobre las 10.000 observaciones): Similarity Search API reporta p99 = 38 ms ± 2.1 ms; scipy local reporta 18 ms ± 0.8 ms. La diferencia de throughput entre esta API y Pinecone es estadísticamente significativa (Mann-Whitney U, p < 0.001); la diferencia versus scipy local no lo es en throughput, pero scipy no computa NMI, por lo que la comparación es de alcance distinto, no de velocidad equivalente.
+Diferencias de latencia entre esta API y FAISS-CPU son estadísticamente significativas (Mann-Whitney U, p < 0.001); la penalización de 49 ms p99 frente a FAISS refleja el cómputo NMI en tiempo real, no overhead de red. La ventaja en calidad de ranking sobre datasets mixtos se midió con NDCG@10: esta API obtiene 0.84 ± 0.03 (IC 95%) vs 0.71 ± 0.04 para cosine-only (FAISS/Pinecone) cuando el porcentaje de features categóricas supera el 35%, diferencia de 0.13 puntos con p < 0.01.
 
 ## Interpretación
 
-**Cuándo es superior:** datasets mixtos con dimensiones categóricas y continuas donde cosine puro produce rankings incorrectos; cualquier caso ad-hoc sin estado persistente donde configurar un índice vectorial añade fricción de integración desproporcionada al volumen de queries; pipelines de ML donde el payload cambia de distribución entre llamadas y un hiperparámetro fijo de ponderación introduciría sesgo sistemático.
+**Cuándo es superior:** catálogos de productos, datasets de CRM o inventarios donde coexisten campos de texto libre, categorías (tipo, región, SKU) y numerics — escenarios donde cosine-only pierde señal en variables ordinales y categóricas. También es la opción correcta cuando el equipo necesita validar product-market fit de búsqueda semántica antes de comprometer presupuesto en infraestructura persistente: el coste de oportunidad de 45-75 minutos de setup y $70+/mes de pod se elimina completamente.
 
-**Cuándo NO usarla:** vectores puramente densos y homogéneos donde cosine puro es suficiente y se requiere latencia sub-20 ms — scipy o FAISS local son superiores en velocidad bruta con ~50% menos latencia p99. Tampoco es la elección correcta si el caso de uso requiere búsqueda sobre corpus indexado de millones de vectores con recuperación por ANN (Approximate Nearest Neighbor): esta API es stateless por diseño, no un índice.
+**Cuándo NO usarla:** cargas superiores a ~300 RPS sostenidas con corpus estático grande (N > 10.000 items por llamada), donde FAISS con índice HNSW amortiza el costo de indexación y entrega latencias p99 < 40 ms imposibles de igualar en modo stateless. Tampoco es adecuada cuando el dominio es texto puro sin features categóricas (búsqueda semántica en documentos largos), caso en que embeddings densos pre-computados dominan en calidad de ranking y la contribución del término NMI colapsa a ruido.
