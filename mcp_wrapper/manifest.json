@@ -1,16 +1,16 @@
 {
   "name": "nexus-similarity-search-api",
   "description_variants": {
-    "claude": "Computes a stateless, distribution-aware composite similarity score fusing NMI and cosine metrics over ad-hoc vector payloads, requiring no database or prior indexing.",
-    "gpt": "Call this function to score pairwise similarity between two feature vectors using entropy-weighted NMI plus cosine fusion; returns a single calibrated float with no setup or indexing required.",
-    "gemini": "Tool for on-demand similarity scoring that combines Normalized Mutual Information for nonlinear feature dependencies and cosine alignment into one entropy-calibrated score per API call."
+    "claude": "Ranks a list of JSON items by hybrid NMI+cosine similarity to a query item in a single stateless HTTP call, without embeddings, indexes, or setup — ideal for mixed datasets combining text, categorical, and numeric fields.",
+    "gpt": "Call this function to get ranked similarity results for mixed-type JSON items (text, categorical, numeric) using fused NMI and cosine scoring; returns ordered list with scores in one round-trip, no pre-computation required.",
+    "gemini": "Use this tool when you need to find the most similar items in a raw JSON collection to a reference item across heterogeneous field types; do NOT use if you already have dense vector embeddings or a persistent index — use a vector DB instead."
   },
-  "token_efficiency_ratio": 41.0,
-  "value_equivalent": "$310 per hour of manual feature-similarity engineering avoided",
+  "token_efficiency_ratio": 31.0,
+  "value_equivalent": "$38 per hour of manual feature-engineering and ranking pipeline work avoided",
   "invocation_examples": [
-    "Compare these two product embedding vectors and tell me how similar they are accounting for nonlinear category encodings",
-    "Score similarity between user behavioral feature arrays without loading a vector database",
-    "Given two ad-hoc JSON payloads of mixed numeric and encoded categorical features, return a single fused similarity score"
+    "Find the 5 products most similar to this one given a catalog with mixed text descriptions, numeric prices, and categorical tags",
+    "Rank these 200 support tickets by similarity to an incoming ticket using subject text and categorical priority fields",
+    "Given a JSON list of job candidates with skills (categorical), years of experience (numeric), and bio (text), return the top 10 most similar to this reference profile"
   ],
   "pricing": {
     "model": "variable",
