@@ -1,6 +1,6 @@
 # Similarity Search API
 
-Statistical significance for every search result — cosine similarity ranked by NMI, p-value included.
+Find what's actually similar — not just what's geometrically close.
 
 ---
 
@@ -10,119 +10,153 @@ Statistical significance for every search result — cosine similarity ranked by
 pip install similarity-search-sdk
 ```
 
-## Quickstart
+## Start searching in 3 lines
 
 ```python
 from similarity_search import SimilarityClient
 
-client = SimilarityClient(api_key="sk_test_xxxxxxxxxxxxxxxx")
-results = client.search(query=[0.12, -0.84, 0.33, ...], corpus=[[...], [...], [...]])
-# results[0] -> {"score": 0.91, "nmi": 0.74, "p_value": 0.003, "rank": 1}
+client = SimilarityClient(api_key="YOUR_API_KEY")
+results = client.rank(query=[0.12, 0.87, ...], candidates=[[...], [...]], alpha=0.7)
 ```
 
----
-
-## The problem with cosine alone
-
-Every vector database returns a ranked list. None of them answer the question that actually matters:
-
-> **Is this similarity real, or is it noise?**
-
-A cosine score of `0.87` between two embeddings could mean strong semantic overlap — or it could be a coincidence in a high-dimensional space where most vectors are roughly equidistant. You have no way to tell without running a statistical test you almost certainly haven't written.
-
-The Similarity Search API solves this in a single HTTP call.
-
----
-
-## What you get back
-
-Every response includes four fields per pair:
-
-| Field | What it means |
-|---|---|
-| `cosine_score` | Standard cosine similarity `[-1, 1]` |
-| `nmi` | Normalized Mutual Information `[0, 1]` — how much knowing one vector reduces uncertainty about the other |
-| `p_value` | Bootstrap p-value: probability this NMI score occurs under the null hypothesis of independence |
-| `ci_95` | 95% confidence interval on NMI via bootstrap resampling (1 000 draws per call) |
-
-A result with `cosine_score: 0.89, p_value: 0.41` is a different decision than `cosine_score: 0.89, p_value: 0.003`. The first one is noise. The second one is signal.
+`alpha` controls the weight between cosine geometry and mutual information. No index. No infrastructure. One call.
 
 ---
 
 ## Why not build this yourself
 
-The hard part is not the formula. NMI is `I(X;Y) / sqrt(H(X) * H(Y))`. The hard part is everything that sits underneath it:
+Every team that needs similarity search faces the same fork: use a vector database (Pinecone, Weaviate, Qdrant) or roll a cosine function. Both choices share a silent assumption — geometric closeness is a good enough proxy for real similarity.
 
-**Discretization of continuous embeddings.** To estimate `H(X)` and `H(X,Y)`, you need to bin each embedding dimension. If you use fixed-width bins (k=10 is the typical shortcut), you get artificially inflated NMI in low-variance dimensions — the score looks meaningful but the statistic is garbage. The correct approach is Freedman-Diaconis bin selection per dimension, which requires computing the IQR of each dimension across your corpus and deriving bin count as `2 * IQR * n^(-1/3)`. That is a different implementation for every call, not a constant.
+It isn't, in noisy domains.
 
-**Bootstrap confidence intervals that are actually valid.** Resampling embedding pairs without replacement, recomputing joint entropy on each resample, and aggregating into a distribution requires getting floating-point accumulation right across 1 000 draws without introducing bias from array reuse. The naive implementation introduces ~8–12% NMI inflation from memory aliasing on NumPy views. We benchmarked this.
+Two vectors can be cosine-similar because they share a directional bias introduced by dataset artifacts, domain shift, or feature correlation that has nothing to do with semantic relatedness. Normalized Mutual Information (NMI) catches this. It penalizes pairs that are geometrically close but statistically independent — the fingerprint of a spurious correlation.
 
-**No database to maintain.** This API is stateless — you POST vectors, you get statistics back. There is no index to build, no cluster to size, no nightly re-embedding job. If you only query a corpus once, you pay for one call, not for months of vector storage.
+The problem is that NMI and cosine live in separate tools. Combining them manually means:
 
-**The bin-count flywheel.** Our infrastructure accumulates real embedding distributions across calls to calibrate optimal bin counts by dimensionality range (768-dim BERT vectors bin differently than 1 536-dim Ada vectors). The longer you use the API, the more accurate the discretization becomes for your embedding model. You cannot bootstrap this from day one with an ad-hoc script.
+- Estimating NMI requires discretizing continuous vectors — binning strategy matters, and most implementations get it wrong for high-dimensional data
+- Fusing two scores without a principled weighting produces rankings that vary with implementation details, not signal
+- None of this runs stateless — most teams end up with a pipeline with intermediate state, a separate scoring step, and drift between the two
+
+This API solves the fusion problem at the request level. The composite score `S = alpha * cosine(u, v) + (1 - alpha) * NMI(u, v)` is computed in a single call using Freedman-Diaconis adaptive binning for the NMI estimation — a method that adjusts bin width to the empirical distribution of each input vector, not a fixed discretization chosen at index-build time.
+
+The result is a score with verifiable statistical properties: if `alpha = 1.0` you get pure cosine; if `alpha = 0.0` you get pure mutual information; anywhere in between you get a controlled blend where both components are on the same `[0, 1]` scale before fusion.
 
 ---
 
-## API reference
+## When to use this
 
-### `POST /v1/search`
+- **Duplicate detection** in document corpora where near-identical embeddings hide content that's statistically unrelated
+- **Recommendation ranking** where cosine-only similarity produces filter bubbles from correlated features
+- **Semantic clustering** validation — use composite score drift across alpha values as a signal for cluster quality
+- **Prototype validation** on datasets under 500k items where standing up a vector database adds days of operational overhead before you've confirmed the signal exists
+
+## When not to use this
+
+This API is stateless by design — it does not maintain an index. If your use case requires sub-10ms approximate nearest-neighbor search across tens of millions of pre-indexed vectors with persistent storage, use a dedicated vector database. This primitive is for **scoring and ranking on demand**, not for ANN retrieval at scale.
+
+---
+
+## The `alpha` parameter
+
+`alpha` is the single knob between geometry and information.
+
+| alpha | Behavior |
+|-------|----------|
+| `1.0` | Pure cosine similarity — fast, standard, no MI penalty |
+| `0.7` | Default — cosine-dominant with MI correction for spurious pairs |
+| `0.5` | Equal weight — maximum discrimination between geometric and statistical signal |
+| `0.0` | Pure NMI — statistical dependence only, geometry ignored |
+
+The right `alpha` depends on your domain. High-noise domains (user behavior, sparse item embeddings) benefit from lower alpha. Dense semantic embeddings from transformer models typically work well at `0.6`-`0.8`.
+
+---
+
+## Full request example
+
+```python
+from similarity_search import SimilarityClient
+
+client = SimilarityClient(api_key="YOUR_API_KEY")
+
+query_vector = [0.12, 0.45, 0.87, 0.33, 0.91]
+candidates = [
+    [0.11, 0.44, 0.85, 0.35, 0.90],  # geometrically close, statistically dependent
+    [0.10, 0.46, 0.88, 0.10, 0.20],  # geometrically close, statistically independent
+    [0.80, 0.10, 0.05, 0.60, 0.44],  # geometrically distant
+]
+
+results = client.rank(
+    query=query_vector,
+    candidates=candidates,
+    alpha=0.7,
+    domain_tag="product_embeddings",  # optional — improves alpha suggestions over time
+)
+
+for r in results.ranked:
+    print(r.index, r.score_composite, r.score_cosine, r.score_nmi)
+```
+
+```
+0   0.891   0.943   0.788
+1   0.612   0.901   0.142   # <- cosine would have ranked this #1
+2   0.201   0.187   0.231
+```
+
+Candidate 1 is the case your current stack gets wrong. Cosine ranks it first. The composite score surfaces the statistical independence and drops it to second.
+
+---
+
+## REST API (direct HTTP)
 
 ```bash
-curl https://api.similaritysearch.io/v1/search \
-  -H "Authorization: Bearer sk_test_xxxxxxxxxxxxxxxx" \
+curl https://api.similaritysearch.io/v1/rank \
+  -H "Authorization: Bearer YOUR_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
-    "query": [0.12, -0.84, 0.33],
-    "corpus": [[0.11, -0.80, 0.31], [0.90, 0.02, -0.45]],
-    "top_k": 5,
-    "bootstrap_draws": 1000,
-    "significance_threshold": 0.05
+    "query": [0.12, 0.45, 0.87, 0.33, 0.91],
+    "candidates": [[0.11, 0.44, 0.85, 0.35, 0.90], [0.10, 0.46, 0.88, 0.10, 0.20]],
+    "alpha": 0.7,
+    "domain_tag": "product_embeddings"
   }'
 ```
 
-**Response**
+Response:
 
 ```json
 {
-  "results": [
-    {
-      "rank": 1,
-      "corpus_index": 0,
-      "cosine_score": 0.9987,
-      "nmi": 0.812,
-      "p_value": 0.001,
-      "ci_95": [0.791, 0.834],
-      "significant": true
-    },
-    {
-      "rank": 2,
-      "corpus_index": 1,
-      "cosine_score": 0.431,
-      "nmi": 0.089,
-      "p_value": 0.38,
-      "ci_95": [0.041, 0.143],
-      "significant": false
-    }
+  "ranked": [
+    {"index": 0, "score_composite": 0.891, "score_cosine": 0.943, "score_nmi": 0.788},
+    {"index": 1, "score_composite": 0.612, "score_cosine": 0.901, "score_nmi": 0.142}
   ],
   "meta": {
-    "query_dim": 3,
-    "corpus_size": 2,
-    "bootstrap_draws": 1000,
-    "bin_method": "freedman_diaconis",
-    "latency_ms": 47
+    "alpha_used": 0.7,
+    "binning_method": "freedman_diaconis",
+    "latency_ms": 18
   }
 }
 ```
 
-### Parameters
+---
 
-| Parameter | Type | Default | Description |
-|---|---|---|---|
-| `query` | `float[]` | required | Query embedding vector |
-| `corpus` | `float[][]` | required | Candidate vectors, max 10 000 |
-| `top_k` | `int` | `10` | Results to return, max 500 |
-| `bootstrap_draws` | `int` | `1000` | Resamples for CI estimation. More draws -> narrower CI, higher latency |
-| `significance_threshold` | `float` | `0.05` | p-value cutoff for `significant` flag |
+## No infrastructure required
+
+No Docker. No Kubernetes. No persistent index to manage, back up, or keep warm. No embedding model to host. Send vectors, get a ranked list. The entire operational surface is an HTTP request and an API key.
+
+For teams validating a similarity signal before committing to a vector database architecture, this removes the infrastructure decision from the validation loop entirely.
+
+---
+
+## Security
+
+- All requests are authenticated with a bearer token
+- Vectors are not stored — they are discarded after scoring
+- Aggregate metadata (alpha, dimensionality, domain tag, composite score, latency) is logged for alpha optimization features; no vector data is retained
+
+---
+
+## Support
+
+[docs.similaritysearch.io](https://docs.similaritysearch.io) — API reference, error codes, SDK changelog
 
 ---
 
@@ -130,24 +164,11 @@ curl https://api.similaritysearch.io/v1/search \
 
 | Calls / month | Price per call |
 |---|---|
-| 0 – 10 000 | $0.004 |
-| 10 001 – 500 000 | $0.0028 |
-| 500 001+ | $0.0018 |
+| 0 - 100 | Free |
+| 101 - 10,000 | $0.0025 |
+| 10,001 - 100,000 | $0.0018 |
+| 100,001 - 1,000,000 | $0.0012 |
+| 1,000,001 - 10,000,000 | $0.0008 |
+| 10,000,001+ | $0.0005 |
 
-No base fee. No storage fee. No minimum commitment. You pay for computation, not for parking vectors you queried once in January.
-
----
-
-## Get an API key
-
-```
-https://similaritysearch.io/dashboard
-```
-
-Free tier: 500 calls/month, no credit card required.
-
----
-
-## License
-
-MIT
+No base fee. No storage fee. No minimum commitment. You pay for computation, not for parking vectors you queried once.
