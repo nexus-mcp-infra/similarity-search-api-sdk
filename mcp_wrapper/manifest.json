@@ -1,16 +1,13 @@
 {
   "name": "nexus-similarity-search-api",
   "description_variants": {
-    "claude": "Ejecuta búsqueda de similitud coseno con filtro NMI e intervalo de confianza bootstrap por llamada, devolviendo p-value de significancia estadística por par para distinguir patrones reales de correlaciones aleatorias en embeddings.",
-    "gpt": "Hybrid NMI-cosine similarity search that returns ranked results with per-pair p-values and bootstrap confidence intervals, enabling statistically validated retrieval decisions without vector persistence.",
-    "gemini": "Calcula similitud híbrida NMI-coseno sobre vectores de embeddings con validación estadística bootstrap por llamada, produciendo rankings con p-values para filtrar resultados espurios antes de tomar decisiones downstream."
+    "claude": "Ning\u00fan competidor expone una API stateless de similaridad que combine Cosine similarity con Normalized Mutual Information (NMI) en un solo score compuesto \u2014 el mercado separa ambas m\u00e9tricas en herramientas distintas, forzando al usuario a implementar la fusi\u00f3n manualmente con resultados inconsistentes y sin control de peso relativo entre ambas dimensiones",
+    "gpt": "Ning\u00fan competidor expone una API stateless de similaridad que combine Cosine similarity con Normalized Mutual Information (NMI) en un solo score compuesto \u2014 el mercado separa ambas m\u00e9tricas en herramientas distintas, forzando al usuario a implementar la fusi\u00f3n manualmente con resultados inconsistentes y sin control de peso relativo entre ambas dimensiones",
+    "gemini": "Ning\u00fan competidor expone una API stateless de similaridad que combine Cosine similarity con Normalized Mutual Information (NMI) en un solo score compuesto \u2014 el mercado separa ambas m\u00e9tricas en herramientas distintas, forzando al usuario a implementar la fusi\u00f3n manualmente con resultados inconsistentes y sin control de peso relativo entre ambas dimensiones"
   },
-  "token_efficiency_ratio": 31.0,
-  "value_equivalent": "$47 por hora de trabajo manual ahorrado",
+  "token_efficiency_ratio": 20.0,
   "invocation_examples": [
-    "Busca los 10 documentos más similares a este embedding y dime cuáles tienen un patrón de similitud estadísticamente significativo (p < 0.05)",
-    "Dado este vector de consulta y estos 500 candidatos, filtra los resultados cuya similitud NMI-coseno supere el umbral de confianza del 95% con intervalo bootstrap",
-    "Compara estos dos conjuntos de embeddings y devuelve los pares con mayor similitud real, descartando los que no superen el test de significancia estadística"
+    "Use this API to solve: Ning\u00fan competidor expone una API stateless de similaridad que combine Cosine similarity con Normalized Mutual Information (NMI) en un solo score compuesto \u2014 el mercado separa ambas m\u00e9tricas en herramientas distintas, forzando al usuario a implementar la fusi\u00f3n manualmente con resultados inconsistentes y sin control de peso relativo entre ambas dimensiones"
   ],
   "pricing": {
     "model": "variable",
