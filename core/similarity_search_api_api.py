@@ -1,401 +1,512 @@
-from fastapi import FastAPI, HTTPException, Depends, Header
-from fastapi.middleware.gzip import GZipMiddleware
-from pydantic import BaseModel, Field, field_validator, model_validator
+from fastapi import FastAPI, HTTPException, Security, status
+from fastapi.security.api_key import APIKeyHeader
+from pydantic import BaseModel, Field, model_validator
 from typing import Optional
 import numpy as np
 from scipy.stats import entropy as scipy_entropy
-import asyncpg
-import asyncio
-import time
+from sklearn.metrics import normalized_mutual_info_score
+from sklearn.preprocessing import KBinsDiscretizer
 import os
-import logging
-from contextlib import asynccontextmanager
+import time
+import hashlib
+import hmac
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("similarity_api")
-
-DB_DSN = os.environ.get("DATABASE_URL", "")
-API_KEY_SECRET = os.environ.get("API_KEY_SECRET", "")
-
-db_pool: Optional[asyncpg.Pool] = None
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    global db_pool
-    if DB_DSN:
-        try:
-            db_pool = await asyncpg.create_pool(DB_DSN, min_size=2, max_size=10)
-            await _ensure_flywheel_table()
-            logger.info("DB pool ready")
-        except Exception as exc:
-            logger.warning(f"DB unavailable, flywheel disabled: {exc}")
-    yield
-    if db_pool:
-        await db_pool.close()
-
+API_KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=False)
+_VALID_API_KEY = os.environ.get("SIMILARITY_API_KEY", "")
 
 app = FastAPI(
-    title="NMI-Cosine Similarity API",
+    title="Stateless Similarity Search API",
+    description=(
+        "Fuses NMI and cosine similarity into a single entropy-weighted score. "
+        "No indexing, no persistent state, no prior upload required."
+    ),
     version="1.0.0",
-    description="Stateless similarity scoring: S = alpha*cosine + (1-alpha)*NMI",
-    lifespan=lifespan,
+    docs_url="/docs",
+    redoc_url=None,
 )
-app.add_middleware(GZipMiddleware, minimum_size=512)
 
 
-def _freedman_diaconis_bins(data: np.ndarray) -> int:
-    n = len(data)
-    if n < 2:
-        return 2
-    iqr = np.percentile(data, 75) - np.percentile(data, 25)
-    if iqr == 0:
-        bins = int(np.ceil(np.sqrt(n)))
-    else:
-        h = 2.0 * iqr * n ** (-1.0 / 3.0)
-        data_range = data.max() - data.min()
-        bins = int(np.ceil(data_range / h)) if h > 0 else int(np.ceil(np.sqrt(n)))
-    return max(2, min(bins, 64))
-
-
-def _cosine_similarity(u: np.ndarray, v: np.ndarray) -> float:
-    norm_u = np.linalg.norm(u)
-    norm_v = np.linalg.norm(v)
-    if norm_u == 0.0 or norm_v == 0.0:
-        return 0.0
-    raw = float(np.dot(u, v) / (norm_u * norm_v))
-    return float(np.clip(raw, -1.0, 1.0))
-
-
-def _normalized_mutual_information(u: np.ndarray, v: np.ndarray) -> float:
-    n = len(u)
-    all_vals = np.concatenate([u, v])
-    n_bins = _freedman_diaconis_bins(all_vals)
-    global_min = all_vals.min()
-    global_max = all_vals.max()
-    if global_max == global_min:
-        return 1.0
-    edges = np.linspace(global_min, global_max, n_bins + 1)
-    u_idx = np.searchsorted(edges[1:-1], u, side="right")
-    v_idx = np.searchsorted(edges[1:-1], v, side="right")
-    joint_counts = np.zeros((n_bins, n_bins), dtype=np.float64)
-    for i, j in zip(u_idx, v_idx):
-        joint_counts[i, j] += 1.0
-    joint_prob = joint_counts / n
-    p_u = joint_prob.sum(axis=1)
-    p_v = joint_prob.sum(axis=0)
-    h_u = scipy_entropy(p_u + 1e-12)
-    h_v = scipy_entropy(p_v + 1e-12)
-    joint_flat = joint_prob[joint_prob > 0]
-    h_joint = -np.sum(joint_flat * np.log(joint_flat + 1e-12))
-    mutual_info = h_u + h_v - h_joint
-    denom = h_u + h_v
-    if denom < 1e-12:
-        return 1.0
-    nmi = 2.0 * mutual_info / denom
-    return float(np.clip(nmi, 0.0, 1.0))
-
-
-def _cosine_similarity_batch(query: np.ndarray, matrix: np.ndarray) -> np.ndarray:
-    norm_q = np.linalg.norm(query)
-    norms = np.linalg.norm(matrix, axis=1)
-    if norm_q == 0.0:
-        return np.zeros(len(matrix))
-    dots = matrix @ query
-    denom = norms * norm_q
-    safe_denom = np.where(denom == 0, 1e-12, denom)
-    return np.clip(dots / safe_denom, -1.0, 1.0)
-
-
-def _nmi_batch(query: np.ndarray, matrix: np.ndarray) -> np.ndarray:
-    return np.array([_normalized_mutual_information(query, row) for row in matrix])
-
-
-async def _ensure_flywheel_table():
-    async with db_pool.acquire() as conn:
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS nmi_cosine_flywheel (
-                id BIGSERIAL PRIMARY KEY,
-                created_at TIMESTAMPTZ DEFAULT NOW(),
-                alpha FLOAT NOT NULL,
-                vector_dim INTEGER NOT NULL,
-                domain_tag TEXT,
-                score_composite FLOAT NOT NULL,
-                latency_ms FLOAT NOT NULL
-            )
-        """)
-
-
-async def _record_flywheel(
-    alpha: float,
-    vector_dim: int,
-    domain_tag: Optional[str],
-    score_composite: float,
-    latency_ms: float,
-):
-    if not db_pool:
-        return
-    try:
-        async with db_pool.acquire() as conn:
-            await conn.execute(
-                """INSERT INTO nmi_cosine_flywheel
-                   (alpha, vector_dim, domain_tag, score_composite, latency_ms)
-                   VALUES ($1, $2, $3, $4, $5)""",
-                alpha,
-                vector_dim,
-                domain_tag,
-                score_composite,
-                latency_ms,
-            )
-    except Exception as exc:
-        logger.warning(f"Flywheel write failed: {exc}")
-
-
-def _require_api_key(x_api_key: str = Header(...)):
-    if not API_KEY_SECRET:
-        return
-    if x_api_key != API_KEY_SECRET:
-        raise HTTPException(status_code=401, detail="Invalid or missing X-API-Key")
-
-
-class VectorPairRequest(BaseModel):
-    vector_a: list[float] = Field(..., min_length=2, max_length=8192)
-    vector_b: list[float] = Field(..., min_length=2, max_length=8192)
-    alpha: float = Field(0.5, ge=0.0, le=1.0, description="Weight for cosine component; (1-alpha) weights NMI")
-    domain_tag: Optional[str] = Field(None, max_length=64)
-
-    @field_validator("vector_a", "vector_b", mode="before")
-    @classmethod
-    def no_nan_inf(cls, v):
-        if v is None:
-            raise ValueError("Vector must not be None")
-        for val in v:
-            if not isinstance(val, (int, float)):
-                raise ValueError(f"All vector elements must be numeric, got {type(val)}")
-            if not np.isfinite(val):
-                raise ValueError("Vector elements must be finite (no NaN or Inf)")
-        return v
+class VectorPayload(BaseModel):
+    query: list[float] = Field(..., min_length=1, max_length=16384)
+    candidates: list[list[float]] = Field(..., min_length=1, max_length=2048)
+    top_k: int = Field(default=10, ge=1, le=512)
+    nmi_bins: int = Field(
+        default=10,
+        ge=3,
+        le=64,
+        description=(
+            "Number of bins for NMI discretization. "
+            "Increase for larger candidate sets; reduce for sparse data."
+        ),
+    )
+    alpha: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Fixed NMI weight override [0,1]. If None (recommended), "
+            "weight is derived dynamically from marginal entropy of query dimensions."
+        ),
+    )
 
     @model_validator(mode="after")
-    def same_length(self):
-        if len(self.vector_a) != len(self.vector_b):
-            raise ValueError(
-                f"Vectors must have equal dimension: got {len(self.vector_a)} vs {len(self.vector_b)}"
-            )
-        return self
-
-
-class ScoreResponse(BaseModel):
-    score_composite: float
-    cosine_similarity: float
-    nmi: float
-    alpha: float
-    latency_ms: float
-
-
-class BatchRequest(BaseModel):
-    query: list[float] = Field(..., min_length=2, max_length=8192)
-    candidates: list[list[float]] = Field(..., min_length=1, max_length=512)
-    alpha: float = Field(0.5, ge=0.0, le=1.0)
-    top_k: int = Field(10, ge=1, le=512)
-    domain_tag: Optional[str] = Field(None, max_length=64)
-
-    @field_validator("query", mode="before")
-    @classmethod
-    def query_no_nan_inf(cls, v):
-        if v is None:
-            raise ValueError("Query vector must not be None")
-        for val in v:
-            if not isinstance(val, (int, float)):
-                raise ValueError(f"Query elements must be numeric")
-            if not np.isfinite(val):
-                raise ValueError("Query elements must be finite")
-        return v
-
-    @model_validator(mode="after")
-    def validate_candidates(self):
+    def validate_dimensions(self) -> "VectorPayload":
         dim = len(self.query)
-        for idx, cand in enumerate(self.candidates):
+        if dim == 0:
+            raise ValueError("query vector must have at least one dimension")
+        for i, cand in enumerate(self.candidates):
             if len(cand) != dim:
                 raise ValueError(
-                    f"Candidate {idx} has dim {len(cand)}, expected {dim} to match query"
+                    f"candidate[{i}] has {len(cand)} dimensions, expected {dim}"
                 )
-            for val in cand:
-                if not isinstance(val, (int, float)) or not np.isfinite(val):
-                    raise ValueError(f"Candidate {idx} contains non-finite or non-numeric value")
         return self
 
 
-class RankedCandidate(BaseModel):
+class BatchPayload(BaseModel):
+    queries: list[list[float]] = Field(..., min_length=1, max_length=256)
+    candidates: list[list[float]] = Field(..., min_length=1, max_length=2048)
+    top_k: int = Field(default=10, ge=1, le=512)
+    nmi_bins: int = Field(default=10, ge=3, le=64)
+    alpha: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+
+    @model_validator(mode="after")
+    def validate_batch_dimensions(self) -> "BatchPayload":
+        dim = len(self.queries[0])
+        for i, q in enumerate(self.queries):
+            if len(q) != dim:
+                raise ValueError(
+                    f"queries[{i}] has {len(q)} dimensions, expected {dim}"
+                )
+        for i, c in enumerate(self.candidates):
+            if len(c) != dim:
+                raise ValueError(
+                    f"candidates[{i}] has {len(c)} dimensions, expected {dim}"
+                )
+        return self
+
+
+class SimilarityResult(BaseModel):
     index: int
-    score_composite: float
-    cosine_similarity: float
-    nmi: float
+    composite_score: float
+    nmi_score: float
+    cosine_score: float
+    nmi_weight: float
 
 
-class BatchScoreResponse(BaseModel):
-    results: list[RankedCandidate]
-    alpha: float
+class SearchResponse(BaseModel):
+    results: list[SimilarityResult]
+    query_dim: int
+    candidate_count: int
+    nmi_weight_used: float
     latency_ms: float
 
 
-class AlphaInsightResponse(BaseModel):
-    domain_tag: str
-    suggested_alpha: float
-    confidence: str
-    sample_count: int
-    note: str
+class BatchSearchResponse(BaseModel):
+    results: list[list[SimilarityResult]]
+    query_count: int
+    candidate_count: int
+    latency_ms: float
 
 
-@app.get("/health", include_in_schema=False)
-async def health_check():
-    return {"status": "ok", "version": "1.0.0"}
+class MetricsResponse(BaseModel):
+    query: list[float]
+    reference: list[float]
+    nmi_score: float
+    cosine_score: float
+    composite_score: float
+    nmi_weight: float
+    marginal_entropies: list[float]
 
 
-@app.post("/v1/score", response_model=ScoreResponse, summary="Score a single vector pair")
-async def score_pair(
-    req: VectorPairRequest,
-    _: None = Depends(_require_api_key),
-):
+class MetricsPayload(BaseModel):
+    query: list[float] = Field(..., min_length=1, max_length=16384)
+    reference: list[float] = Field(..., min_length=1, max_length=16384)
+    nmi_bins: int = Field(default=10, ge=3, le=64)
+    alpha: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+
+    @model_validator(mode="after")
+    def validate_same_dim(self) -> "MetricsPayload":
+        if len(self.query) != len(self.reference):
+            raise ValueError(
+                f"query and reference must have equal dimensions: "
+                f"{len(self.query)} != {len(self.reference)}"
+            )
+        return self
+
+
+def _require_api_key(api_key: Optional[str] = Security(API_KEY_HEADER)) -> str:
+    if not _VALID_API_KEY:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="SIMILARITY_API_KEY environment variable is not set on this server.",
+        )
+    if api_key is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing X-API-Key header.",
+        )
+    if not hmac.compare_digest(
+        hashlib.sha256(api_key.encode()).digest(),
+        hashlib.sha256(_VALID_API_KEY.encode()).digest(),
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Invalid API key.",
+        )
+    return api_key
+
+
+def _marginal_entropy_per_dim(matrix: np.ndarray, n_bins: int) -> np.ndarray:
+    """
+    Estimate marginal Shannon entropy H(X_i) for each column of matrix
+    using equal-width histogram binning.
+
+    H(X_i) = -sum_k p_k * log2(p_k)
+
+    Returns array of shape (D,) with entropy in bits for each dimension.
+    Dimensions with zero variance receive H=0 (fully deterministic).
+    """
+    n_samples, n_dims = matrix.shape
+    entropies = np.zeros(n_dims, dtype=np.float64)
+
+    for d in range(n_dims):
+        col = matrix[:, d]
+        col_min, col_max = col.min(), col.max()
+        if col_max - col_min < 1e-12:
+            entropies[d] = 0.0
+            continue
+        counts, _ = np.histogram(col, bins=n_bins, range=(col_min, col_max))
+        probs = counts / counts.sum()
+        entropies[d] = scipy_entropy(probs, base=2)
+
+    return entropies
+
+
+def _entropy_weighted_nmi_alpha(query: np.ndarray, n_bins: int) -> tuple[float, np.ndarray]:
+    """
+    Derive dynamic NMI weight alpha from query marginal entropy.
+
+    alpha = mean(H(X_i)) / log2(n_bins)
+
+    This maps alpha into [0,1]: high-entropy queries (spread, informative)
+    push alpha toward 1 (NMI dominates); low-entropy queries (concentrated,
+    near-constant) push alpha toward 0 (cosine dominates).
+
+    Returns (alpha, marginal_entropies_per_dim).
+    """
+    entropies = _marginal_entropy_per_dim(query.reshape(1, -1), n_bins)
+    max_entropy = np.log2(n_bins) if n_bins > 1 else 1.0
+    alpha = float(np.clip(entropies.mean() / max_entropy, 0.0, 1.0))
+    return alpha, entropies
+
+
+def _cosine_similarity_batch(query: np.ndarray, candidates: np.ndarray) -> np.ndarray:
+    """
+    Cosine similarity between query (D,) and candidates (N, D).
+
+    cos(q, c_i) = (q . c_i) / (||q|| * ||c_i||)
+
+    Returns array of shape (N,). Vectors with zero norm yield score 0.0.
+    """
+    query_norm = np.linalg.norm(query)
+    if query_norm < 1e-12:
+        return np.zeros(len(candidates), dtype=np.float64)
+
+    cand_norms = np.linalg.norm(candidates, axis=1)
+    dot_products = candidates @ query
+    denom = cand_norms * query_norm
+    safe_denom = np.where(denom < 1e-12, 1.0, denom)
+    cosine_scores = np.where(denom < 1e-12, 0.0, dot_products / safe_denom)
+    return cosine_scores.astype(np.float64)
+
+
+def _nmi_per_candidate(
+    query: np.ndarray, candidates: np.ndarray, n_bins: int
+) -> np.ndarray:
+    """
+    Compute NMI between query and each candidate using sklearn's
+    normalized_mutual_info_score on discretized values.
+
+    NMI(X,Y) = 2*MI(X,Y) / (H(X) + H(Y))
+
+    Discretization uses equal-width binning into n_bins bins per dimension,
+    then the joint sequence (query_discretized, candidate_discretized) is
+    treated as paired categorical observations for NMI computation.
+
+    Returns array of shape (N,).
+    """
+    kbd = KBinsDiscretizer(n_bins=n_bins, encode="ordinal", strategy="uniform", subsample=None)
+    n_cands = len(candidates)
+
+    all_vectors = np.vstack([query.reshape(1, -1), candidates])
+    try:
+        kbd.fit(all_vectors)
+        discretized = kbd.transform(all_vectors).astype(int)
+    except ValueError:
+        return np.zeros(n_cands, dtype=np.float64)
+
+    query_disc_flat = discretized[0].flatten()
+    nmi_scores = np.zeros(n_cands, dtype=np.float64)
+
+    for i in range(n_cands):
+        cand_disc_flat = discretized[i + 1].flatten()
+        try:
+            score = normalized_mutual_info_score(
+                query_disc_flat,
+                cand_disc_flat,
+                average_method="arithmetic",
+            )
+        except Exception:
+            score = 0.0
+        nmi_scores[i] = score
+
+    return nmi_scores
+
+
+def _compute_composite_scores(
+    query: np.ndarray,
+    candidates: np.ndarray,
+    n_bins: int,
+    alpha_override: Optional[float],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, float, np.ndarray]:
+    """
+    Orchestrates entropy-weighted composite score computation.
+
+    composite_i = alpha * NMI(query, candidate_i)
+                + (1 - alpha) * cosine(query, candidate_i)
+
+    Where alpha is derived from marginal entropy of the query unless overridden.
+
+    Returns (composite_scores, nmi_scores, cosine_scores, alpha_used, marginal_entropies).
+    """
+    if alpha_override is not None:
+        alpha = float(np.clip(alpha_override, 0.0, 1.0))
+        marginal_entropies = _marginal_entropy_per_dim(
+            np.vstack([query.reshape(1, -1), candidates]), n_bins
+        )
+    else:
+        alpha, marginal_entropies = _entropy_weighted_nmi_alpha(query, n_bins)
+
+    cosine_scores = _cosine_similarity_batch(query, candidates)
+    nmi_scores = _nmi_per_candidate(query, candidates, n_bins)
+
+    composite = alpha * nmi_scores + (1.0 - alpha) * cosine_scores
+    return composite, nmi_scores, cosine_scores, alpha, marginal_entropies
+
+
+@app.post(
+    "/v1/similarity/search",
+    response_model=SearchResponse,
+    summary="Entropy-weighted NMI+Cosine similarity search (stateless)",
+    tags=["Similarity"],
+)
+def search_similar_vectors(
+    payload: VectorPayload,
+    _key: str = Security(_require_api_key),
+) -> SearchResponse:
+    """
+    Find the top-k candidates most similar to query using the composite
+    NMI+Cosine score weighted by the query's marginal entropy distribution.
+
+    Use when: you have a query vector and a candidate set per call, with no
+    persistent index. Suitable for datasets with mixed linear/nonlinear feature
+    dependencies.
+
+    Do NOT use when: you need approximate nearest-neighbor over millions of
+    pre-indexed vectors -- use Pinecone/Weaviate instead.
+    """
     t0 = time.perf_counter()
-    u = np.array(req.vector_a, dtype=np.float64)
-    v = np.array(req.vector_b, dtype=np.float64)
-    cosine = _cosine_similarity(u, v)
-    nmi = _normalized_mutual_information(u, v)
-    composite = req.alpha * cosine + (1.0 - req.alpha) * nmi
-    latency_ms = (time.perf_counter() - t0) * 1000.0
-    asyncio.ensure_future(
-        _record_flywheel(req.alpha, len(u), req.domain_tag, composite, latency_ms)
+
+    query_arr = np.array(payload.query, dtype=np.float64)
+    candidates_arr = np.array(payload.candidates, dtype=np.float64)
+
+    if not np.all(np.isfinite(query_arr)):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="query contains non-finite values (NaN or Inf).",
+        )
+    if not np.all(np.isfinite(candidates_arr)):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="candidates contains non-finite values (NaN or Inf).",
+        )
+
+    composite, nmi_scores, cosine_scores, alpha, _ = _compute_composite_scores(
+        query_arr, candidates_arr, payload.nmi_bins, payload.alpha
     )
-    return ScoreResponse(
-        score_composite=round(composite, 8),
-        cosine_similarity=round(cosine, 8),
-        nmi=round(nmi, 8),
-        alpha=req.alpha,
+
+    top_k = min(payload.top_k, len(candidates_arr))
+    top_indices = np.argpartition(composite, -top_k)[-top_k:]
+    top_indices = top_indices[np.argsort(composite[top_indices])[::-1]]
+
+    results = [
+        SimilarityResult(
+            index=int(idx),
+            composite_score=round(float(composite[idx]), 8),
+            nmi_score=round(float(nmi_scores[idx]), 8),
+            cosine_score=round(float(cosine_scores[idx]), 8),
+            nmi_weight=round(alpha, 8),
+        )
+        for idx in top_indices
+    ]
+
+    latency_ms = (time.perf_counter() - t0) * 1000.0
+
+    return SearchResponse(
+        results=results,
+        query_dim=len(payload.query),
+        candidate_count=len(payload.candidates),
+        nmi_weight_used=round(alpha, 8),
         latency_ms=round(latency_ms, 3),
     )
 
 
-@app.post("/v1/rank", response_model=BatchScoreResponse, summary="Rank candidates against a query vector")
-async def rank_candidates(
-    req: BatchRequest,
-    _: None = Depends(_require_api_key),
-):
+@app.post(
+    "/v1/similarity/batch",
+    response_model=BatchSearchResponse,
+    summary="Batch entropy-weighted NMI+Cosine search for multiple queries",
+    tags=["Similarity"],
+)
+def batch_search_similar_vectors(
+    payload: BatchPayload,
+    _key: str = Security(_require_api_key),
+) -> BatchSearchResponse:
+    """
+    Run similarity search for multiple queries against the same candidate set
+    in a single HTTP call. Each query gets its own alpha derived independently
+    from its marginal entropy.
+
+    Use when: you have 2-256 queries to evaluate against the same candidate pool.
+
+    Do NOT use when: queries have heterogeneous dimensions or candidate sets --
+    use /v1/similarity/search per query instead.
+    """
     t0 = time.perf_counter()
-    query = np.array(req.query, dtype=np.float64)
-    matrix = np.array(req.candidates, dtype=np.float64)
-    cosines = _cosine_similarity_batch(query, matrix)
-    nmis = _nmi_batch(query, matrix)
-    composites = req.alpha * cosines + (1.0 - req.alpha) * nmis
-    top_k = min(req.top_k, len(req.candidates))
-    top_indices = np.argpartition(composites, -top_k)[-top_k:]
-    top_indices = top_indices[np.argsort(composites[top_indices])[::-1]]
-    results = [
-        RankedCandidate(
-            index=int(i),
-            score_composite=round(float(composites[i]), 8),
-            cosine_similarity=round(float(cosines[i]), 8),
-            nmi=round(float(nmis[i]), 8),
+
+    queries_arr = np.array(payload.queries, dtype=np.float64)
+    candidates_arr = np.array(payload.candidates, dtype=np.float64)
+
+    if not np.all(np.isfinite(queries_arr)):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="queries contains non-finite values (NaN or Inf).",
         )
-        for i in top_indices
-    ]
+    if not np.all(np.isfinite(candidates_arr)):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="candidates contains non-finite values (NaN or Inf).",
+        )
+
+    all_results: list[list[SimilarityResult]] = []
+
+    for q_idx, query_vec in enumerate(queries_arr):
+        composite, nmi_scores, cosine_scores, alpha, _ = _compute_composite_scores(
+            query_vec, candidates_arr, payload.nmi_bins, payload.alpha
+        )
+        top_k = min(payload.top_k, len(candidates_arr))
+        top_indices = np.argpartition(composite, -top_k)[-top_k:]
+        top_indices = top_indices[np.argsort(composite[top_indices])[::-1]]
+
+        query_results = [
+            SimilarityResult(
+                index=int(idx),
+                composite_score=round(float(composite[idx]), 8),
+                nmi_score=round(float(nmi_scores[idx]), 8),
+                cosine_score=round(float(cosine_scores[idx]), 8),
+                nmi_weight=round(alpha, 8),
+            )
+            for idx in top_indices
+        ]
+        all_results.append(query_results)
+
     latency_ms = (time.perf_counter() - t0) * 1000.0
-    if results:
-        best_composite = float(composites[top_indices[0]])
-        asyncio.ensure_future(
-            _record_flywheel(req.alpha, len(query), req.domain_tag, best_composite, latency_ms)
-        )
-    return BatchScoreResponse(results=results, alpha=req.alpha, latency_ms=round(latency_ms, 3))
 
-
-@app.post("/v1/explain", summary="Decompose score components for interpretability")
-async def explain_score(
-    req: VectorPairRequest,
-    _: None = Depends(_require_api_key),
-):
-    t0 = time.perf_counter()
-    u = np.array(req.vector_a, dtype=np.float64)
-    v = np.array(req.vector_b, dtype=np.float64)
-    cosine = _cosine_similarity(u, v)
-    nmi = _normalized_mutual_information(u, v)
-    composite = req.alpha * cosine + (1.0 - req.alpha) * nmi
-    cosine_contribution = req.alpha * cosine
-    nmi_contribution = (1.0 - req.alpha) * nmi
-    tension = abs(cosine - nmi)
-    interpretation = (
-        "high_geometric_low_statistical"
-        if cosine > nmi + 0.2
-        else "high_statistical_low_geometric"
-        if nmi > cosine + 0.2
-        else "aligned"
+    return BatchSearchResponse(
+        results=all_results,
+        query_count=len(payload.queries),
+        candidate_count=len(payload.candidates),
+        latency_ms=round(latency_ms, 3),
     )
-    latency_ms = (time.perf_counter() - t0) * 1000.0
+
+
+@app.post(
+    "/v1/similarity/metrics",
+    response_model=MetricsResponse,
+    summary="Decomposed NMI, cosine, and composite score between two vectors",
+    tags=["Similarity"],
+)
+def decompose_similarity_metrics(
+    payload: MetricsPayload,
+    _key: str = Security(_require_api_key),
+) -> MetricsResponse:
+    """
+    Return the full score decomposition (NMI, cosine, composite, alpha, per-dim entropies)
+    for a query-reference pair. Useful for debugging, calibration, and understanding
+    why the composite score takes a specific value.
+
+    Use when: you want to audit or explain a similarity score between exactly two vectors.
+
+    Do NOT use when: you have a pool of candidates -- /v1/similarity/search is more efficient.
+    """
+    query_arr = np.array(payload.query, dtype=np.float64)
+    reference_arr = np.array(payload.reference, dtype=np.float64)
+
+    if not np.all(np.isfinite(query_arr)):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="query contains non-finite values (NaN or Inf).",
+        )
+    if not np.all(np.isfinite(reference_arr)):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="reference contains non-finite values (NaN or Inf).",
+        )
+
+    composite, nmi_scores, cosine_scores, alpha, marginal_entropies = _compute_composite_scores(
+        query_arr,
+        reference_arr.reshape(1, -1),
+        payload.nmi_bins,
+        payload.alpha,
+    )
+
+    return MetricsResponse(
+        query=payload.query,
+        reference=payload.reference,
+        nmi_score=round(float(nmi_scores[0]), 8),
+        cosine_score=round(float(cosine_scores[0]), 8),
+        composite_score=round(float(composite[0]), 8),
+        nmi_weight=round(alpha, 8),
+        marginal_entropies=[round(float(e), 8) for e in marginal_entropies],
+    )
+
+
+@app.get(
+    "/v1/health",
+    summary="Liveness check — confirms API is up and math dependencies are importable",
+    tags=["Ops"],
+)
+def health_check() -> dict:
+    """
+    Use when: load balancer or orchestrator needs a liveness probe.
+
+    Do NOT use when: you need to verify auth or score correctness -- this endpoint
+    does not require an API key and performs no score computation.
+    """
+    try:
+        _test = normalized_mutual_info_score([0, 1, 0], [0, 1, 1])
+        _test2 = float(scipy_entropy([0.5, 0.5], base=2))
+        deps_ok = np.isfinite(_test) and np.isfinite(_test2)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"Math dependency check failed: {exc}",
+        )
+
     return {
-        "score_composite": round(composite, 8),
-        "cosine_similarity": round(cosine, 8),
-        "nmi": round(nmi, 8),
-        "cosine_contribution": round(cosine_contribution, 8),
-        "nmi_contribution": round(nmi_contribution, 8),
-        "metric_tension": round(tension, 8),
-        "interpretation": interpretation,
-        "alpha": req.alpha,
-        "vector_dim": len(u),
-        "latency_ms": round(latency_ms, 3),
+        "status": "ok",
+        "deps_ok": deps_ok,
+        "numpy_version": np.__version__,
     }
-
-
-@app.get("/v1/alpha-insight/{domain_tag}", response_model=AlphaInsightResponse, summary="Suggest optimal alpha for a domain")
-async def alpha_insight(
-    domain_tag: str,
-    _: None = Depends(_require_api_key),
-):
-    if not domain_tag or len(domain_tag) > 64:
-        raise HTTPException(status_code=422, detail="domain_tag must be between 1 and 64 characters")
-    if not db_pool:
-        raise HTTPException(
-            status_code=503,
-            detail="Flywheel DB unavailable; alpha-insight requires historical data"
-        )
-    async with db_pool.acquire() as conn:
-        rows = await conn.fetch(
-            """SELECT alpha, score_composite
-               FROM nmi_cosine_flywheel
-               WHERE domain_tag = $1
-               ORDER BY created_at DESC
-               LIMIT 1000""",
-            domain_tag,
-        )
-    if not rows:
-        raise HTTPException(
-            status_code=404,
-            detail=f"No flywheel data for domain_tag='{domain_tag}'. Score at least one pair with this tag first."
-        )
-    alphas = np.array([r["alpha"] for r in rows], dtype=np.float64)
-    scores = np.array([r["score_composite"] for r in rows], dtype=np.float64)
-    n_bins = min(20, len(alphas))
-    bin_edges = np.linspace(0.0, 1.0, n_bins + 1)
-    bin_indices = np.digitize(alphas, bin_edges[1:-1])
-    bin_means = np.zeros(n_bins)
-    bin_counts = np.zeros(n_bins, dtype=int)
-    for i, s in zip(bin_indices, scores):
-        bin_means[i] += s
-        bin_counts[i] += 1
-    observed = bin_counts > 0
-    bin_means[observed] /= bin_counts[observed]
-    best_bin = int(np.argmax(bin_means * observed))
-    suggested_alpha = float((bin_edges[best_bin] + bin_edges[best_bin + 1]) / 2.0)
-    confidence = (
-        "high" if bin_counts[best_bin] >= 50
-        else "medium" if bin_counts[best_bin] >= 10
-        else "low"
-    )
-    return AlphaInsightResponse(
-        domain_tag=domain_tag,
-        suggested_alpha=round(suggested_alpha, 3),
-        confidence=confidence,
-        sample_count=int(len(rows)),
-        note="Suggested alpha maximizes mean composite score observed for this domain. Use as starting point, not ground truth.",
-    )
 
 # --- NEXUS: servidor MCP real montado en el mismo proceso (inyectado por forge_agent) ---
 # Reemplaza el wrapper Node/TypeScript separado -- un solo deploy, sin
@@ -429,35 +540,35 @@ async def _nexus_mcp_call_core(method: str, path: str, params: dict) -> Any:
         return resp.json()
 
 
-@_nexus_mcp.tool(name='nexus_similarity_search_api_rank_by_nmi_cosine_fusion', description='Ranks a candidate set against a query vector using a weighted fusion of Cosine similarity and Normalized Mutual Information (NMI). Use this when you need rankings that penalize geometrically close but statistically independent pairs — ideal for noisy recommendation, semantic deduplication, or clustering pre-processing. Do NOT use when candidates are pre-indexed in a vector store (use a native ANN query instead) or when NMI computation cost is unacceptable for very high-dimensional discrete histograms (dim > 4096 with many bins).')
-async def rank_by_nmi_cosine_fusion(query_vector: Annotated[list[float], Field(..., description='Dense float vector representing the query item. Must have the same dimensionality as every vector in candidate_matrix.', min_length=2, max_length=4096)], candidate_matrix: Annotated[list[list[float]], Field(..., description='List of candidate dense float vectors to rank. Each row must match the dimensionality of query_vector. Maximum 2000 candidates per request.', min_length=1, max_length=2000)], alpha: Annotated[float, Field(0.7, description='Mixing weight in [0.0, 1.0]. Final score = alpha * cosine + (1 - alpha) * nmi. alpha=1.0 reduces to pure cosine; alpha=0.0 reduces to pure NMI. Values around 0.6-0.75 are typical for semantic search with noise.', ge=0.0, le=1.0)], nmi_bins: Annotated[float, Field(32, description='Number of histogram bins used to estimate joint and marginal distributions for NMI computation. Higher values increase resolution but raise compute cost. Recommended range 8-64; values above 128 are rarely beneficial.', ge=4, le=128)], top_k: Annotated[float, Field(10, description='Number of top-ranked results to return. Must be <= len(candidate_matrix). Set to -1 to return all candidates ranked.', ge=-1, le=2000)], candidate_ids: Annotated[list[str], Field(None, description='Optional list of string identifiers aligned with candidate_matrix rows. When provided, each result includes the corresponding ID. If omitted, results use zero-based integer indices as identifiers.', max_length=2000)]) -> dict[str, Any]:
-    """NMI-Cosine Fused Ranking"""
-    params = {"query_vector": query_vector, "candidate_matrix": candidate_matrix, "alpha": alpha, "nmi_bins": nmi_bins, "top_k": top_k, "candidate_ids": candidate_ids}
-    return await _nexus_mcp_call_core('POST', '/v1/similarity/rank-nmi-cosine', params)
+@_nexus_mcp.tool(name='nexus_similarity_search_api_rank_vectors_by_nmi_cosine_fusion', description='Ranks a candidate set of vectors against a query vector using a composite score that fuses Normalized Mutual Information (for nonlinear feature dependencies) and cosine similarity (for directional alignment), weighted by the marginal entropy of each dimension computed from the candidate distribution. Use when you need stateless ad-hoc similarity ranking without a database, especially when the feature space contains categorical-encoded or mixed-type dimensions where cosine alone underperforms. Do NOT use when you have more than 50,000 candidates per call (latency will exceed SLA) or when all features are already known to be linearly independent and continuous (cosine alone is sufficient and cheaper).')
+async def rank_vectors_by_nmi_cosine_fusion(query_vector: Annotated[list[float], Field(..., description='The reference vector to rank against. Must have the same dimensionality as every vector in candidate_matrix. Values must be finite floats; NaN or Inf will be rejected.', min_length=2, max_length=4096)], candidate_matrix: Annotated[list[list[float]], Field(..., description='2-D array of candidate vectors. Each row is one candidate; columns must match the dimensionality of query_vector. Min 1 row, max 50,000 rows.', min_length=1, max_length=50000)], top_k: Annotated[float, Field(10, description='Number of top-ranked candidates to return. Must be between 1 and the total number of candidates. Defaults to 10.', ge=1, le=50000)], nmi_bins: Annotated[float, Field(None, description='Number of histogram bins used to discretize each continuous dimension for NMI estimation. Higher values increase fidelity for smooth distributions but raise compute cost quadratically per dimension. Valid range: 2-64. If omitted, set automatically via Sturges rule applied to the candidate count.', ge=2, le=64)], fusion_mode: Annotated[str, Field('entropy_weighted', description="Controls how NMI and cosine scores are combined. 'entropy_weighted' (default): each dimension's contribution to NMI vs cosine is weighted by its marginal entropy, making the balance data-driven. 'equal': unweighted arithmetic mean of NMI and cosine scores. Use 'equal' only for ablation studies or when you want to decouple the adaptive weighting.", min_length=5, max_length=16)]) -> dict[str, Any]:
+    """NMI+Cosine Fusion Ranking"""
+    params = {"query_vector": query_vector, "candidate_matrix": candidate_matrix, "top_k": top_k, "nmi_bins": nmi_bins, "fusion_mode": fusion_mode}
+    return await _nexus_mcp_call_core('POST', '/v1/similarity/rank', params)
 
-@_nexus_mcp.tool(name='nexus_similarity_search_api_score_vector_pair_nmi_cosine', description='Computes the full NMI-Cosine fusion score for exactly one pair of vectors, returning the composite score plus each component (cosine, nmi) individually for interpretability. Use this for auditing, threshold calibration, or explaining why two items were ranked together. Do NOT use for bulk ranking — calling this in a loop over thousands of pairs is inefficient; use rank_by_nmi_cosine_fusion instead.')
-async def score_vector_pair_nmi_cosine(vector_a: Annotated[list[float], Field(..., description='First dense float vector of the pair.', min_length=2, max_length=4096)], vector_b: Annotated[list[float], Field(..., description='Second dense float vector of the pair. Must have identical dimensionality to vector_a.', min_length=2, max_length=4096)], alpha: Annotated[float, Field(0.7, description='Mixing weight in [0.0, 1.0]. Final score = alpha * cosine + (1 - alpha) * nmi. Must match the alpha used in ranking if this call is used for threshold calibration.', ge=0.0, le=1.0)], nmi_bins: Annotated[float, Field(32, description='Number of histogram bins for NMI distribution estimation. Must match the value used in ranking calls to produce comparable scores.', ge=4, le=128)]) -> dict[str, Any]:
-    """Single-Pair NMI-Cosine Score"""
-    params = {"vector_a": vector_a, "vector_b": vector_b, "alpha": alpha, "nmi_bins": nmi_bins}
-    return await _nexus_mcp_call_core('POST', '/v1/similarity/score-pair', params)
-
-@_nexus_mcp.tool(name='nexus_similarity_search_api_compute_pairwise_nmi_cosine_matrix', description='Computes the full N x N NMI-Cosine fusion score matrix for a set of vectors. Returns a symmetric matrix where entry [i][j] is the composite similarity between vector i and vector j. Use this as input to clustering algorithms, graph construction, or duplicate detection pipelines. Do NOT use with N > 500 — the O(N^2) pairs make this expensive beyond that size; prefer rank_by_nmi_cosine_fusion with each vector as a query instead.')
-async def compute_pairwise_nmi_cosine_matrix(vector_matrix: Annotated[list[list[float]], Field(..., description='List of dense float vectors. Each pair of rows will be scored. All rows must share the same dimensionality. Maximum 500 vectors.', min_length=2, max_length=500)], alpha: Annotated[float, Field(0.7, description='Mixing weight in [0.0, 1.0] for cosine vs NMI component.', ge=0.0, le=1.0)], nmi_bins: Annotated[float, Field(32, description='Number of histogram bins for NMI estimation across all pairs.', ge=4, le=128)], vector_ids: Annotated[list[str], Field(None, description='Optional identifiers aligned with vector_matrix rows. When provided, the response labels matrix rows and columns with these IDs.', max_length=500)]) -> dict[str, Any]:
+@_nexus_mcp.tool(name='nexus_similarity_search_api_compute_pairwise_nmi_cosine_matrix', description='Computes the full N x N composite NMI+Cosine similarity matrix for a set of vectors. Each cell (i, j) is the fusion score between vector i and vector j, with entropy-based dimensional weighting derived from the full set distribution. Use when you need an all-pairs similarity structure for clustering, graph construction, or manifold analysis. Do NOT use for query-vs-candidates ranking (use rank_vectors_by_nmi_cosine_fusion instead) or for sets larger than 2,000 vectors (O(N^2 * D) cost becomes prohibitive).')
+async def compute_pairwise_nmi_cosine_matrix(vector_matrix: Annotated[list[list[float]], Field(..., description='2-D array where each row is a vector. All rows must share the same dimensionality. Min 2 rows, max 2,000 rows.', min_length=2, max_length=2000)], nmi_bins: Annotated[float, Field(None, description='Histogram bins for NMI discretization. Valid range: 2-64. Auto-set via Sturges rule if omitted.', ge=2, le=64)], diagonal_value: Annotated[float, Field(1.0, description='Value to place on the matrix diagonal (self-similarity). Typically 1.0 for normalized scores. Set to 0.0 if the matrix will be used as a distance or graph-edge weight where self-loops should be ignored.', ge=0.0, le=1.0)]) -> dict[str, Any]:
     """Pairwise Fusion Score Matrix"""
-    params = {"vector_matrix": vector_matrix, "alpha": alpha, "nmi_bins": nmi_bins, "vector_ids": vector_ids}
+    params = {"vector_matrix": vector_matrix, "nmi_bins": nmi_bins, "diagonal_value": diagonal_value}
     return await _nexus_mcp_call_core('POST', '/v1/similarity/pairwise-matrix', params)
 
-@_nexus_mcp.tool(name='nexus_similarity_search_api_calibrate_alpha_for_domain', description='Given a labeled set of vector pairs with ground-truth similarity judgments (positive/negative), finds the alpha value that maximizes ranking quality (AUC-ROC) of the NMI-Cosine fusion score over that dataset. Use this once per domain or dataset shift to choose the right alpha before deploying rank_by_nmi_cosine_fusion. Do NOT use on unlabeled data — without ground-truth labels the optimization has no signal and will return a meaningless alpha.')
-async def calibrate_alpha_for_domain(pair_vectors_a: Annotated[list[list[float]], Field(..., description='List of first vectors in each labeled pair. Must align row-by-row with pair_vectors_b and pair_labels.', min_length=10, max_length=5000)], pair_vectors_b: Annotated[list[list[float]], Field(..., description='List of second vectors in each labeled pair. Must align row-by-row with pair_vectors_a and pair_labels.', min_length=10, max_length=5000)], pair_labels: Annotated[list[float], Field(..., description='Binary ground-truth similarity labels: 1 = similar, 0 = dissimilar. Must align with pair_vectors_a and pair_vectors_b. Minimum 5 positive and 5 negative examples required.', ge=0, le=1, min_length=10, max_length=5000)], nmi_bins: Annotated[float, Field(32, description='Number of histogram bins for NMI estimation. Use the same value you plan to use in production ranking calls.', ge=4, le=128)], alpha_resolution: Annotated[float, Field(0.05, description='Step size for grid search over alpha in (0.0, 1.0). Smaller values yield finer calibration at higher compute cost. Recommended range: 0.05 to 0.01.', ge=0.01, le=0.25)]) -> dict[str, Any]:
-    """Alpha Weight Calibration"""
-    params = {"pair_vectors_a": pair_vectors_a, "pair_vectors_b": pair_vectors_b, "pair_labels": pair_labels, "nmi_bins": nmi_bins, "alpha_resolution": alpha_resolution}
-    return await _nexus_mcp_call_core('POST', '/v1/similarity/calibrate-alpha', params)
+@_nexus_mcp.tool(name='nexus_similarity_search_api_decompose_fusion_score_by_dimension', description='Returns the per-dimension breakdown of the NMI+Cosine fusion score between a query vector and a single target vector: the marginal entropy weight, raw NMI contribution, raw cosine contribution, and weighted fusion contribution for each dimension. Use when you need to explain why two vectors scored as they did, identify which dimensions drive similarity, or audit the entropy-weighting behavior on a specific pair. Do NOT use for bulk ranking or matrix computation — it is designed for single-pair interpretability, not throughput.')
+async def decompose_fusion_score_by_dimension(query_vector: Annotated[list[float], Field(..., description='Reference vector. Must have the same length as target_vector. Min 2 elements, max 4096 elements.', min_length=2, max_length=4096)], target_vector: Annotated[list[float], Field(..., description='Target vector to compare against the query. Must match query_vector dimensionality exactly.', min_length=2, max_length=4096)], reference_distribution: Annotated[list[list[float]], Field(None, description='Optional background matrix used to estimate marginal entropy weights per dimension. If omitted, entropy is estimated from query_vector and target_vector alone (two-sample estimate, lower fidelity). Providing the same candidate_matrix used in the ranking call ensures entropy weights are consistent with the ranking context. Max 50,000 rows.', min_length=2, max_length=50000)], nmi_bins: Annotated[float, Field(None, description='Histogram bins for NMI discretization. Valid range: 2-64.', ge=2, le=64)]) -> dict[str, Any]:
+    """Per-Dimension Score Decomposition"""
+    params = {"query_vector": query_vector, "target_vector": target_vector, "reference_distribution": reference_distribution, "nmi_bins": nmi_bins}
+    return await _nexus_mcp_call_core('POST', '/v1/similarity/decompose', params)
 
-@_nexus_mcp.tool(name='nexus_similarity_search_api_detect_statistical_geometric_divergence', description='For each candidate vector, computes the signed divergence between its cosine rank and its NMI rank relative to the query. High divergence flags candidates that are geometrically close but statistically independent (cosine high, NMI low) — these are the false positives that pure cosine search misses. Use this to audit an existing cosine-only ranking or to identify noise sources in a dataset. Do NOT use as a primary ranking tool — it diagnoses divergence, it does not produce a final composite ranking; use rank_by_nmi_cosine_fusion for that.')
-async def detect_statistical_geometric_divergence(query_vector: Annotated[list[float], Field(..., description='Dense float query vector used as the reference for both cosine and NMI rank computation.', min_length=2, max_length=4096)], candidate_matrix: Annotated[list[list[float]], Field(..., description='Candidate dense float vectors to analyze for rank divergence. Maximum 2000 candidates.', min_length=2, max_length=2000)], nmi_bins: Annotated[float, Field(32, description='Number of histogram bins for NMI estimation.', ge=4, le=128)], divergence_threshold: Annotated[float, Field(5, description='Minimum absolute rank divergence (in rank positions) to flag a candidate as divergent. Candidates with |cosine_rank - nmi_rank| >= this value are included in the flagged output list.', ge=1, le=1999)], candidate_ids: Annotated[list[str], Field(None, description='Optional identifiers aligned with candidate_matrix rows for labeling the divergence report.', max_length=2000)]) -> dict[str, Any]:
-    """NMI-Cosine Divergence Detector"""
-    params = {"query_vector": query_vector, "candidate_matrix": candidate_matrix, "nmi_bins": nmi_bins, "divergence_threshold": divergence_threshold, "candidate_ids": candidate_ids}
-    return await _nexus_mcp_call_core('POST', '/v1/similarity/detect-divergence', params)
+@_nexus_mcp.tool(name='nexus_similarity_search_api_estimate_dimensional_entropy_profile', description='Estimates the marginal Shannon entropy of each dimension across a vector matrix and returns the normalized entropy weights that the fusion scorer will apply internally. Use this as a diagnostic before running bulk ranking or pairwise-matrix calls, to understand which dimensions dominate the fusion score and whether the input distribution has degenerate (zero-entropy) dimensions that should be dropped. Do NOT use as a substitute for the full fusion score — it returns weights only, not similarity scores.')
+async def estimate_dimensional_entropy_profile(vector_matrix: Annotated[list[list[float]], Field(..., description='2-D array of vectors whose dimensional entropy profile you want to inspect. Min 2 rows, max 50,000 rows. Min 2 columns, max 4096 columns.', min_length=2, max_length=50000)], nmi_bins: Annotated[float, Field(None, description='Histogram bins for entropy discretization. Valid range: 2-64. Auto-set via Sturges rule if omitted.', ge=2, le=64)], flag_degenerate_threshold: Annotated[float, Field(0.01, description='Normalized entropy value below which a dimension is flagged as degenerate (near-constant, contributing near-zero information to the fusion score). Range: 0.0-0.5. Default 0.01 means dimensions with less than 1% of max possible entropy are flagged.', ge=0.0, le=0.5)]) -> dict[str, Any]:
+    """Entropy Profile Estimator"""
+    params = {"vector_matrix": vector_matrix, "nmi_bins": nmi_bins, "flag_degenerate_threshold": flag_degenerate_threshold}
+    return await _nexus_mcp_call_core('POST', '/v1/similarity/entropy-profile', params)
+
+@_nexus_mcp.tool(name='nexus_similarity_search_api_threshold_filter_by_fusion_score', description='Returns only the candidates whose NMI+Cosine fusion score against the query vector meets or exceeds a specified threshold, without returning a ranked list. Use when the downstream system needs a binary in/out decision (e.g., deduplication, membership testing, anomaly gating) and the score threshold is already calibrated. Do NOT use when you need ranked ordering or when the threshold is unknown and you want to explore score distributions — use rank_vectors_by_nmi_cosine_fusion with top_k instead.')
+async def threshold_filter_by_fusion_score(query_vector: Annotated[list[float], Field(..., description='Reference vector. Must match the dimensionality of every row in candidate_matrix. Min 2 elements, max 4096 elements.', min_length=2, max_length=4096)], candidate_matrix: Annotated[list[list[float]], Field(..., description='2-D array of candidate vectors to filter. Each row is one candidate. Min 1 row, max 50,000 rows.', min_length=1, max_length=50000)], min_fusion_score: Annotated[float, Field(..., description='Minimum composite NMI+Cosine fusion score (inclusive) for a candidate to be included in the response. Must be in [0.0, 1.0]. A value of 0.8 is a strong similarity threshold; 0.5 is permissive. Choosing a value without prior calibration via rank_vectors_by_nmi_cosine_fusion is discouraged.', ge=0.0, le=1.0)], nmi_bins: Annotated[float, Field(None, description='Histogram bins for NMI discretization. Valid range: 2-64. Should match the value used during threshold calibration to ensure score comparability.', ge=2, le=64)], fusion_mode: Annotated[str, Field('entropy_weighted', description="Score fusion mode: 'entropy_weighted' (default, data-driven weighting) or 'equal' (unweighted mean). Must match the fusion_mode used during threshold calibration.", min_length=5, max_length=16)]) -> dict[str, Any]:
+    """Fusion Score Threshold Filter"""
+    params = {"query_vector": query_vector, "candidate_matrix": candidate_matrix, "min_fusion_score": min_fusion_score, "nmi_bins": nmi_bins, "fusion_mode": fusion_mode}
+    return await _nexus_mcp_call_core('POST', '/v1/similarity/filter', params)
 
 
 # Crea el sub-app ASGI de streamable HTTP -- DEBE llamarse antes de
