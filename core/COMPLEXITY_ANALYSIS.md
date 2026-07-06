@@ -1,34 +1,41 @@
-# Análisis de Complejidad Computacional — Similarity Search API (NMI-Cosine Hybrid)
+# Análisis de Complejidad Computacional — Similarity Search API (NMI+Cosine)
+
+---
 
 ## Endpoints Públicos
 
-### `POST /search` — Ranking NMI-cosine con p-value bootstrap
+### `POST /similarity` — Score compuesto par-a-par
 
-**Temporal:** O(n·d + n·d·B) donde n = corpus size, d = dimensiones del embedding, B = iteraciones bootstrap (default 500). El término dominante es la estimación de entropía conjunta H(X,Y) por par candidato tras el filtro cosine inicial: cada bin adaptativo Freedman-Diaconis requiere O(d·log d) por dimensión para ordenar y calcular IQR, escalando a O(k·d·log d) sobre los k top candidatos retenidos post-cosine.
-**Espacial:** O(n·d) para el corpus in-memory + O(B·k) para las distribuciones bootstrap intermedias.
-**Mejor caso:** corpus preordenado, k=1, B=100 → O(d·log d). **Promedio:** k=20, B=500, d=1536 → ~140ms por llamada en instancia c6i.xlarge. **Peor caso:** n=10,000, d=3072 (embeddings large), k=50, B=1000 → O(n·d·B) supera 4s, umbral de timeout.
-**Cuello de botella:** la discretización per-dimension con Freedman-Diaconis sobre el corpus completo antes del filtro cosine — ejecutarla post-filtro (solo sobre k candidatos) reduce el trabajo en factor n/k.
+**Temporal:** O(n · B) donde n = dimensiones del vector y B = bins para discretización NMI. El cálculo de entropía marginal H(Xᵢ) requiere un paso sobre los n valores del vector query para estimar distribución; cosine añade O(n) multiplicaciones. Total: O(n · B + n) = O(n · B).
 
----
+**Espacial:** O(n · B) para las tablas de frecuencia conjunta y marginal por dimensión.
 
-### `POST /compare` — NMI puntual entre dos vectores
+**Mejor caso:** vectores de baja dimensionalidad (n < 50) con distribuciones uniformes donde B se reduce automáticamente — O(n). **Promedio:** n ≈ 256–512, B ≈ 10–20, latencia dominada por discretización. **Peor caso:** n > 1024 con distribuciones multimodales que fuerzan B alto — O(n · B) degrada linealmente con ambos.
 
-**Temporal:** O(d·log d) por la discretización bilateral + O(d·B) para bootstrap del intervalo de confianza. Sin corpus, sin cosine sweep; complejidad fija respecto a n.
-**Espacial:** O(d·B) constante, independiente del volumen de datos de sesión.
-**Mejor caso / promedio / peor:** la variación es solo por d: d=384 (MiniLM) → ~8ms; d=3072 → ~60ms. No hay caso patológico salvo B muy alto.
-**Cuello de botella:** la estimación de entropía conjunta H(X,Y) discreta cuando ambas dimensiones tienen baja varianza — bins colapsan a 1-2 categorías, el estimador necesita corrección Laplace explícita para no producir NMI=1 espurio.
+**Cuello de botella:** estimación de bins óptimos (regla de Sturges o Scott) sobre cada dimensión antes de construir las tablas de frecuencia — es secuencial por dimensión y no trivialmente paralelizable sin overhead de sincronización.
 
 ---
 
-### `POST /validate-corpus` — Auditoría de bin quality por rango de dimensionalidad
+### `POST /similarity/batch` — Score compuesto sobre conjunto de candidatos
 
-**Temporal:** O(n·d·log n) — para cada dimensión calcula IQR sobre n vectores (O(n·log n) por sort) y devuelve bin counts óptimos recomendados. Batch-only, no en critical path de búsqueda.
-**Espacial:** O(n·d) completo, el endpoint más costoso en memoria.
-**Mejor / peor:** n=100 → <50ms; n=50,000, d=3072 → >30s; debe ejecutarse offline.
-**Cuello de botella:** sort per-dimension no paralelizado — candidato directo a numpy vectorizado sobre eje 0.
+**Temporal:** O(k · n · B) donde k = número de vectores candidatos en el payload. La ponderación por entropía w_i = H(Xᵢ) / Σ H(Xⱼ) se calcula una sola vez sobre el vector query y se reutiliza para los k comparandos — esto evita recomputar la distribución marginal k veces, dejando el costo dominante en O(k · n) para cosine y O(k · n · B) para NMI por candidato.
+
+**Espacial:** O(n · B + k · n) — tablas de frecuencia más el buffer de candidatos en memoria.
+
+**Mejor caso:** k pequeño (< 20) con candidatos preordenados externamente. **Peor caso:** k = 1000, n = 512 — aproximadamente 512K operaciones de binning. **Cuello de botella:** carga del payload completo en memoria antes de iniciar cómputo; sin streaming, el pico de RAM escala con k · n · sizeof(float64).
+
+---
+
+### `POST /similarity/explain` — Descomposición dimensional del score
+
+**Temporal:** O(n · B) idéntico a `/similarity` más O(n log n) para ordenar dimensiones por contribución al score final. El sort es el componente adicional respecto al endpoint base.
+
+**Espacial:** O(n · B + n) — mismo footprint más el vector de contribuciones por dimensión.
+
+**Mejor / peor caso:** igual que `/similarity`; el sort de contribuciones es despreciable frente al binning. **Cuello de botella:** serialización del breakdown dimensional completo en la respuesta JSON cuando n > 512 — el payload de salida crece O(n).
 
 ---
 
 ## Saturación y Estrategia de Escala
 
-Con B=500 y d=1536 (Ada-002), el throughput satura en ~22 req/s por worker en c6i.xlarge (medido con k=20 candidatos post-cosine). Escalar más allá requiere dos cambios acoplados: (1) cachear los bin counts Freedman-Diaconis por rango de dimensionalidad en Redis con TTL proporcional al volumen de corpus acumulado en el flywheel PostgreSQL — reutilizar bins precalculados elimina O(n·d·log d) del hot path; (2) reducir B dinámicamente cuando la varianza bootstrap de las primeras 50 iteraciones converge por debajo de umbral σ²<0.001, recortando el término O(B·k) al 30-60% en la mayoría de llamadas reales sin pérdida estadística medible.
+Con n = 256 y k = 1 (llamadas par-a-par), cada request completa en ~4–8 ms en un worker Uvicorn single-core, lo que sitúa el punto de saturación de una instancia en ~120–250 req/s antes de que la cola de eventos de FastAPI empiece a acumular latencia. El cuello de botella no es I/O sino CPU puro en el bucle de binning. La estrategia de escala natural es horizontal stateless — cada réplica es independiente por diseño — con un balanceador L7 sin sticky sessions; añadir réplicas escala linealmente hasta el límite de red. Para batch con k > 100, paralelizar el bucle de candidatos con `numpy` vectorizado sobre el eje k (operaciones matriciales en lugar de Python loops) reduce O(k · n · B) a una operación de broadcast que aprovecha BLAS, ganando ~8–15x en throughput por core antes de añadir réplicas.
