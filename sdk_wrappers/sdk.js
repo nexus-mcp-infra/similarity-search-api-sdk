@@ -1,647 +1,393 @@
+const axios = require('axios');
 
-```javascript
-'use strict';
+const SIMILARITY_SEARCH_API_BASE_URL = process.env.SIMILARITY_SEARCH_API_BASE_URL || 'https://api.similaritysearch.io/v1';
+const SIMILARITY_SEARCH_API_TIMEOUT_MS = 30000;
 
-const https = require('https');
-const http = require('http');
-
-const SIMILARITY_SEARCH_API_BASE_URL = process.env.SIMILARITY_SEARCH_API_URL || 'https://api.similarity-search.io';
-const SIMILARITY_SEARCH_API_VERSION = 'v1';
-const DEFAULT_TIMEOUT_MS = 30000;
-const DEFAULT_BOOTSTRAP_ITERATIONS = 500;
-const DEFAULT_SIGNIFICANCE_THRESHOLD = 0.05;
-const MAX_EMBEDDING_DIMENSIONS = 4096;
-const MAX_VECTORS_PER_CALL = 1000;
-const MAX_QUERY_VECTORS = 10;
-
-class SimilaritySearchError extends Error {
-  constructor(message, statusCode, responseBody) {
-    super(message);
-    this.name = 'SimilaritySearchError';
-    this.statusCode = statusCode || null;
-    this.responseBody = responseBody || null;
-  }
-}
-
-class SimilaritySearchAuthError extends SimilaritySearchError {
+class SimilaritySearchAuthError extends Error {
   constructor(message) {
-    super(message, 401, null);
+    super(message);
     this.name = 'SimilaritySearchAuthError';
   }
 }
 
-class SimilaritySearchValidationError extends SimilaritySearchError {
+class SimilaritySearchValidationError extends Error {
   constructor(message) {
-    super(message, 422, null);
+    super(message);
     this.name = 'SimilaritySearchValidationError';
   }
 }
 
-class SimilaritySearchRateLimitError extends SimilaritySearchError {
-  constructor(retryAfterSeconds) {
-    super(`Rate limit exceeded. Retry after ${retryAfterSeconds} seconds.`, 429, null);
+class SimilaritySearchRateLimitError extends Error {
+  constructor(message, retryAfterMs) {
+    super(message);
     this.name = 'SimilaritySearchRateLimitError';
-    this.retryAfterSeconds = retryAfterSeconds;
+    this.retryAfterMs = retryAfterMs || null;
   }
 }
 
-function validateApiKey(apiKey) {
-  if (apiKey === null || apiKey === undefined) {
-    throw new SimilaritySearchAuthError(
-      'API key is required. Provide it via constructor options or SIMILARITY_SEARCH_API_KEY environment variable.'
-    );
-  }
-  if (typeof apiKey !== 'string') {
-    throw new SimilaritySearchAuthError(
-      `API key must be a string, received ${typeof apiKey}.`
-    );
-  }
-  if (apiKey.trim().length === 0) {
-    throw new SimilaritySearchAuthError(
-      'API key must not be empty.'
-    );
+class SimilaritySearchApiError extends Error {
+  constructor(message, statusCode, responseBody) {
+    super(message);
+    this.name = 'SimilaritySearchApiError';
+    this.statusCode = statusCode;
+    this.responseBody = responseBody;
   }
 }
 
-function validateEmbeddingVector(vector, label) {
-  if (!Array.isArray(vector)) {
-    throw new SimilaritySearchValidationError(
-      `${label} must be an array of numbers, received ${typeof vector}.`
-    );
+function assertNonEmptyFloatArray(value, fieldName) {
+  if (value === null || value === undefined) {
+    throw new SimilaritySearchValidationError(`'${fieldName}' must not be null or undefined`);
   }
-  if (vector.length === 0) {
-    throw new SimilaritySearchValidationError(
-      `${label} must not be empty.`
-    );
+  if (!Array.isArray(value)) {
+    throw new SimilaritySearchValidationError(`'${fieldName}' must be an array of numbers, got ${typeof value}`);
   }
-  if (vector.length > MAX_EMBEDDING_DIMENSIONS) {
-    throw new SimilaritySearchValidationError(
-      `${label} exceeds maximum allowed dimensions (${MAX_EMBEDDING_DIMENSIONS}). Received ${vector.length}.`
-    );
+  if (value.length === 0) {
+    throw new SimilaritySearchValidationError(`'${fieldName}' must not be an empty array`);
   }
-  for (let i = 0; i < vector.length; i++) {
-    const val = vector[i];
-    if (typeof val !== 'number' || !isFinite(val)) {
+  for (let i = 0; i < value.length; i++) {
+    if (typeof value[i] !== 'number' || !isFinite(value[i])) {
       throw new SimilaritySearchValidationError(
-        `${label}[${i}] must be a finite number, received ${val}.`
+        `'${fieldName}[${i}]' must be a finite number, got ${value[i]}`
       );
     }
   }
 }
 
-function validateVectorCorpus(corpus) {
-  if (!Array.isArray(corpus)) {
-    throw new SimilaritySearchValidationError(
-      `corpus must be an array of embedding vectors, received ${typeof corpus}.`
-    );
+function assertFloat01(value, fieldName) {
+  if (typeof value !== 'number' || !isFinite(value)) {
+    throw new SimilaritySearchValidationError(`'${fieldName}' must be a finite number, got ${typeof value}`);
   }
-  if (corpus.length === 0) {
-    throw new SimilaritySearchValidationError(
-      'corpus must contain at least one embedding vector.'
-    );
+  if (value < 0 || value > 1) {
+    throw new SimilaritySearchValidationError(`'${fieldName}' must be between 0 and 1 inclusive, got ${value}`);
   }
-  if (corpus.length > MAX_VECTORS_PER_CALL) {
-    throw new SimilaritySearchValidationError(
-      `corpus exceeds maximum vectors per call (${MAX_VECTORS_PER_CALL}). Received ${corpus.length}.`
-    );
+}
+
+function assertPositiveInteger(value, fieldName) {
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 1) {
+    throw new SimilaritySearchValidationError(`'${fieldName}' must be a positive integer, got ${value}`);
   }
-  const expectedDim = corpus[0].length;
-  for (let i = 0; i < corpus.length; i++) {
-    validateEmbeddingVector(corpus[i], `corpus[${i}]`);
-    if (corpus[i].length !== expectedDim) {
+}
+
+function assertNonEmptyString(value, fieldName) {
+  if (typeof value !== 'string' || value.trim().length === 0) {
+    throw new SimilaritySearchValidationError(`'${fieldName}' must be a non-empty string, got ${JSON.stringify(value)}`);
+  }
+}
+
+function assertVectorArrayConsistentDimension(vectors, queryVector) {
+  const dim = queryVector.length;
+  for (let i = 0; i < vectors.length; i++) {
+    if (!Array.isArray(vectors[i]) || vectors[i].length !== dim) {
       throw new SimilaritySearchValidationError(
-        `All corpus vectors must have the same dimensionality. corpus[0] has ${expectedDim} dims, corpus[${i}] has ${corpus[i].length} dims.`
+        `vectors[${i}] has dimension ${Array.isArray(vectors[i]) ? vectors[i].length : 'N/A'}, expected ${dim} to match query_vector`
       );
     }
   }
 }
 
-function validateQueryVectors(queries) {
-  if (!Array.isArray(queries)) {
-    throw new SimilaritySearchValidationError(
-      `queries must be an array of embedding vectors, received ${typeof queries}.`
+function buildAuthenticatedAxiosInstance(apiKey) {
+  if (!apiKey || typeof apiKey !== 'string' || apiKey.trim().length === 0) {
+    throw new SimilaritySearchAuthError(
+      'A valid API key must be provided. Set it via SimilaritySearchClient({ apiKey }) or the SIMILARITY_SEARCH_API_KEY environment variable.'
     );
   }
-  if (queries.length === 0) {
-    throw new SimilaritySearchValidationError(
-      'queries must contain at least one embedding vector.'
-    );
-  }
-  if (queries.length > MAX_QUERY_VECTORS) {
-    throw new SimilaritySearchValidationError(
-      `queries exceeds maximum per call (${MAX_QUERY_VECTORS}). Received ${queries.length}.`
-    );
-  }
-}
-
-function validateTopK(topK, corpusSize) {
-  if (topK === null || topK === undefined) return;
-  if (typeof topK !== 'number' || !Number.isInteger(topK)) {
-    throw new SimilaritySearchValidationError(
-      `topK must be an integer, received ${typeof topK} (${topK}).`
-    );
-  }
-  if (topK < 1) {
-    throw new SimilaritySearchValidationError(
-      `topK must be >= 1, received ${topK}.`
-    );
-  }
-  if (corpusSize !== undefined && topK > corpusSize) {
-    throw new SimilaritySearchValidationError(
-      `topK (${topK}) cannot exceed corpus size (${corpusSize}).`
-    );
-  }
-}
-
-function validateBootstrapIterations(iterations) {
-  if (iterations === null || iterations === undefined) return;
-  if (typeof iterations !== 'number' || !Number.isInteger(iterations)) {
-    throw new SimilaritySearchValidationError(
-      `bootstrapIterations must be an integer, received ${typeof iterations}.`
-    );
-  }
-  if (iterations < 100 || iterations > 10000) {
-    throw new SimilaritySearchValidationError(
-      `bootstrapIterations must be between 100 and 10000, received ${iterations}.`
-    );
-  }
-}
-
-function validateSignificanceThreshold(threshold) {
-  if (threshold === null || threshold === undefined) return;
-  if (typeof threshold !== 'number' || !isFinite(threshold)) {
-    throw new SimilaritySearchValidationError(
-      `significanceThreshold must be a finite number, received ${threshold}.`
-    );
-  }
-  if (threshold <= 0 || threshold >= 1) {
-    throw new SimilaritySearchValidationError(
-      `significanceThreshold must be between 0 (exclusive) and 1 (exclusive), received ${threshold}.`
-    );
-  }
-}
-
-function httpRequest(options, body, timeoutMs) {
-  return new Promise((resolve, reject) => {
-    const protocol = options.protocol === 'http:' ? http : https;
-    const payload = body ? JSON.stringify(body) : null;
-
-    const reqOptions = {
-      hostname: options.hostname,
-      port: options.port,
-      path: options.path,
-      method: options.method || 'GET',
-      headers: Object.assign({}, options.headers),
-    };
-
-    if (payload) {
-      reqOptions.headers['Content-Type'] = 'application/json';
-      reqOptions.headers['Content-Length'] = Buffer.byteLength(payload);
-    }
-
-    const req = protocol.request(reqOptions, (res) => {
-      let rawData = '';
-      res.on('data', (chunk) => { rawData += chunk; });
-      res.on('end', () => {
-        resolve({ statusCode: res.statusCode, headers: res.headers, body: rawData });
-      });
-    });
-
-    req.setTimeout(timeoutMs, () => {
-      req.destroy();
-      reject(new SimilaritySearchError(
-        `Request timed out after ${timeoutMs}ms.`, null, null
-      ));
-    });
-
-    req.on('error', (err) => {
-      reject(new SimilaritySearchError(
-        `Network error: ${err.message}`, null, null
-      ));
-    });
-
-    if (payload) {
-      req.write(payload);
-    }
-    req.end();
+  return axios.create({
+    baseURL: SIMILARITY_SEARCH_API_BASE_URL,
+    timeout: SIMILARITY_SEARCH_API_TIMEOUT_MS,
+    headers: {
+      'Authorization': `Bearer ${apiKey}`,
+      'Content-Type': 'application/json',
+      'Accept': 'application/json',
+      'X-SDK-Client': 'similarity-search-sdk-js/1.0.0',
+    },
   });
 }
 
-function parseBaseUrl(rawUrl) {
-  const trimmed = rawUrl.replace(/\/$/, '');
-  let protocol = 'https:';
-  let rest = trimmed;
-  if (trimmed.startsWith('https://')) {
-    protocol = 'https:';
-    rest = trimmed.slice(8);
-  } else if (trimmed.startsWith('http://')) {
-    protocol = 'http:';
-    rest = trimmed.slice(7);
-  }
-  const colonIdx = rest.indexOf(':');
-  const slashIdx = rest.indexOf('/');
-  let hostname, port, basePath;
-  if (colonIdx !== -1 && (slashIdx === -1 || colonIdx < slashIdx)) {
-    hostname = rest.slice(0, colonIdx);
-    const afterColon = rest.slice(colonIdx + 1);
-    const portEnd = afterColon.indexOf('/');
-    if (portEnd === -1) {
-      port = parseInt(afterColon, 10);
-      basePath = '';
-    } else {
-      port = parseInt(afterColon.slice(0, portEnd), 10);
-      basePath = afterColon.slice(portEnd);
+function mapAxiosErrorToSdkError(error) {
+  if (error.response) {
+    const { status, data } = error.response;
+    const body = data || {};
+    if (status === 401 || status === 403) {
+      return new SimilaritySearchAuthError(
+        `Authentication failed (HTTP ${status}): ${body.detail || body.message || 'Invalid or missing API key'}`
+      );
     }
-  } else if (slashIdx !== -1) {
-    hostname = rest.slice(0, slashIdx);
-    port = protocol === 'https:' ? 443 : 80;
-    basePath = rest.slice(slashIdx);
-  } else {
-    hostname = rest;
-    port = protocol === 'https:' ? 443 : 80;
-    basePath = '';
-  }
-  return { protocol, hostname, port, basePath };
-}
-
-async function dispatchApiRequest(parsedBase, apiKey, method, endpointPath, body, timeoutMs) {
-  const fullPath = `${parsedBase.basePath}/${SIMILARITY_SEARCH_API_VERSION}${endpointPath}`;
-  const options = {
-    protocol: parsedBase.protocol,
-    hostname: parsedBase.hostname,
-    port: parsedBase.port,
-    path: fullPath,
-    method,
-    headers: {
-      'Authorization': `Bearer ${apiKey}`,
-      'Accept': 'application/json',
-      'User-Agent': `similarity-search-sdk-js/1.0.0`,
-    },
-  };
-
-  const response = await httpRequest(options, body, timeoutMs);
-
-  if (response.statusCode === 401 || response.statusCode === 403) {
-    throw new SimilaritySearchAuthError(
-      'Authentication failed. Check your API key.'
+    if (status === 429) {
+      const retryAfter = error.response.headers['retry-after'];
+      const retryAfterMs = retryAfter ? parseInt(retryAfter, 10) * 1000 : null;
+      return new SimilaritySearchRateLimitError(
+        `Rate limit exceeded (HTTP 429): ${body.detail || body.message || 'Too many requests'}`,
+        retryAfterMs
+      );
+    }
+    if (status === 422) {
+      const detail = body.detail
+        ? (Array.isArray(body.detail) ? body.detail.map(e => `${e.loc ? e.loc.join('.') : 'field'}: ${e.msg}`).join('; ') : body.detail)
+        : 'Unprocessable entity';
+      return new SimilaritySearchValidationError(`Server rejected input (HTTP 422): ${detail}`);
+    }
+    return new SimilaritySearchApiError(
+      `API error (HTTP ${status}): ${body.detail || body.message || 'Unknown server error'}`,
+      status,
+      body
     );
   }
-
-  if (response.statusCode === 429) {
-    const retryAfter = response.headers['retry-after']
-      ? parseInt(response.headers['retry-after'], 10)
-      : 60;
-    throw new SimilaritySearchRateLimitError(retryAfter);
-  }
-
-  let parsed;
-  try {
-    parsed = JSON.parse(response.body);
-  } catch (e) {
-    throw new SimilaritySearchError(
-      `Failed to parse API response as JSON. Status: ${response.statusCode}. Body: ${response.body.slice(0, 200)}`,
-      response.statusCode,
-      response.body
+  if (error.code === 'ECONNABORTED' || (error.message && error.message.includes('timeout'))) {
+    return new SimilaritySearchApiError(
+      `Request timed out after ${SIMILARITY_SEARCH_API_TIMEOUT_MS}ms. Consider reducing vector dimensionality or candidate set size.`,
+      null,
+      null
     );
   }
-
-  if (response.statusCode === 422) {
-    const detail = parsed.detail
-      ? (Array.isArray(parsed.detail)
-        ? parsed.detail.map(d => `${d.loc ? d.loc.join('.') : ''}: ${d.msg}`).join('; ')
-        : String(parsed.detail))
-      : 'Validation error.';
-    throw new SimilaritySearchValidationError(detail);
-  }
-
-  if (response.statusCode >= 400) {
-    const msg = parsed.message || parsed.detail || parsed.error || `API error ${response.statusCode}`;
-    throw new SimilaritySearchError(String(msg), response.statusCode, parsed);
-  }
-
-  return parsed;
+  return new SimilaritySearchApiError(
+    `Network error: ${error.message}`,
+    null,
+    null
+  );
 }
 
 class SimilaritySearchClient {
-  constructor(options) {
-    if (options === null || options === undefined) {
-      options = {};
+  constructor({ apiKey, baseUrl } = {}) {
+    const resolvedApiKey = apiKey || process.env.SIMILARITY_SEARCH_API_KEY;
+    this._http = buildAuthenticatedAxiosInstance(resolvedApiKey);
+    if (baseUrl) {
+      if (typeof baseUrl !== 'string' || baseUrl.trim().length === 0) {
+        throw new SimilaritySearchValidationError("'baseUrl' must be a non-empty string");
+      }
+      this._http.defaults.baseURL = baseUrl.replace(/\/$/, '');
     }
-    if (typeof options !== 'object' || Array.isArray(options)) {
-      throw new SimilaritySearchValidationError(
-        'SimilaritySearchClient constructor expects an options object or no argument.'
-      );
-    }
-
-    const apiKey = options.apiKey || process.env.SIMILARITY_SEARCH_API_KEY || null;
-    validateApiKey(apiKey);
-
-    this._apiKey = apiKey;
-    this._timeoutMs = typeof options.timeoutMs === 'number' && options.timeoutMs > 0
-      ? options.timeoutMs
-      : DEFAULT_TIMEOUT_MS;
-
-    const baseUrl = options.baseUrl || SIMILARITY_SEARCH_API_BASE_URL;
-    this._parsedBase = parseBaseUrl(baseUrl);
   }
 
-  async rankByCosineNmi(params) {
-    if (params === null || params === undefined) {
+  async nmiCosineCompositeScore({ query_vector, candidate_vectors, alpha = 0.5, domain_tag = null }) {
+    assertNonEmptyFloatArray(query_vector, 'query_vector');
+    if (candidate_vectors === null || candidate_vectors === undefined) {
+      throw new SimilaritySearchValidationError("'candidate_vectors' must not be null or undefined");
+    }
+    if (!Array.isArray(candidate_vectors) || candidate_vectors.length === 0) {
+      throw new SimilaritySearchValidationError("'candidate_vectors' must be a non-empty array of vectors");
+    }
+    if (candidate_vectors.length > 50000) {
       throw new SimilaritySearchValidationError(
-        'rankByCosineNmi requires a params object with at least { queryVector, corpus }.'
+        `'candidate_vectors' exceeds maximum of 50000 items per request, got ${candidate_vectors.length}`
       );
     }
-    if (typeof params !== 'object' || Array.isArray(params)) {
-      throw new SimilaritySearchValidationError(
-        `rankByCosineNmi params must be an object, received ${typeof params}.`
-      );
-    }
-
-    const { queryVector, corpus, topK, bootstrapIterations, significanceThreshold, metadata } = params;
-
-    validateEmbeddingVector(queryVector, 'queryVector');
-    validateVectorCorpus(corpus);
-
-    for (let i = 0; i < corpus.length; i++) {
-      if (corpus[i].length !== queryVector.length) {
-        throw new SimilaritySearchValidationError(
-          `queryVector has ${queryVector.length} dims but corpus[${i}] has ${corpus[i].length} dims. All vectors must share dimensionality.`
-        );
+    candidate_vectors.forEach((vec, i) => assertNonEmptyFloatArray(vec, `candidate_vectors[${i}]`));
+    assertVectorArrayConsistentDimension(candidate_vectors, query_vector);
+    assertFloat01(alpha, 'alpha');
+    if (domain_tag !== null && domain_tag !== undefined) {
+      assertNonEmptyString(domain_tag, 'domain_tag');
+      if (domain_tag.length > 64) {
+        throw new SimilaritySearchValidationError("'domain_tag' must not exceed 64 characters");
       }
     }
 
-    validateTopK(topK, corpus.length);
-    validateBootstrapIterations(bootstrapIterations);
-    validateSignificanceThreshold(significanceThreshold);
+    const payload = { query_vector, candidate_vectors, alpha };
+    if (domain_tag) payload.domain_tag = domain_tag;
 
-    if (metadata !== null && metadata !== undefined && typeof metadata !== 'object') {
-      throw new SimilaritySearchValidationError(
-        `metadata must be an object or omitted, received ${typeof metadata}.`
-      );
+    try {
+      const response = await this._http.post('/score/nmi-cosine-composite', payload);
+      return response.data;
+    } catch (err) {
+      throw mapAxiosErrorToSdkError(err);
     }
-
-    const body = {
-      query_vector: queryVector,
-      corpus,
-      top_k: topK !== undefined ? topK : null,
-      bootstrap_iterations: bootstrapIterations !== undefined ? bootstrapIterations : DEFAULT_BOOTSTRAP_ITERATIONS,
-      significance_threshold: significanceThreshold !== undefined ? significanceThreshold : DEFAULT_SIGNIFICANCE_THRESHOLD,
-    };
-    if (metadata) body.metadata = metadata;
-
-    return dispatchApiRequest(
-      this._parsedBase, this._apiKey, 'POST', '/rank/cosine-nmi', body, this._timeoutMs
-    );
   }
 
-  async rankBatchQueriesByNmi(params) {
-    if (params === null || params === undefined) {
+  async rankedNmiCosineSearch({ query_vector, candidate_vectors, alpha = 0.5, top_k = 10, domain_tag = null }) {
+    assertNonEmptyFloatArray(query_vector, 'query_vector');
+    if (!Array.isArray(candidate_vectors) || candidate_vectors.length === 0) {
+      throw new SimilaritySearchValidationError("'candidate_vectors' must be a non-empty array of vectors");
+    }
+    if (candidate_vectors.length > 50000) {
       throw new SimilaritySearchValidationError(
-        'rankBatchQueriesByNmi requires a params object with at least { queryVectors, corpus }.'
+        `'candidate_vectors' exceeds maximum of 50000 items per request, got ${candidate_vectors.length}`
       );
     }
-    if (typeof params !== 'object' || Array.isArray(params)) {
+    candidate_vectors.forEach((vec, i) => assertNonEmptyFloatArray(vec, `candidate_vectors[${i}]`));
+    assertVectorArrayConsistentDimension(candidate_vectors, query_vector);
+    assertFloat01(alpha, 'alpha');
+    assertPositiveInteger(top_k, 'top_k');
+    if (top_k > candidate_vectors.length) {
       throw new SimilaritySearchValidationError(
-        `rankBatchQueriesByNmi params must be an object, received ${typeof params}.`
+        `'top_k' (${top_k}) cannot exceed the number of candidate_vectors (${candidate_vectors.length})`
       );
     }
-
-    const { queryVectors, corpus, topK, bootstrapIterations, significanceThreshold } = params;
-
-    validateQueryVectors(queryVectors);
-    validateVectorCorpus(corpus);
-
-    const expectedDim = queryVectors[0].length;
-    for (let i = 0; i < queryVectors.length; i++) {
-      validateEmbeddingVector(queryVectors[i], `queryVectors[${i}]`);
-      if (queryVectors[i].length !== expectedDim) {
-        throw new SimilaritySearchValidationError(
-          `All query vectors must share dimensionality. queryVectors[0] has ${expectedDim} dims, queryVectors[${i}] has ${queryVectors[i].length} dims.`
-        );
+    if (domain_tag !== null && domain_tag !== undefined) {
+      assertNonEmptyString(domain_tag, 'domain_tag');
+      if (domain_tag.length > 64) {
+        throw new SimilaritySearchValidationError("'domain_tag' must not exceed 64 characters");
       }
     }
 
-    for (let i = 0; i < corpus.length; i++) {
-      if (corpus[i].length !== expectedDim) {
-        throw new SimilaritySearchValidationError(
-          `Query vectors have ${expectedDim} dims but corpus[${i}] has ${corpus[i].length} dims.`
-        );
-      }
+    const payload = { query_vector, candidate_vectors, alpha, top_k };
+    if (domain_tag) payload.domain_tag = domain_tag;
+
+    try {
+      const response = await this._http.post('/search/ranked-nmi-cosine', payload);
+      return response.data;
+    } catch (err) {
+      throw mapAxiosErrorToSdkError(err);
     }
-
-    validateTopK(topK, corpus.length);
-    validateBootstrapIterations(bootstrapIterations);
-    validateSignificanceThreshold(significanceThreshold);
-
-    const body = {
-      query_vectors: queryVectors,
-      corpus,
-      top_k: topK !== undefined ? topK : null,
-      bootstrap_iterations: bootstrapIterations !== undefined ? bootstrapIterations : DEFAULT_BOOTSTRAP_ITERATIONS,
-      significance_threshold: significanceThreshold !== undefined ? significanceThreshold : DEFAULT_SIGNIFICANCE_THRESHOLD,
-    };
-
-    return dispatchApiRequest(
-      this._parsedBase, this._apiKey, 'POST', '/rank/batch-cosine-nmi', body, this._timeoutMs
-    );
   }
 
-  async estimateJointEntropyProfile(params) {
-    if (params === null || params === undefined) {
+  async pairwiseNmiCosineMatrix({ vectors, alpha = 0.5, domain_tag = null }) {
+    if (!Array.isArray(vectors) || vectors.length < 2) {
+      throw new SimilaritySearchValidationError("'vectors' must be an array of at least 2 vectors");
+    }
+    if (vectors.length > 1000) {
       throw new SimilaritySearchValidationError(
-        'estimateJointEntropyProfile requires a params object with { vectorA, vectorB }.'
+        `'vectors' exceeds maximum of 1000 items for pairwise matrix (would produce ${vectors.length * vectors.length} scores), got ${vectors.length}`
       );
     }
-    if (typeof params !== 'object' || Array.isArray(params)) {
-      throw new SimilaritySearchValidationError(
-        `estimateJointEntropyProfile params must be an object, received ${typeof params}.`
-      );
-    }
-
-    const { vectorA, vectorB, binStrategy } = params;
-
-    validateEmbeddingVector(vectorA, 'vectorA');
-    validateEmbeddingVector(vectorB, 'vectorB');
-
-    if (vectorA.length !== vectorB.length) {
-      throw new SimilaritySearchValidationError(
-        `vectorA (${vectorA.length} dims) and vectorB (${vectorB.length} dims) must have the same dimensionality.`
-      );
-    }
-
-    const allowedBinStrategies = ['freedman-diaconis', 'scott', 'fixed-16', 'fixed-32'];
-    if (binStrategy !== null && binStrategy !== undefined) {
-      if (!allowedBinStrategies.includes(binStrategy)) {
-        throw new SimilaritySearchValidationError(
-          `binStrategy must be one of ${allowedBinStrategies.join(', ')}, received '${binStrategy}'.`
-        );
+    vectors.forEach((vec, i) => assertNonEmptyFloatArray(vec, `vectors[${i}]`));
+    assertVectorArrayConsistentDimension(vectors.slice(1), vectors[0]);
+    assertFloat01(alpha, 'alpha');
+    if (domain_tag !== null && domain_tag !== undefined) {
+      assertNonEmptyString(domain_tag, 'domain_tag');
+      if (domain_tag.length > 64) {
+        throw new SimilaritySearchValidationError("'domain_tag' must not exceed 64 characters");
       }
     }
 
-    const body = {
-      vector_a: vectorA,
-      vector_b: vectorB,
-      bin_strategy: binStrategy || 'freedman-diaconis',
-    };
+    const payload = { vectors, alpha };
+    if (domain_tag) payload.domain_tag = domain_tag;
 
-    return dispatchApiRequest(
-      this._parsedBase, this._apiKey, 'POST', '/entropy/joint-profile', body, this._timeoutMs
-    );
+    try {
+      const response = await this._http.post('/matrix/pairwise-nmi-cosine', payload);
+      return response.data;
+    } catch (err) {
+      throw mapAxiosErrorToSdkError(err);
+    }
   }
 
-  async fetchNmiSignificanceBootstrap(params) {
-    if (params === null || params === undefined) {
-      throw new SimilaritySearchValidationError(
-        'fetchNmiSignificanceBootstrap requires a params object with { vectorA, vectorB, bootstrapIterations }.'
-      );
-    }
-    if (typeof params !== 'object' || Array.isArray(params)) {
-      throw new SimilaritySearchValidationError(
-        `fetchNmiSignificanceBootstrap params must be an object, received ${typeof params}.`
-      );
+  async suggestOptimalAlphaForDomain({ domain_tag }) {
+    assertNonEmptyString(domain_tag, 'domain_tag');
+    if (domain_tag.length > 64) {
+      throw new SimilaritySearchValidationError("'domain_tag' must not exceed 64 characters");
     }
 
-    const { vectorA, vectorB, bootstrapIterations, confidenceLevel } = params;
+    try {
+      const response = await this._http.get('/alpha/domain-suggestion', {
+        params: { domain_tag },
+      });
+      return response.data;
+    } catch (err) {
+      throw mapAxiosErrorToSdkError(err);
+    }
+  }
 
-    validateEmbeddingVector(vectorA, 'vectorA');
-    validateEmbeddingVector(vectorB, 'vectorB');
-
-    if (vectorA.length !== vectorB.length) {
+  async duplicateDetectionByNmiCosineThreshold({ vectors, ids = null, alpha = 0.5, composite_threshold = 0.85, domain_tag = null }) {
+    if (!Array.isArray(vectors) || vectors.length < 2) {
+      throw new SimilaritySearchValidationError("'vectors' must be an array of at least 2 vectors");
+    }
+    if (vectors.length > 10000) {
       throw new SimilaritySearchValidationError(
-        `vectorA (${vectorA.length} dims) and vectorB (${vectorB.length} dims) must have the same dimensionality.`
+        `'vectors' exceeds maximum of 10000 items for duplicate detection, got ${vectors.length}`
       );
     }
-
-    validateBootstrapIterations(bootstrapIterations);
-
-    if (confidenceLevel !== null && confidenceLevel !== undefined) {
-      if (typeof confidenceLevel !== 'number' || !isFinite(confidenceLevel)) {
+    vectors.forEach((vec, i) => assertNonEmptyFloatArray(vec, `vectors[${i}]`));
+    assertVectorArrayConsistentDimension(vectors.slice(1), vectors[0]);
+    assertFloat01(alpha, 'alpha');
+    assertFloat01(composite_threshold, 'composite_threshold');
+    if (composite_threshold < 0.5) {
+      throw new SimilaritySearchValidationError(
+        `'composite_threshold' below 0.5 will produce excessive false positives in duplicate detection; minimum accepted is 0.5, got ${composite_threshold}`
+      );
+    }
+    if (ids !== null && ids !== undefined) {
+      if (!Array.isArray(ids) || ids.length !== vectors.length) {
         throw new SimilaritySearchValidationError(
-          `confidenceLevel must be a finite number, received ${confidenceLevel}.`
+          `'ids' must be an array of the same length as 'vectors' (${vectors.length}), got ${Array.isArray(ids) ? ids.length : typeof ids}`
         );
       }
-      if (confidenceLevel <= 0 || confidenceLevel >= 1) {
-        throw new SimilaritySearchValidationError(
-          `confidenceLevel must be between 0 (exclusive) and 1 (exclusive), received ${confidenceLevel}.`
-        );
+      ids.forEach((id, i) => {
+        if (typeof id !== 'string' && typeof id !== 'number') {
+          throw new SimilaritySearchValidationError(`'ids[${i}]' must be a string or number, got ${typeof id}`);
+        }
+      });
+    }
+    if (domain_tag !== null && domain_tag !== undefined) {
+      assertNonEmptyString(domain_tag, 'domain_tag');
+      if (domain_tag.length > 64) {
+        throw new SimilaritySearchValidationError("'domain_tag' must not exceed 64 characters");
       }
     }
 
-    const body = {
-      vector_a: vectorA,
-      vector_b: vectorB,
-      bootstrap_iterations: bootstrapIterations !== undefined ? bootstrapIterations : DEFAULT_BOOTSTRAP_ITERATIONS,
-      confidence_level: confidenceLevel !== undefined ? confidenceLevel : 0.95,
-    };
+    const payload = { vectors, alpha, composite_threshold };
+    if (ids) payload.ids = ids;
+    if (domain_tag) payload.domain_tag = domain_tag;
 
-    return dispatchApiRequest(
-      this._parsedBase, this._apiKey, 'POST', '/bootstrap/nmi-significance', body, this._timeoutMs
-    );
+    try {
+      const response = await this._http.post('/duplicates/nmi-cosine-threshold', payload);
+      return response.data;
+    } catch (err) {
+      throw mapAxiosErrorToSdkError(err);
+    }
   }
 
   async mainMethod(data) {
     if (data === null || data === undefined) {
       throw new SimilaritySearchValidationError(
-        'mainMethod requires a data object. For ranked similarity search, provide { queryVector, corpus }. For batch queries, provide { queryVectors, corpus }.'
+        "'data' must not be null or undefined. Expected an object with at least 'query_vector' and 'candidate_vectors'."
       );
     }
     if (typeof data !== 'object' || Array.isArray(data)) {
       throw new SimilaritySearchValidationError(
-        `mainMethod data must be an object, received ${typeof data}.`
+        "'data' must be a plain object. Expected keys: query_vector, candidate_vectors, and optionally alpha, top_k, domain_tag."
       );
     }
+    const { query_vector, candidate_vectors, alpha, top_k, domain_tag } = data;
+    return this.rankedNmiCosineSearch({
+      query_vector,
+      candidate_vectors,
+      alpha: alpha !== undefined ? alpha : 0.5,
+      top_k: top_k !== undefined ? top_k : 10,
+      domain_tag: domain_tag || null,
+    });
+  }
+}
 
-    if (Array.isArray(data.queryVectors)) {
-      return this.rankBatchQueriesByNmi(data);
+function createSimilaritySearchClient(options = {}) {
+  return new SimilaritySearchClient(options);
+}
+
+const _defaultClient = {
+  _instance: null,
+  _getOrCreate() {
+    if (!this._instance) {
+      const apiKey = process.env.SIMILARITY_SEARCH_API_KEY;
+      if (!apiKey) {
+        throw new SimilaritySearchAuthError(
+          'No API key found. Set SIMILARITY_SEARCH_API_KEY in your environment or instantiate SimilaritySearchClient({ apiKey }) explicitly.'
+        );
+      }
+      this._instance = new SimilaritySearchClient({ apiKey });
     }
-
-    if (Array.isArray(data.queryVector)) {
-      return this.rankByCosineNmi(data);
-    }
-
-    throw new SimilaritySearchValidationError(
-      'mainMethod data must include either queryVector (single query) or queryVectors (batch queries), along with a corpus array.'
-    );
-  }
-}
-
-function createSimilaritySearchClient(options) {
-  return new SimilaritySearchClient(options || {});
-}
-
-const _defaultInstance = (() => {
-  const envKey = process.env.SIMILARITY_SEARCH_API_KEY;
-  if (envKey) {
-    try {
-      return new SimilaritySearchClient({ apiKey: envKey });
-    } catch (e) {
-      return null;
-    }
-  }
-  return null;
-})();
-
-async function mainMethod(data) {
-  if (!_defaultInstance) {
-    throw new SimilaritySearchAuthError(
-      'No default client available. Set SIMILARITY_SEARCH_API_KEY environment variable or use createClient() with explicit options.'
-    );
-  }
-  return _defaultInstance.mainMethod(data);
-}
-
-async function rankByCosineNmi(params) {
-  if (!_defaultInstance) {
-    throw new SimilaritySearchAuthError(
-      'No default client available. Set SIMILARITY_SEARCH_API_KEY environment variable or use createClient().'
-    );
-  }
-  return _defaultInstance.rankByCosineNmi(params);
-}
-
-async function rankBatchQueriesByNmi(params) {
-  if (!_defaultInstance) {
-    throw new SimilaritySearchAuthError(
-      'No default client available. Set SIMILARITY_SEARCH_API_KEY environment variable or use createClient().'
-    );
-  }
-  return _defaultInstance.rankBatchQueriesByNmi(params);
-}
-
-async function estimateJointEntropyProfile(params) {
-  if (!_defaultInstance) {
-    throw new SimilaritySearchAuthError(
-      'No default client available. Set SIMILARITY_SEARCH_API_KEY environment variable or use createClient().'
-    );
-  }
-  return _defaultInstance.estimateJointEntropyProfile(params);
-}
-
-async function fetchNmiSignificanceBootstrap(params) {
-  if (!_defaultInstance) {
-    throw new SimilaritySearchAuthError(
-      'No default client available. Set SIMILARITY_SEARCH_API_KEY environment variable or use createClient().'
-    );
-  }
-  return _defaultInstance.fetchNmiSignificanceBootstrap(params);
-}
-
-module.exports = {
-  createClient: createSimilaritySearchClient,
-  SimilaritySearchClient,
-  SimilaritySearchError,
-  SimilaritySearchAuthError,
-  SimilaritySearchValidationError,
-  SimilaritySearchRateLimitError,
-  mainMethod,
-  rankByCosineNmi,
-  rankBatchQueriesByNmi,
-  estimateJointEntropyProfile,
-  fetchNmiSignificanceBootstrap,
-  DEFAULT_BOOTSTRAP_ITERATIONS,
-  DEFAULT_SIGNIFICANCE_THRESHOLD,
-  MAX_EMBEDDING_DIMENSIONS,
-  MAX_VECTORS_PER_CALL,
-  MAX_QUERY_VECTORS,
+    return this._instance;
+  },
+  async mainMethod(data) {
+    return this._getOrCreate().mainMethod(data);
+  },
+  async nmiCosineCompositeScore(params) {
+    return this._getOrCreate().nmiCosineCompositeScore(params);
+  },
+  async rankedNmiCosineSearch(params) {
+    return this._getOrCreate().rankedNmiCosineSearch(params);
+  },
+  async pairwiseNmiCosineMatrix(params) {
+    return this._getOrCreate().pairwiseNmiCosineMatrix(params);
+  },
+  async suggestOptimalAlphaForDomain(params) {
+    return this._getOrCreate().suggestOptimalAlphaForDomain(params);
+  },
+  async duplicateDetectionByNmiCosineThreshold(params) {
+    return this._getOrCreate().duplicateDetectionByNmiCosineThreshold(params);
+  },
 };
-```
+
+module.exports = _defaultClient;
+module.exports.SimilaritySearchClient = SimilaritySearchClient;
+module.exports.createSimilaritySearchClient = createSimilaritySearchClient;
+module.exports.SimilaritySearchAuthError = SimilaritySearchAuthError;
+module.exports.SimilaritySearchValidationError = SimilaritySearchValidationError;
+module.exports.SimilaritySearchRateLimitError = SimilaritySearchRateLimitError;
+module.exports.SimilaritySearchApiError = SimilaritySearchApiError;
