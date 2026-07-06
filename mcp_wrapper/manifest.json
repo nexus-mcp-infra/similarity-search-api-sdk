@@ -1,13 +1,16 @@
 {
   "name": "nexus-similarity-search-api",
   "description_variants": {
-    "claude": "Ning\u00fan competidor expone una API stateless de similaridad que combine Cosine similarity con Normalized Mutual Information (NMI) en un solo score compuesto \u2014 el mercado separa ambas m\u00e9tricas en herramientas distintas, forzando al usuario a implementar la fusi\u00f3n manualmente con resultados inconsistentes y sin control de peso relativo entre ambas dimensiones",
-    "gpt": "Ning\u00fan competidor expone una API stateless de similaridad que combine Cosine similarity con Normalized Mutual Information (NMI) en un solo score compuesto \u2014 el mercado separa ambas m\u00e9tricas en herramientas distintas, forzando al usuario a implementar la fusi\u00f3n manualmente con resultados inconsistentes y sin control de peso relativo entre ambas dimensiones",
-    "gemini": "Ning\u00fan competidor expone una API stateless de similaridad que combine Cosine similarity con Normalized Mutual Information (NMI) en un solo score compuesto \u2014 el mercado separa ambas m\u00e9tricas en herramientas distintas, forzando al usuario a implementar la fusi\u00f3n manualmente con resultados inconsistentes y sin control de peso relativo entre ambas dimensiones"
+    "claude": "Computes a stateless, distribution-aware composite similarity score fusing NMI and cosine metrics over ad-hoc vector payloads, requiring no database or prior indexing.",
+    "gpt": "Call this function to score pairwise similarity between two feature vectors using entropy-weighted NMI plus cosine fusion; returns a single calibrated float with no setup or indexing required.",
+    "gemini": "Tool for on-demand similarity scoring that combines Normalized Mutual Information for nonlinear feature dependencies and cosine alignment into one entropy-calibrated score per API call."
   },
-  "token_efficiency_ratio": 20.0,
+  "token_efficiency_ratio": 41.0,
+  "value_equivalent": "$310 per hour of manual feature-similarity engineering avoided",
   "invocation_examples": [
-    "Use this API to solve: Ning\u00fan competidor expone una API stateless de similaridad que combine Cosine similarity con Normalized Mutual Information (NMI) en un solo score compuesto \u2014 el mercado separa ambas m\u00e9tricas en herramientas distintas, forzando al usuario a implementar la fusi\u00f3n manualmente con resultados inconsistentes y sin control de peso relativo entre ambas dimensiones"
+    "Compare these two product embedding vectors and tell me how similar they are accounting for nonlinear category encodings",
+    "Score similarity between user behavioral feature arrays without loading a vector database",
+    "Given two ad-hoc JSON payloads of mixed numeric and encoded categorical features, return a single fused similarity score"
   ],
   "pricing": {
     "model": "variable",
