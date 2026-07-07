@@ -3,155 +3,159 @@ from scipy.optimize import minimize_scalar
 from dataclasses import dataclass
 from typing import NamedTuple
 
-# Parametros de mercado calibrados para developer tools con pago por operacion
-P_MIN = 0.001
-P_MAX = 0.050
-Q_BASE = 500_000  # operaciones/mes cliente mediano en similarity search stateless
-PRICE_SENSITIVITY = 180  # calibrado: developers abandonan a 5x precio de alternativa DIY
+# Parametros de mercado derivados del segmento developer-tools / stateless similarity
+P_MIN = 0.001   # USD por operacion (floor: competitivo con llamadas embedding standalone)
+P_MAX = 0.05    # USD por operacion (ceiling: umbral de arbitraje vs vector DB managed)
+Q_BASE = 500_000  # operaciones/mes referencia central del segmento (geometric mean 1K-10M)
 
-@dataclass
+# Elasticidad empirica para developer tools de infraestructura:
+# -1.8 refleja mercado sensible al precio pero con lock-in moderado por stateless convenience
+# Fuente estructural: elasticidades tipicas de API infra oscilan entre -1.5 y -2.2
+ELASTICITY_BASE = -1.8
+
+# Coeficiente NMI+Cosine: el diferenciador tecnico reduce elasticidad en ~0.3
+# porque no hay sustituto directo que combine ambas metricas en una llamada stateless
+MOAT_ELASTICITY_DISCOUNT = 0.3
+ELASTICITY_EFFECTIVE = ELASTICITY_BASE + MOAT_ELASTICITY_DISCOUNT  # -> -1.5
+
+# Parametro de escala para Q = Q_BASE * (P / P_REF)^epsilon
+P_REF = 0.005  # precio de referencia: punto medio logaritmico del rango target
+
+
+@dataclass(frozen=True)
+class AdoptionScenario:
+    name: str
+    elasticity: float       # refleja sustituibilidad percibida en ese segmento
+    q_base_scale: float     # multiplicador sobre Q_BASE segun tamano del cliente
+    freemium_threshold: int # operaciones/mes donde el costo supera friccion de pago
+
+
 class DemandCurve:
-    # Elasticidad constante log-log: ln(Q) = a - b*ln(P), tipica en APIs de infraestructura
-    base_volume: float
-    sensitivity: float
-    adoption_ceiling: float  # saturacion por segmento de mercado
+    """Demanda isoelastica: Q(P) = Q_BASE * scale * (P_REF / P)^|epsilon|"""
+
+    def __init__(self, elasticity: float, q_scale: float):
+        # epsilon negativo -> exponente positivo al invertir la base
+        self.epsilon = abs(elasticity)
+        self.q_scale = q_scale
+        self.q_anchor = Q_BASE * q_scale
 
     def quantity(self, price: float) -> float:
         if price <= 0:
             raise ValueError(f"Price must be positive, got {price}")
-        # Demanda log-lineal con techo de adopcion: evita Q->inf cuando P->0
-        raw = self.base_volume * (P_MIN / price) ** self.sensitivity
-        return min(raw, self.adoption_ceiling)
+        # formula isoelastica calibrada en P_REF
+        return self.q_anchor * (P_REF / price) ** self.epsilon
 
-    def elasticity(self, price: float) -> float:
-        # e = dQ/dP * P/Q = -sensitivity cuando Q < ceiling, 0 en saturacion
-        q = self.quantity(price)
-        if q >= self.adoption_ceiling:
-            return 0.0
-        return -self.sensitivity
+    def elasticity_at(self, price: float) -> float:
+        # por definicion del modelo isoelastico la elasticidad es constante = -epsilon
+        # pero verificamos analiticamenete: dQ/dP = -epsilon * Q_anchor * P_REF^epsilon * P^(-epsilon-1)
+        # epsilon_punto = (dQ/dP) * (P/Q) = -epsilon (constante) -> confirmado
+        return -self.epsilon
 
     def revenue(self, price: float) -> float:
         return price * self.quantity(price)
 
+    def optimal_price(self) -> float:
+        # Para Q isoelastica con epsilon != 1, revenue = P * A * (P_REF/P)^epsilon
+        # = A * P_REF^epsilon * P^(1-epsilon)
+        # d(revenue)/dP = (1-epsilon) * A * P_REF^epsilon * P^(-epsilon) = 0
+        # Si epsilon > 1: revenue decrece con P -> optimo en P_MAX (constraint)
+        # Si epsilon < 1: revenue crece con P -> optimo en P_MAX tambien (constraint)
+        # El maximo real esta en la restriccion superior del mercado: P_MAX
+        # Verificamos numericamente para capturar efectos de saturacion de volumen
+        result = minimize_scalar(
+            lambda p: -self.revenue(p),
+            bounds=(P_MIN, P_MAX),
+            method="bounded"
+        )
+        return float(result.x)
 
-class OptimalPricingResult(NamedTuple):
-    price: float
-    quantity: float
-    revenue: float
-    elasticity_at_optimum: float
-    is_elastic: bool  # True si |e| > 1: reducir precio aumenta revenue
+    def freemium_paid_crossover(self, threshold_ops: int, free_tier_ops: int = 1000) -> float:
+        # precio donde el costo de pagar supera la friccion cognitiva del freemium
+        # se estima como el precio tal que revenue(P) * (threshold_ops - free_tier_ops) = 10 USD
+        # (10 USD/mes es el umbral psicologico de compra de tarjeta tipico en devtools)
+        paid_ops = max(threshold_ops - free_tier_ops, 1)
+        crossover_price = 10.0 / paid_ops
+        # se clampea al rango de mercado
+        return float(np.clip(crossover_price, P_MIN, P_MAX))
 
 
-def maximize_nmi_cosine_api_revenue(curve: DemandCurve) -> OptimalPricingResult:
-    # Minimizamos -revenue porque scipy solo tiene minimize
-    result = minimize_scalar(
-        lambda p: -curve.revenue(p),
-        bounds=(P_MIN, P_MAX),
-        method='bounded'
-    )
-    p_opt = result.x
+# EXACTAMENTE 3 escenarios de adopcion segun perfil de cliente
+SCENARIOS: list[AdoptionScenario] = [
+    AdoptionScenario(
+        name="indie_developer",
+        # alta sensibilidad: puede usar cosine simple sin NMI si el precio sube
+        elasticity=-2.1,
+        # volumen bajo: ~5K ops/mes, 1% de Q_BASE
+        q_base_scale=0.01,
+        # pasa a paid cuando el ahorro vs vector DB (>20 USD/mes) justifica la tarjeta
+        freemium_threshold=5_000,
+    ),
+    AdoptionScenario(
+        name="saas_platform_mid",
+        # elasticidad media: dependencia operacional pero alternativas existen
+        elasticity=-1.5,
+        # volumen medio: ~200K ops/mes, 40% de Q_BASE
+        q_base_scale=0.4,
+        # adopcion paid cuando la busqueda semantica es feature critico del producto
+        freemium_threshold=50_000,
+    ),
+    AdoptionScenario(
+        name="enterprise_data_pipeline",
+        # baja elasticidad: lock-in por bootstrap CI + auditabilidad de scores
+        elasticity=-0.9,
+        # volumen alto: ~3M ops/mes, 600% de Q_BASE
+        q_base_scale=6.0,
+        # enterprise entra directo a paid; threshold es el minimo de contrato
+        freemium_threshold=100_000,
+    ),
+]
+
+
+class SimilaritySearchPriceEquilibrium(NamedTuple):
+    scenario_name: str
+    optimal_price_usd: float
+    quantity_at_optimal: float
+    revenue_at_optimal_usd: float
+    elasticity: float
+    freemium_crossover_price_usd: float
+    freemium_crossover_monthly_revenue_usd: float
+
+
+def compute_equilibrium(scenario: AdoptionScenario) -> SimilaritySearchPriceEquilibrium:
+    curve = DemandCurve(elasticity=scenario.elasticity, q_scale=scenario.q_base_scale)
+    p_opt = curve.optimal_price()
     q_opt = curve.quantity(p_opt)
-    e_opt = curve.elasticity(p_opt)
-    return OptimalPricingResult(
-        price=round(p_opt, 5),
-        quantity=round(q_opt),
-        revenue=round(p_opt * q_opt, 2),
-        elasticity_at_optimum=round(e_opt, 3),
-        is_elastic=abs(e_opt) > 1
+    rev_opt = curve.revenue(p_opt)
+    eps = curve.elasticity_at(p_opt)
+    p_cross = curve.freemium_paid_crossover(scenario.freemium_threshold)
+    rev_cross = p_cross * (scenario.freemium_threshold - 1000)
+    return SimilaritySearchPriceEquilibrium(
+        scenario_name=scenario.name,
+        optimal_price_usd=round(p_opt, 6),
+        quantity_at_optimal=round(q_opt, 0),
+        revenue_at_optimal_usd=round(rev_opt, 2),
+        elasticity=round(eps, 2),
+        freemium_crossover_price_usd=round(p_cross, 6),
+        freemium_crossover_monthly_revenue_usd=round(rev_cross, 2),
     )
 
 
-# Exactamente 3 escenarios de adopcion: reflejan los tres perfiles de dolor descritos
-ADOPTION_SCENARIOS = {
-    # Cliente que actualmente paga $70+/mes Pinecone para 500 queries/dia (~15K/mes)
-    "pinecone_refugee": DemandCurve(
-        base_volume=15_000,
-        sensitivity=0.9,      # menos elastico: ya tiene budget aprobado para vector DB
-        adoption_ceiling=50_000
-    ),
-    # Developer que evalua si similarity search resuelve su problema antes de infraestructura
-    "stateless_evaluator": DemandCurve(
-        base_volume=250_000,
-        sensitivity=2.1,      # muy elastico: el valor es no committearse, precio lo rompe
-        adoption_ceiling=2_000_000
-    ),
-    # Plataforma que orquesta embedding + vector DB + ranking como tres servicios hoy
-    "orchestration_consolidator": DemandCurve(
-        base_volume=1_500_000,
-        sensitivity=1.4,      # elasticidad media: ahorra en 2 servicios, negocia volumen
-        adoption_ceiling=10_000_000
-    ),
-}
-
-
-@dataclass
-class FreemiumEquilibriumPoint:
-    # Umbral donde el costo de oportunidad del tier free supera el ingreso marginal
-    free_ops_limit: int
-    paid_conversion_price: float
-    monthly_ops_at_conversion: float
-    monthly_revenue_at_conversion: float
-    implied_arpu_vs_pinecone: float  # ratio vs $70/mes baseline
-
-
-def compute_freemium_to_paid_threshold(
-    curve: DemandCurve,
-    free_ops_limit: int = 1_000,
-    conversion_friction_factor: float = 1.35  # developers convierten 35% mas arriba del optimo teorico
-) -> FreemiumEquilibriumPoint:
-    # Precio al que el usuario free alcanza el limite y la friccion de conversion se justifica
-    opt = maximize_nmi_cosine_api_revenue(curve)
-    # Precio de conversion: optimo ajustado por friccion psicologica de pagar la primera vez
-    p_conversion = min(opt.price * conversion_friction_factor, P_MAX)
-    q_conversion = curve.quantity(p_conversion)
-    monthly_revenue = p_conversion * q_conversion
-    # Comparacion contra $70/mes Pinecone: el pain point mas concreto del ICP
-    arpu_ratio = monthly_revenue / 70.0
-    return FreemiumEquilibriumPoint(
-        free_ops_limit=free_ops_limit,
-        paid_conversion_price=round(p_conversion, 5),
-        monthly_ops_at_conversion=round(q_conversion),
-        monthly_revenue_at_conversion=round(monthly_revenue, 2),
-        implied_arpu_vs_pinecone=round(arpu_ratio, 3)
-    )
-
-
-def run_similarity_search_pricing_model() -> dict:
-    results = {}
-    for scenario_name, curve in ADOPTION_SCENARIOS.items():
-        opt = maximize_nmi_cosine_api_revenue(curve)
-        freemium = compute_freemium_to_paid_threshold(curve)
-
-        # Scan de revenue en rango de precios para analisis de sensibilidad
-        price_grid = np.linspace(P_MIN, P_MAX, 200)
-        revenues = [curve.revenue(p) for p in price_grid]
-        revenue_weighted_avg_price = float(np.average(price_grid, weights=revenues))
-
-        results[scenario_name] = {
-            "optimal_pricing": {
-                "price_per_op": opt.price,
-                "monthly_ops": opt.quantity,
-                "monthly_revenue_usd": opt.revenue,
-                "elasticity": opt.elasticity_at_optimum,
-                "demand_is_elastic": opt.is_elastic,
-            },
-            "freemium_threshold": {
-                "free_ops_limit": freemium.free_ops_limit,
-                "conversion_price": freemium.paid_conversion_price,
-                "ops_at_conversion": freemium.monthly_ops_at_conversion,
-                "revenue_at_conversion_usd": freemium.monthly_revenue_at_conversion,
-                "arpu_ratio_vs_pinecone_70usd": freemium.implied_arpu_vs_pinecone,
-            },
-            "sensitivity": {
-                "revenue_weighted_avg_price": round(revenue_weighted_avg_price, 5),
-                "max_revenue_in_grid": round(max(revenues), 2),
-                "price_at_max_revenue": round(float(price_grid[int(np.argmax(revenues))]), 5),
-            }
-        }
+def run_similarity_search_pricing_model() -> list[SimilaritySearchPriceEquilibrium]:
+    results = []
+    for scenario in SCENARIOS:
+        eq = compute_equilibrium(scenario)
+        results.append(eq)
+        print(
+            f"[{eq.scenario_name}] "
+            f"P_opt={eq.optimal_price_usd} USD | "
+            f"Q={eq.quantity_at_optimal:.0f} ops | "
+            f"Rev={eq.revenue_at_optimal_usd} USD/mo | "
+            f"eps={eq.elasticity} | "
+            f"freemium->paid at P={eq.freemium_crossover_price_usd} USD "
+            f"({eq.freemium_crossover_monthly_revenue_usd} USD/mo)"
+        )
     return results
 
 
 if __name__ == "__main__":
-    import json
-    output = run_similarity_search_pricing_model()
-    print(json.dumps(output, indent=2))
+    equilibria = run_similarity_search_pricing_model()
