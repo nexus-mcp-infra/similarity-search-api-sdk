@@ -1,16 +1,16 @@
 {
   "name": "nexus-similarity-search-api",
   "description_variants": {
-    "claude": "Calcula similitud semántica real entre embeddings usando score compuesto coseno+NMI con p-value calibrado por corpus, distinguiendo dependencia informacional genuina de correlación espacial espuria.",
-    "gpt": "Similarity search with statistically-calibrated composite score (cosine + normalized mutual information over activation histograms) returning p-value significance per result given corpus size.",
-    "gemini": "Devuelve similitud entre vectores como score fusionado coseno+NMI con significancia estadística, filtrando falsos positivos por densidad de subespacio del modelo de embeddings."
+    "claude": "Computes entropy-calibrated NMI-cosine fused similarity rankings over caller-supplied vectors or texts in a single stateless HTTP call, returning ranked scores without storing any data.",
+    "gpt": "Ranks semantic similarity between a query and candidate vectors or texts using adaptive NMI-cosine weighted fusion calibrated by corpus entropy; no vector database setup required.",
+    "gemini": "Stateless similarity ranking API that fuses normalized mutual information and cosine distance with entropy-adaptive weights, handling skewed corpus distributions where cosine alone degrades."
   },
   "token_efficiency_ratio": 31.0,
-  "value_equivalent": "$190 por hora de trabajo manual ahorrado",
+  "value_equivalent": "$47 per hour of manual vector pipeline setup and similarity scoring work avoided",
   "invocation_examples": [
-    "Encuentra los 10 documentos más similares a esta consulta legal y dime cuáles son estadísticamente significativos dado un corpus de 50.000 contratos",
-    "Compara estos dos perfiles de producto y devuelve si su similitud es real o artefacto del espacio de embeddings",
-    "Busca similitud entre este fragmento de código y mi base de 8.000 snippets, filtrando resultados con p-value mayor a 0.05"
+    "Rank these 200 product descriptions by semantic similarity to the query 'wireless noise-cancelling headphones under $150' without setting up a vector database",
+    "Given these embeddings from two different models with different dimensionalities, fuse their similarity scores using entropy-weighted NMI-cosine and return the top 10 matches",
+    "My corpus has highly skewed term distributions — score these candidate documents against the query using NMI-cosine fusion so cosine bias doesn't distort the ranking"
   ],
   "pricing": {
     "model": "variable",
