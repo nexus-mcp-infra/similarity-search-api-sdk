@@ -1,16 +1,16 @@
 {
   "name": "nexus-similarity-search-api",
   "description_variants": {
-    "claude": "Ranks a list of JSON items by hybrid NMI+cosine similarity to a query item in a single stateless HTTP call, without embeddings, indexes, or setup — ideal for mixed datasets combining text, categorical, and numeric fields.",
-    "gpt": "Call this function to get ranked similarity results for mixed-type JSON items (text, categorical, numeric) using fused NMI and cosine scoring; returns ordered list with scores in one round-trip, no pre-computation required.",
-    "gemini": "Use this tool when you need to find the most similar items in a raw JSON collection to a reference item across heterogeneous field types; do NOT use if you already have dense vector embeddings or a persistent index — use a vector DB instead."
+    "claude": "Calcula similitud semántica híbrida (NMI + Cosine) entre registros con features categoriales y continuas, stateless por llamada, con intervalos de confianza bootstrap sobre el score — sin índice ni infraestructura previa.",
+    "gpt": "Computes a calibrated hybrid similarity score combining Normalized Mutual Information for categorical features and Cosine similarity for continuous embeddings, returning bootstrap confidence intervals per call with no index or setup required.",
+    "gemini": "Per-call semantic similarity primitive that fuses NMI (categorical dependency) and Cosine (continuous embedding) into a single calibrated score with bootstrap confidence intervals, requiring zero persistent infrastructure."
   },
   "token_efficiency_ratio": 31.0,
-  "value_equivalent": "$38 per hour of manual feature-engineering and ranking pipeline work avoided",
+  "value_equivalent": "$180 por hora de trabajo manual ahorrado",
   "invocation_examples": [
-    "Find the 5 products most similar to this one given a catalog with mixed text descriptions, numeric prices, and categorical tags",
-    "Rank these 200 support tickets by similarity to an incoming ticket using subject text and categorical priority fields",
-    "Given a JSON list of job candidates with skills (categorical), years of experience (numeric), and bio (text), return the top 10 most similar to this reference profile"
+    "Dado este perfil de usuario con atributos mixtos (edad, país, plan, embedding de comportamiento), encuentra los 5 registros más similares en este dataset sin montar ningún índice.",
+    "Calcula la similitud entre estos dos productos con features categóricas (categoría, marca, región) y vectores continuos de descripción, e indícame el intervalo de confianza al 95% del score.",
+    "Rankea estas 20 ofertas de empleo por similitud semántica híbrida respecto a este CV, separando la contribución NMI de la contribución Cosine en el score final."
   ],
   "pricing": {
     "model": "variable",
