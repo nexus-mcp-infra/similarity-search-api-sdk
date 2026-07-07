@@ -1,218 +1,171 @@
 # Similarity Search API
 
-Find the 10 most similar items to any JSON record — no embeddings, no index, no infrastructure.
+Semantic similarity over mixed-data records — stateless, per-call, no index required.
+
+---
+
+## Install
 
 ```bash
-pip install similarity-search-client
+pip install nexus-similarity
 ```
 
+---
+
+## 30 seconds to your first result
+
 ```python
-from similarity_search import SimilarityClient
+from nexus_similarity import SimilarityClient
 
 client = SimilarityClient(api_key="YOUR_API_KEY")
-results = client.search(query={"title": "noise-canceling headphones", "category": "electronics", "price": 149}, corpus=items)
+result = client.compare(query={"category": "electronics", "price": 299.99, "brand": "sony"}, candidates=[{"category": "electronics", "price": 279.00, "brand": "sony"}, {"category": "appliances", "price": 310.00, "brand": "lg"}])
+print(result.ranked[0].score, result.ranked[0].confidence_interval)  # 0.91, (0.87, 0.94)
 ```
-
-That's it. No Pinecone pod. No embedding model. No orchestration layer.
 
 ---
 
-## The problem with every other approach
-
-Getting semantic search working looks simple until you actually do it:
-
-1. Pick an embedding model and figure out how to run it
-2. Stand up a vector database (Pinecone, Weaviate, Qdrant — pick your poison)
-3. Write the ingestion pipeline to keep the index in sync
-4. Write the query layer to hit both services and merge results
-5. Pay for all of it before you know if it even works for your data
-
-That's 45–90 minutes of setup before you can answer the question: *does similarity search actually solve my problem?* And if your workload is 500 queries/day, you're paying $70+/month for a Pinecone pod that's idle 99% of the time.
-
-**This API collapses all of that into one HTTP call.**
-
----
-
-## Why NMI + cosine, not just cosine
-
-Every vector database scores similarity using cosine distance over embeddings. That works well when your data is pure text. It breaks when your records mix text, categories, and numerics — which is most real-world data.
-
-Cosine over a TF-IDF or embedding vector has no way to express the fact that `category: "electronics"` and `category: "electronics"` is a *structurally stronger signal* than two documents that happen to share vocabulary. It treats all dimensions as continuous and linear.
-
-**Normalized Mutual Information (NMI)** measures statistical dependence between features directly from their distributions — it captures non-linear relationships between categorical and ordinal fields that cosine simply cannot see. NMI ranges from 0 (independent) to 1 (perfectly dependent), and it requires no pre-trained model to compute.
-
-The Similarity Search API fuses both signals in a single scoring step:
-
-```
-score(q, item) = alpha * cosine(q_vec, item_vec) + (1 - alpha) * NMI(q_features, item_features)
-```
-
-Default `alpha = 0.6` weights cosine slightly higher for mixed datasets. If your corpus is mostly categorical, send `alpha=0.3` in the request body. If it's mostly text, send `alpha=0.8`. No retraining. No model. Just one parameter.
-
----
-
-## Quickstart
-
-### Install
-
-```bash
-pip install similarity-search-client
-```
-
-### Search
-
-```python
-from similarity_search import SimilarityClient
-
-client = SimilarityClient(api_key="YOUR_API_KEY")
-
-query = {
-    "title": "wireless mechanical keyboard",
-    "category": "peripherals",
-    "price": 89,
-    "brand": "keychron"
-}
-
-corpus = [
-    {"title": "USB-C mechanical keyboard", "category": "peripherals", "price": 95, "brand": "keychron"},
-    {"title": "gaming mouse", "category": "peripherals", "price": 59, "brand": "logitech"},
-    {"title": "laptop stand", "category": "accessories", "price": 35, "brand": "nexstand"},
-    # ... up to 10,000 items per call
-]
-
-results = client.search(query=query, corpus=corpus, top_k=5)
-
-for r in results:
-    print(r.rank, r.score, r.item["title"])
-# 1  0.94  USB-C mechanical keyboard
-# 2  0.61  gaming mouse
-# 3  0.29  laptop stand
-```
-
-### Tune alpha for your data
-
-```python
-# Corpus is mostly categorical fields (enums, tags, labels)
-results = client.search(query=query, corpus=corpus, alpha=0.3)
-
-# Corpus is mostly free text
-results = client.search(query=query, corpus=corpus, alpha=0.8)
-```
-
-### Raw HTTP
-
-```bash
-curl -X POST https://api.similaritysearch.io/v1/search \
-  -H "Authorization: Bearer YOUR_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "query": {"title": "wireless keyboard", "category": "peripherals", "price": 89},
-    "corpus": [...],
-    "top_k": 10,
-    "alpha": 0.6
-  }'
-```
-
-Response:
+## What you get back
 
 ```json
 {
-  "results": [
-    {"rank": 1, "score": 0.94, "item": {"title": "USB-C mechanical keyboard", "category": "peripherals", "price": 95}},
-    {"rank": 2, "score": 0.61, "item": {"title": "gaming mouse", "category": "peripherals", "price": 59}}
+  "ranked": [
+    {
+      "index": 0,
+      "score": 0.91,
+      "confidence_interval": [0.87, 0.94],
+      "feature_weights": {"categorical": 0.63, "continuous": 0.37}
+    },
+    {
+      "index": 1,
+      "score": 0.44,
+      "confidence_interval": [0.38, 0.51],
+      "feature_weights": {"categorical": 0.63, "continuous": 0.37}
+    }
   ],
-  "meta": {
-    "corpus_size": 3,
-    "top_k": 2,
-    "alpha_used": 0.6,
-    "latency_ms": 18
-  }
+  "schema_inferred": {"category": "categorical", "price": "continuous", "brand": "categorical"},
+  "bootstrap_n": 500
 }
 ```
 
 ---
 
-## API reference
+## Why not build this yourself
 
-### `POST /v1/search`
+Every team that reaches this problem makes the same three mistakes — in order.
 
-| Field | Type | Required | Description |
-|---|---|---|---|
-| `query` | `object` | yes | The reference item. Any JSON object with string, numeric, or boolean fields. |
-| `corpus` | `array[object]` | yes | Items to rank. Max 10,000 per call. Must share at least one key with `query`. |
-| `top_k` | `integer` | no | Number of results to return. Default `10`, max `1000`. |
-| `alpha` | `float` | no | Cosine weight in [0.0, 1.0]. Default `0.6`. NMI weight is `1 - alpha`. |
+**Mistake 1: Using a vector DB for small-scale similarity.**
+Pinecone, Weaviate, and Qdrant are excellent at 10M+ vectors with persistent indices. For catalogs under 100k items, you pay for infrastructure you don't need, write ingestion pipelines you have to maintain, and wake up to sync failures when your source data changes. A stateless per-call API has no index to go stale.
 
-### `GET /v1/health`
+**Mistake 2: Mixing categorical and continuous features naively.**
+Cosine similarity on embeddings works for text and dense vectors. It produces meaningless results when your records contain a mix of categorical fields (brand, category, status) and continuous ones (price, latitude, duration). The standard fix — one-hot encoding everything and running cosine — distorts the geometry of categorical relationships. NMI (Normalized Mutual Information) measures dependency between categorical features without imposing a false metric structure. The right answer is to use both, weighted by what your data actually contains.
 
-Returns `200 OK` when the service is available. No authentication required. Use this for uptime monitoring.
+**Mistake 3: Getting a distance back, not a decision.**
+Raw cosine scores have no calibration. A score of 0.74 could mean "very similar" or "barely related" depending on the domain and the data distribution. Without a confidence interval grounded in bootstrap resampling, you're making ranking decisions on point estimates that could swing significantly with minor input variation. This API returns 500-resample bootstrap CIs on every call — you know not just the score but how much to trust it.
 
 ---
 
-## What it does not do
+## How the score is computed
 
-- **No persistent index.** The corpus lives in the request. There is nothing to sync, nothing to update, nothing to delete.
-- **No embedding model.** Numeric and text fields are vectorized with TF-IDF inside the scoring pipeline. You do not choose or host a model.
-- **No state between calls.** Every request is fully independent. Horizontal scaling is implicit.
-- **Not designed for corpora above 10,000 items.** For static corpora that large, a persistent index genuinely makes more sense — use Qdrant or Weaviate and accept the infrastructure cost. This API is optimized for the case where the corpus changes frequently, is small-to-medium, or you need to validate the approach before committing to index infrastructure.
+The hybrid score is not a fixed weighted average. On each call, the API:
+
+1. **Infers feature types** from the input — no schema declaration required. Fields are classified as categorical or continuous using entropy estimation from `src/math/information`.
+2. **Computes NMI** (normalized by joint entropy) across categorical feature pairs between query and each candidate.
+3. **Computes Cosine similarity** over continuous feature vectors, with per-feature z-score normalization.
+4. **Calibrates the NMI/Cosine blend weight** dynamically: if 70% of your features are categorical, the score reflects that — mathematically, not by convention. The weight `w` for the categorical component is `w = n_cat / (n_cat + n_cont)` adjusted by a mutual-information-derived confidence term, not a hyperparameter you tune.
+5. **Runs bootstrap CI** with n=500 resamples via `src/math/statistics` on the fused score distribution to return the 90% confidence interval.
+
+The same endpoint behaves differently on a product catalog than on a user-profile dataset — because the math responds to the data, not to a config file.
+
+---
+
+## When to use this API
+
+**Use it when:**
+- Your records have mixed categorical + continuous fields and you want a single comparable score
+- You need similarity on demand without maintaining a persistent index
+- You want confidence intervals on similarity scores to drive ranking or deduplication decisions
+- Your dataset is under 500k records and standing up a vector DB is operationally disproportionate
+
+**Do not use it when:**
+- You need approximate nearest-neighbor search over millions of vectors at sub-10ms latency — use a vector DB
+- Your data is pure unstructured text with no categorical structure — a plain embedding + cosine pipeline is sufficient and cheaper
+- You need to persist, version, or diff an index over time — this API is stateless by design and stores nothing
+
+---
+
+## Endpoints
+
+| Method | Path | What it does |
+|--------|------|--------------|
+| `POST` | `/v1/compare` | Score one query against N candidates, return ranked list with CIs |
+| `POST` | `/v1/batch` | Score M queries against N candidates in a single call |
+| `GET`  | `/v1/schema` | Return the inferred feature type map for a given record set, without scoring |
 
 ---
 
 ## Authentication
 
-All requests require a Bearer token in the `Authorization` header:
+All requests require a bearer token in the `Authorization` header:
 
-```
-Authorization: Bearer YOUR_API_KEY
+```bash
+curl -X POST https://api.nexus.ai/v1/compare \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"query": {...}, "candidates": [...]}'
 ```
 
-API keys are scoped to a project. Rotate them in the dashboard without downtime — old and new keys are valid during a 60-second overlap window.
+API keys are scoped per project. Rotate them from the dashboard without downtime.
 
 ---
 
 ## Errors
 
+The API returns standard HTTP status codes with a structured error body:
+
 ```json
-{"error": {"code": "corpus_too_large", "message": "corpus must contain at most 10000 items, received 12400"}}
-{"error": {"code": "alpha_out_of_range", "message": "alpha must be between 0.0 and 1.0, received 1.4"}}
-{"error": {"code": "no_shared_keys", "message": "query and corpus items share no common keys; scoring is undefined"}}
-{"error": {"code": "unauthorized", "message": "missing or invalid API key"}}
+{
+  "error": {
+    "code": "FEATURE_TYPE_INFERENCE_FAILED",
+    "message": "Field 'timestamp' could not be classified as categorical or continuous. Provide a value with at least 2 distinct states or a numeric type.",
+    "field": "timestamp"
+  }
+}
 ```
 
-HTTP status codes follow standard semantics: `400` for malformed input, `401` for auth, `429` for rate limits, `500` for service errors.
+| Code | Meaning |
+|------|---------|
+| `400` | Malformed request — missing `query`, empty `candidates`, or unparseable field values |
+| `401` | Invalid or missing API key |
+| `422` | Records contain fewer than 2 comparable fields after type inference |
+| `429` | Rate limit exceeded |
+| `500` | Internal error — retryable, idempotent |
 
 ---
 
-## Compared to building it yourself
+## Python SDK reference
 
-| | Build it yourself | Similarity Search API |
-|---|---|---|
-| Time to first result | 45–90 min | 3 min |
-| Infrastructure to manage | Embedding model + vector DB + ingestion pipeline | Zero |
-| Works on mixed data (text + categories + numerics) | Requires custom feature engineering | Native |
-| Categorical dependency signal | Not captured by cosine | NMI, built-in |
-| Cost at 500 queries/day | $70+/month (Pinecone Starter) | Pay per call |
-| Stateless, no index drift | No | Yes |
+```python
+from nexus_similarity import SimilarityClient
 
----
+client = SimilarityClient(api_key="YOUR_API_KEY", timeout=10)
 
-## Language support
+# Single comparison
+result = client.compare(query={...}, candidates=[...])
 
-| Language | Install |
-|---|---|
-| Python | `pip install similarity-search-client` |
-| Node.js | `npm install @similarity-search/client` |
-| Go | `go get github.com/similarity-search/go-client` |
-| Raw HTTP | Any language that can send JSON |
+# Batch
+result = client.batch(queries=[...], candidates=[...])
+
+# Schema inspection without scoring
+schema = client.infer_schema(records=[...])
+```
+
+Full SDK source: [github.com/nexus-ai/nexus-similarity-python](https://github.com/nexus-ai/nexus-similarity-python)
 
 ---
 
-## Support
+## Stack
 
-- Docs: [docs.similaritysearch.io](https://docs.similaritysearch.io)
-- Status: [status.similaritysearch.io](https://status.similaritysearch.io)
-- Issues: open a GitHub issue or email support@similaritysearch.io
-- Response time: < 24h on business days
+Python 3.11 — FastAPI — Uvicorn — ClickHouse (score distribution logging for flywheel recalibration)
 
 ---
 
