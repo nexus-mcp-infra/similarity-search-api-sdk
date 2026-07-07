@@ -1,103 +1,14 @@
 # Similarity Search API
 
-Statistical significance built into every similarity score.
+Semantic similarity ranking without the infrastructure. Send vectors or text, get ranked scores back. No database, no index, no state.
 
 ---
 
 ## Install
 
 ```bash
-pip install similarity-search-client
+pip install similarity-search-sdk
 ```
-
----
-
-## Search in 3 lines
-
-```python
-from similarity_search import SimilarityClient
-
-client = SimilarityClient(api_key="YOUR_API_KEY")
-results = client.search(query="transformer attention mechanism", corpus=my_docs, top_k=10)
-```
-
-Every result includes a composite score, a p-value, and the raw cosine and NMI signals — no extra calls, no config.
-
----
-
-## The problem with cosine similarity
-
-Every vector database returns cosine scores. None of them tell you whether those scores mean anything.
-
-Two embeddings can share a cosine of 0.91 because they describe the same concept — or because they both live in a dense region of the embedding space that your model overweights. You cannot distinguish those cases from the score alone. You act on a false positive, surface irrelevant results, and your downstream precision degrades silently.
-
-**Similarity Search API solves this at the score level, not at the infra level.**
-
----
-
-## How it works
-
-Each similarity score is a composite of two independent signals:
-
-**Cosine similarity** measures geometric proximity in the embedding space — fast, standard, familiar.
-
-**Normalized Mutual Information (NMI)** measures informational dependence between the activation distributions of the two embeddings. Given an embedding vector of dimension `D`, the API partitions it into `k = sqrt(D)` segments and builds an empirical magnitude distribution per segment using Freedman-Diaconis binning. NMI is then:
-
-```
-NMI(P, Q) = MI(P, Q) / sqrt(H(P) * H(Q))
-```
-
-where `H` is Shannon entropy. NMI detects shared structure that survives across the distributional shape of the embedding — not just its direction.
-
-**The composite score** fuses both signals:
-
-```
-S = alpha * cosine + (1 - alpha) * NMI
-```
-
-`alpha` defaults to `0.6` and is adjustable per call. The p-value is computed via chi-squared test of independence between P and Q, then Bonferroni-corrected for `m = corpus_size` comparisons. A result with `p < 0.05` is statistically significant given your actual corpus — not just geometrically close in abstract space.
-
----
-
-## What you get back
-
-```python
-{
-  "id": "doc_8f3a1c",
-  "composite_score": 0.847,
-  "cosine": 0.912,
-  "nmi": 0.741,
-  "p_value": 0.003,
-  "significant": true,
-  "alpha_used": 0.6
-}
-```
-
-`significant: true` means the similarity is unlikely to be explained by embedding-space density alone, at your corpus size. You can filter, rank, or gate on it directly.
-
----
-
-## Why not build this yourself
-
-| What you'd have to build | Why it's harder than it looks |
-|---|---|
-| Freedman-Diaconis binning per embedding segment | Bin width depends on IQR per segment, not global IQR — naively applied it produces degenerate histograms on sparse dims |
-| Corpus-level Bonferroni correction | Requires tracking corpus size per query context, not per index — most infra doesn't expose this |
-| NMI stability on short vectors | Below ~128 dims, entropy estimates are biased; requires sample-size correction (Miller-Madow or similar) |
-| Calibrated alpha tuning | Optimal alpha shifts with domain; exposing it as a per-call param without breaking score monotonicity requires careful normalization |
-| Zero-infra operation | Running this correctly without a persistent index means on-demand histogram construction — non-trivial to make fast without precomputation strategies |
-
-None of this is impossible. Each piece individually is a few days of work. Together, with edge cases, correctness tests, and latency constraints, it's a project — and it's not your core product.
-
----
-
-## Designed for your scale
-
-No vector database to provision. No namespace to pay for whether you use it or not. No minimum corpus size.
-
-Pass your corpus inline, or reference a corpus you've registered. Pay per search operation. Works correctly on 50 documents or 500,000.
-
----
 
 ## Quickstart
 
@@ -105,85 +16,157 @@ Pass your corpus inline, or reference a corpus you've registered. Pay per search
 from similarity_search import SimilarityClient
 
 client = SimilarityClient(api_key="YOUR_API_KEY")
-
-# Single query against an inline corpus
-results = client.search(
-    query="attention is all you need",
-    corpus=["transformer paper", "BERT architecture", "recurrent networks", "CNN for text"],
-    top_k=3,
-    alpha=0.6,            # composite weight, cosine vs NMI
-    significance=0.05     # filter to statistically significant results only
-)
-
-for r in results:
-    print(r.composite_score, r.p_value, r.significant, r.text)
-```
-
-```python
-# Batch: compare all pairs in a list
-pairs = client.compare_pairs(
-    items=["doc A", "doc B", "doc C"],
-    alpha=0.7
-)
-# Returns N*(N-1)/2 scored pairs, each with composite score and p-value
+results = client.rank(query="machine learning for time series", corpus=["LSTM forecasting", "image segmentation with CNNs", "gradient boosting on tabular data"])
+print(results[0])  # -> {"text": "LSTM forecasting", "score": 0.91, "rank": 1}
 ```
 
 ---
 
-## Authentication
+## Why not FAISS, Pinecone, or a cosine wrapper?
 
-All requests require an API key passed via header or client constructor:
+**The short answer:** those tools solve a different problem — storing and retrieving millions of vectors at scale. If you need semantic ranking for a batch that exists right now, you're paying the full infrastructure tax for a problem that doesn't require it.
 
-```python
-client = SimilarityClient(api_key="YOUR_API_KEY")
+**The real answer:** standard cosine similarity fails silently on skewed distributions. If your corpus has three near-identical documents and one outlier, cosine ranks them confidently — but that confidence is an artifact of the geometry, not the semantics.
+
+This API runs **NMI-cosine weighted fusion** on every request. The fusion weight is computed from the actual entropy of the corpus you send:
+
+```
+w_nmi = H(corpus) / (H(corpus) + H_baseline)
+score  = w_nmi * NMI(query, doc) + (1 - w_nmi) * cosine(query, doc)
 ```
 
-```bash
-curl https://api.similarity-search.io/v1/search \
-  -H "Authorization: Bearer YOUR_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"query": "neural retrieval", "corpus": ["dense retrieval", "BM25", "sparse vectors"], "top_k": 2}'
-```
+When your corpus is concentrated (low entropy), the ranker leans harder on mutual information. When it's diffuse (high entropy), it becomes more conservative. This calibration happens in-request, against the full corpus you sent — which means it can never be replicated by a system that indexed your vectors offline and lost the marginal distribution.
 
-Keys are scoped to your account. Rotate them from the dashboard at any time without downtime.
+---
+
+## What problem does this solve exactly?
+
+| Situation | What you'd normally do | What you do here |
+|---|---|---|
+| MVP with < 5k queries/day | Spin up Pinecone, write ingestion pipeline, manage index | POST your corpus + query, get ranked results |
+| One-off semantic comparison | Install FAISS, write embedding glue code, no REST layer | One HTTP call, no local GPU/CPU allocation |
+| Skewed domain corpus (legal, medical, code) | Tune cosine thresholds manually per domain | Entropy-adaptive weight adjusts automatically |
+| Stateless serverless function | Vector DBs require persistent connections | Fully stateless — each request is self-contained |
 
 ---
 
 ## Endpoints
 
-| Method | Path | What it does |
-|---|---|---|
-| `POST` | `/v1/search` | Query against inline or registered corpus, returns ranked results with composite scores and p-values |
-| `POST` | `/v1/compare` | Score a single pair of texts, returns full signal breakdown |
-| `POST` | `/v1/batch_compare` | Score all pairs in a list, returns N*(N-1)/2 results |
-| `POST` | `/v1/corpus` | Register a corpus by ID for repeated queries without re-sending documents |
-| `GET` | `/v1/corpus/{id}` | Retrieve metadata for a registered corpus |
+```
+POST /v1/rank          # text or vectors -> ranked scores
+POST /v1/rank/batch    # multiple queries against same corpus in one call
+GET  /v1/health        # latency + entropy diagnostics for last request
+```
+
+All endpoints are stateless. Nothing you send is stored. The corpus lives only for the duration of the computation.
 
 ---
 
-## Language support
+## Request shape
 
-- **Python** — `pip install similarity-search-client`
-- **Node.js** — `npm install @similarity-search/client`
-- **HTTP** — any language, full REST API, JSON in and out
+```json
+{
+  "query": "transformer architecture for NLP",
+  "corpus": [
+    "attention mechanisms in deep learning",
+    "convolutional filters for image recognition",
+    "BERT fine-tuning on downstream tasks"
+  ],
+  "mode": "text",
+  "top_k": 3
+}
+```
+
+`mode: "text"` — the API embeds internally before ranking.
+`mode: "vector"` — send raw float arrays, skip embedding, get scores faster.
 
 ---
 
-## Requirements
+## Response shape
 
-- Python 3.8+ for the client library
-- No local GPU, no local model, no vector index
-- Embeddings are computed server-side — send raw text
+```json
+{
+  "query_entropy": 0.43,
+  "corpus_entropy": 1.82,
+  "w_nmi": 0.71,
+  "results": [
+    {"rank": 1, "text": "attention mechanisms in deep learning", "score": 0.94, "nmi": 0.89, "cosine": 0.96},
+    {"rank": 2, "text": "BERT fine-tuning on downstream tasks",  "score": 0.81, "nmi": 0.78, "cosine": 0.83},
+    {"rank": 3, "text": "convolutional filters for image recognition", "score": 0.41, "nmi": 0.32, "cosine": 0.47}
+  ]
+}
+```
+
+`w_nmi` is returned on every response so you can audit exactly how the ranker weighted the two signals for your specific corpus.
 
 ---
 
-## Links
+## Authentication
 
-- [API Reference](https://docs.similarity-search.io/api)
-- [Composite Score Deep Dive](https://docs.similarity-search.io/nmi-explained)
-- [Alpha Tuning Guide](https://docs.similarity-search.io/alpha-calibration)
-- [Status](https://status.similarity-search.io)
-- [Support](mailto:support@similarity-search.io)
+```bash
+curl -X POST https://api.similaritysearch.io/v1/rank \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"query": "...", "corpus": ["...", "..."], "mode": "text", "top_k": 5}'
+```
+
+Get your key at [similaritysearch.io/dashboard](https://similaritysearch.io/dashboard).
+
+---
+
+## Limits
+
+| Parameter | Limit |
+|---|---|
+| `corpus` items per request | 10,000 |
+| vector dimensions (`mode: vector`) | 128 – 4,096 |
+| request body | 10 MB |
+| `top_k` | 1 – 1,000 |
+| concurrent requests per key | 50 |
+
+---
+
+## Why stateless is a feature, not a limitation
+
+A vector database keeps your data to make future queries faster. This API doesn't keep anything — which means:
+
+- No data residency concerns. Your corpus never touches a persistent store.
+- No index drift. The ranking is always computed against exactly what you sent.
+- No warm-up. Cold starts don't exist for a service with no index to load.
+- The entropy calculation is exact, not approximated from a stale index snapshot.
+
+For use cases where freshness and correctness matter more than sub-millisecond recall at billion-vector scale, stateless is the right architecture.
+
+---
+
+## SDK reference
+
+```python
+from similarity_search import SimilarityClient
+
+client = SimilarityClient(api_key="YOUR_API_KEY", timeout=30)
+
+# Text mode
+result = client.rank(query="...", corpus=[...], top_k=10)
+
+# Vector mode
+result = client.rank_vectors(query_vec=[0.1, 0.4, ...], corpus_vecs=[[...], [...]], top_k=5)
+
+# Batch mode
+results = client.rank_batch(queries=["...", "..."], corpus=[...], top_k=3)
+
+# Diagnostics
+diag = client.health()
+print(diag["last_request_entropy"])
+```
+
+Full SDK source: [github.com/similarity-search/sdk-python](https://github.com/similarity-search/sdk-python)
+
+---
+
+## Stack
+
+Python 3.11 · FastAPI · NumPy · SciPy · No vector database · No GPU required at client side
 
 ---
 
