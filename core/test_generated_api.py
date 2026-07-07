@@ -1,231 +1,238 @@
 import unittest
 from unittest.mock import patch, MagicMock
-import numpy as np
 import json
+import numpy as np
 
 
-MOCK_API_KEY = "test-key-nexus-similarity-001"
-BASE_URL = "http://localhost:8000"
+MOCK_API_KEY = "test-key-nexus-forge-001"
+BASE_URL = "https://api.nexus.io/v1/similarity"
 
-VECTOR_A = [0.1, 0.4, 0.7, 0.2, 0.9, 0.3, 0.6, 0.8]
-VECTOR_B = [0.15, 0.38, 0.72, 0.18, 0.88, 0.31, 0.59, 0.77]
-VECTOR_ORTHOGONAL = [0.9, -0.4, 0.1, -0.7, 0.2, -0.8, 0.3, -0.6]
+VECTOR_A = [0.1, 0.4, 0.9, 0.2, 0.7]
+VECTOR_B = [0.2, 0.3, 0.8, 0.1, 0.6]
+VECTOR_C = [0.9, 0.1, 0.2, 0.8, 0.3]
+
+MOCK_RANKED_RESPONSE = {
+    "results": [
+        {"index": 0, "nmi_score": 0.87, "cosine_score": 0.992, "fused_score": 0.941},
+        {"index": 1, "nmi_score": 0.21, "cosine_score": 0.143, "fused_score": 0.177},
+    ],
+    "query_dims": 5,
+    "candidates_evaluated": 2,
+    "fusion_weights": {"nmi": 0.4, "cosine": 0.6},
+}
 
 
-def make_mock_similarity_response(
-    cosine_score=0.9982,
-    nmi_score=0.7641,
-    composite_score=0.8812,
-    n_dims=8,
-):
-    return {
-        "cosine_similarity": cosine_score,
-        "nmi_score": nmi_score,
-        "composite_score": composite_score,
-        "metadata": {
-            "n_dims": n_dims,
-            "nmi_bins": 10,
-            "composite_weights": {"cosine": 0.4, "nmi": 0.6},
-        },
-    }
+def _make_mock_response(status_code: int, body: dict) -> MagicMock:
+    mock_resp = MagicMock()
+    mock_resp.status_code = status_code
+    mock_resp.json.return_value = body
+    mock_resp.raise_for_status = MagicMock()
+    if status_code >= 400:
+        import requests
+        mock_resp.raise_for_status.side_effect = requests.HTTPError(
+            response=mock_resp
+        )
+    return mock_resp
 
 
 class TestSimilaritySearchHappyPath(unittest.TestCase):
 
-    @patch("similarity_search_api_sdk.SimilaritySearchClient.compute_similarity")
-    def test_happy_path_valid_vectors_returns_composite_score(self, mock_compute):
-        """Verifica que dos vectores válidos retornan composite_score en [0, 1]."""
-        mock_compute.return_value = make_mock_similarity_response()
+    @patch("similarity_search_api_sdk.SimilaritySearchClient._post")
+    def test_happy_path_vector_ranked_results_order(self, mock_post):
+        """Verifica que resultados vienen ordenados descendente por fused_score con vectores válidos."""
+        mock_post.return_value = MOCK_RANKED_RESPONSE
 
         from similarity_search_api_sdk import SimilaritySearchClient
-
-        client = SimilaritySearchClient(api_key=MOCK_API_KEY, base_url=BASE_URL)
-        result = client.compute_similarity(VECTOR_A, VECTOR_B)
-
-        self.assertIn("composite_score", result)
-        self.assertGreaterEqual(result["composite_score"], 0.0)
-        self.assertLessEqual(result["composite_score"], 1.0)
-        mock_compute.assert_called_once_with(VECTOR_A, VECTOR_B)
-
-    @patch("similarity_search_api_sdk.SimilaritySearchClient.compute_similarity")
-    def test_happy_path_nmi_lower_than_cosine_for_spurious_vectors(self, mock_compute):
-        """Verifica que vectores en subespacio denso tienen NMI significativamente menor que coseno."""
-        mock_compute.return_value = make_mock_similarity_response(
-            cosine_score=0.961,
-            nmi_score=0.312,
-            composite_score=0.571,
+        client = SimilaritySearchClient(api_key=MOCK_API_KEY)
+        response = client.rank_by_fused_similarity(
+            query_vector=VECTOR_A,
+            candidate_vectors=[VECTOR_B, VECTOR_C],
         )
 
-        from similarity_search_api_sdk import SimilaritySearchClient
+        scores = [r["fused_score"] for r in response["results"]]
+        self.assertEqual(scores, sorted(scores, reverse=True))
+        self.assertEqual(len(response["results"]), 2)
 
-        client = SimilaritySearchClient(api_key=MOCK_API_KEY, base_url=BASE_URL)
-        result = client.compute_similarity(VECTOR_A, VECTOR_ORTHOGONAL)
-
-        self.assertLess(result["nmi_score"], result["cosine_similarity"] - 0.3)
-        self.assertLess(result["composite_score"], result["cosine_similarity"])
-
-    @patch("similarity_search_api_sdk.SimilaritySearchClient.compute_similarity")
-    def test_happy_path_metadata_contains_weights_and_bins(self, mock_compute):
-        """Verifica que la respuesta incluye metadatos de configuracion NMI y pesos del composite."""
-        mock_compute.return_value = make_mock_similarity_response()
+    @patch("similarity_search_api_sdk.SimilaritySearchClient._post")
+    def test_happy_path_fusion_weights_reflected_in_response(self, mock_post):
+        """Verifica que los pesos NMI/cosine enviados se reflejan en la respuesta de fusión."""
+        custom_response = {**MOCK_RANKED_RESPONSE, "fusion_weights": {"nmi": 0.3, "cosine": 0.7}}
+        mock_post.return_value = custom_response
 
         from similarity_search_api_sdk import SimilaritySearchClient
-
-        client = SimilaritySearchClient(api_key=MOCK_API_KEY, base_url=BASE_URL)
-        result = client.compute_similarity(VECTOR_A, VECTOR_B)
-
-        self.assertIn("metadata", result)
-        meta = result["metadata"]
-        self.assertIn("nmi_bins", meta)
-        self.assertIn("composite_weights", meta)
-        self.assertAlmostEqual(
-            sum(meta["composite_weights"].values()), 1.0, places=5
+        client = SimilaritySearchClient(api_key=MOCK_API_KEY)
+        response = client.rank_by_fused_similarity(
+            query_vector=VECTOR_A,
+            candidate_vectors=[VECTOR_B, VECTOR_C],
+            nmi_weight=0.3,
+            cosine_weight=0.7,
         )
+
+        self.assertAlmostEqual(response["fusion_weights"]["nmi"], 0.3)
+        self.assertAlmostEqual(response["fusion_weights"]["cosine"], 0.7)
+
+    @patch("similarity_search_api_sdk.SimilaritySearchClient._post")
+    def test_happy_path_fused_score_within_unit_interval(self, mock_post):
+        """Verifica que todos los fused_scores retornados caen en [0.0, 1.0]."""
+        mock_post.return_value = MOCK_RANKED_RESPONSE
+
+        from similarity_search_api_sdk import SimilaritySearchClient
+        client = SimilaritySearchClient(api_key=MOCK_API_KEY)
+        response = client.rank_by_fused_similarity(
+            query_vector=VECTOR_A,
+            candidate_vectors=[VECTOR_B, VECTOR_C],
+        )
+
+        for result in response["results"]:
+            self.assertGreaterEqual(result["fused_score"], 0.0)
+            self.assertLessEqual(result["fused_score"], 1.0)
 
 
 class TestSimilaritySearchEdgeCases(unittest.TestCase):
 
-    @patch("similarity_search_api_sdk.SimilaritySearchClient.compute_similarity")
-    def test_edge_case_identical_vectors_yield_max_scores(self, mock_compute):
-        """Verifica que vectores identicos producen coseno=1.0, NMI=1.0 y composite=1.0."""
-        mock_compute.return_value = make_mock_similarity_response(
-            cosine_score=1.0,
-            nmi_score=1.0,
-            composite_score=1.0,
+    @patch("similarity_search_api_sdk.SimilaritySearchClient._post")
+    def test_edge_case_single_candidate_returns_one_result(self, mock_post):
+        """Verifica que un solo candidato produce exactamente un resultado rankeado."""
+        single_result_response = {
+            "results": [{"index": 0, "nmi_score": 0.75, "cosine_score": 0.80, "fused_score": 0.78}],
+            "query_dims": 5,
+            "candidates_evaluated": 1,
+            "fusion_weights": {"nmi": 0.4, "cosine": 0.6},
+        }
+        mock_post.return_value = single_result_response
+
+        from similarity_search_api_sdk import SimilaritySearchClient
+        client = SimilaritySearchClient(api_key=MOCK_API_KEY)
+        response = client.rank_by_fused_similarity(
+            query_vector=VECTOR_A,
+            candidate_vectors=[VECTOR_B],
         )
 
+        self.assertEqual(len(response["results"]), 1)
+        self.assertEqual(response["candidates_evaluated"], 1)
+
+    def test_edge_case_empty_candidates_raises_value_error(self):
+        """Verifica que lista vacía de candidatos lanza ValueError antes de llamar a la API."""
         from similarity_search_api_sdk import SimilaritySearchClient
-
-        client = SimilaritySearchClient(api_key=MOCK_API_KEY, base_url=BASE_URL)
-        result = client.compute_similarity(VECTOR_A, VECTOR_A)
-
-        self.assertAlmostEqual(result["cosine_similarity"], 1.0, places=5)
-        self.assertAlmostEqual(result["nmi_score"], 1.0, places=5)
-        self.assertAlmostEqual(result["composite_score"], 1.0, places=5)
-
-    @patch("similarity_search_api_sdk.SimilaritySearchClient.compute_similarity")
-    def test_edge_case_high_dimensional_vector_1536_dims(self, mock_compute):
-        """Verifica que vectores de 1536 dimensiones (OpenAI ada-002) se procesan sin error."""
-        vec_1536 = list(np.random.default_rng(42).random(1536).tolist())
-        mock_compute.return_value = make_mock_similarity_response(n_dims=1536)
-
-        from similarity_search_api_sdk import SimilaritySearchClient
-
-        client = SimilaritySearchClient(api_key=MOCK_API_KEY, base_url=BASE_URL)
-        result = client.compute_similarity(vec_1536, vec_1536)
-
-        self.assertEqual(result["metadata"]["n_dims"], 1536)
-        self.assertIn("composite_score", result)
-
-
-class TestSimilaritySearchInvalidInputs(unittest.TestCase):
-
-    def test_invalid_input_none_vector_raises_value_error(self):
-        """Verifica que pasar None como vector lanza ValueError con mensaje descriptivo."""
-        from similarity_search_api_sdk import SimilaritySearchClient
-
-        client = SimilaritySearchClient(api_key=MOCK_API_KEY, base_url=BASE_URL)
-
-        with self.assertRaises((ValueError, TypeError)) as ctx:
-            client.compute_similarity(None, VECTOR_B)
-
-        self.assertTrue(
-            len(str(ctx.exception)) > 0,
-            "La excepcion debe tener un mensaje descriptivo no vacio",
-        )
-
-    def test_invalid_input_mismatched_dimensions_raises_value_error(self):
-        """Verifica que vectores de dimensiones distintas producen ValueError antes de llamar al backend."""
-        from similarity_search_api_sdk import SimilaritySearchClient
-
-        client = SimilaritySearchClient(api_key=MOCK_API_KEY, base_url=BASE_URL)
-        short_vector = [0.1, 0.2, 0.3]
+        client = SimilaritySearchClient(api_key=MOCK_API_KEY)
 
         with self.assertRaises(ValueError) as ctx:
-            client.compute_similarity(VECTOR_A, short_vector)
+            client.rank_by_fused_similarity(
+                query_vector=VECTOR_A,
+                candidate_vectors=[],
+            )
 
-        self.assertIn(
-            str(len(VECTOR_A)), str(ctx.exception) + str(len(short_vector)),
-        )
+        self.assertIn("candidate_vectors", str(ctx.exception).lower())
 
-    def test_invalid_input_non_numeric_elements_raises_type_error(self):
-        """Verifica que un vector con strings en lugar de floats lanza TypeError."""
+    def test_edge_case_none_query_vector_raises_value_error(self):
+        """Verifica que query_vector=None lanza ValueError con mensaje descriptivo."""
         from similarity_search_api_sdk import SimilaritySearchClient
+        client = SimilaritySearchClient(api_key=MOCK_API_KEY)
 
-        client = SimilaritySearchClient(api_key=MOCK_API_KEY, base_url=BASE_URL)
-        bad_vector = ["embed", "this", "text", "please", "0.1", "0.2", "0.3", "0.4"]
+        with self.assertRaises(ValueError) as ctx:
+            client.rank_by_fused_similarity(
+                query_vector=None,
+                candidate_vectors=[VECTOR_B],
+            )
 
-        with self.assertRaises((TypeError, ValueError)):
-            client.compute_similarity(bad_vector, VECTOR_B)
+        self.assertIn("query_vector", str(ctx.exception).lower())
+
+
+class TestSimilaritySearchInvalidInput(unittest.TestCase):
+
+    def test_invalid_input_string_vector_raises_type_error(self):
+        """Verifica que pasar strings en lugar de floats como vector lanza TypeError."""
+        from similarity_search_api_sdk import SimilaritySearchClient
+        client = SimilaritySearchClient(api_key=MOCK_API_KEY)
+
+        with self.assertRaises(TypeError) as ctx:
+            client.rank_by_fused_similarity(
+                query_vector=["a", "b", "c"],
+                candidate_vectors=[VECTOR_B],
+            )
+
+        self.assertIn("float", str(ctx.exception).lower())
+
+    def test_invalid_input_mismatched_dimensions_raises_value_error(self):
+        """Verifica que query y candidatos con dimensiones distintas lanzan ValueError."""
+        from similarity_search_api_sdk import SimilaritySearchClient
+        client = SimilaritySearchClient(api_key=MOCK_API_KEY)
+
+        mismatched_candidate = [0.1, 0.2]
+
+        with self.assertRaises(ValueError) as ctx:
+            client.rank_by_fused_similarity(
+                query_vector=VECTOR_A,
+                candidate_vectors=[mismatched_candidate],
+            )
+
+        self.assertIn("dimension", str(ctx.exception).lower())
 
 
 class TestSimilaritySearchRateLimit(unittest.TestCase):
 
-    @patch("similarity_search_api_sdk.SimilaritySearchClient.compute_similarity")
-    def test_rate_limit_10_sequential_calls_no_crash(self, mock_compute):
-        """Verifica que 10 llamadas secuenciales no lanzan excepcion y acumulan resultados validos."""
-        mock_compute.return_value = make_mock_similarity_response()
+    @patch("similarity_search_api_sdk.SimilaritySearchClient._post")
+    def test_rate_limit_burst_calls_do_not_crash(self, mock_post):
+        """Verifica que 50 llamadas consecutivas sin demora no lanzan excepción en el cliente."""
+        mock_post.return_value = MOCK_RANKED_RESPONSE
 
         from similarity_search_api_sdk import SimilaritySearchClient
+        client = SimilaritySearchClient(api_key=MOCK_API_KEY)
 
-        client = SimilaritySearchClient(api_key=MOCK_API_KEY, base_url=BASE_URL)
-        results = []
+        exceptions_raised = 0
+        for _ in range(50):
+            try:
+                client.rank_by_fused_similarity(
+                    query_vector=VECTOR_A,
+                    candidate_vectors=[VECTOR_B, VECTOR_C],
+                )
+            except Exception:
+                exceptions_raised += 1
 
-        for _ in range(10):
-            result = client.compute_similarity(VECTOR_A, VECTOR_B)
-            results.append(result)
-
-        self.assertEqual(len(results), 10)
-        for r in results:
-            self.assertIn("composite_score", r)
-            self.assertGreaterEqual(r["composite_score"], 0.0)
+        self.assertEqual(exceptions_raised, 0)
+        self.assertEqual(mock_post.call_count, 50)
 
 
 class TestSimilaritySearchAuth(unittest.TestCase):
 
-    def test_auth_missing_api_key_raises_descriptive_error(self):
-        """Verifica que instanciar el cliente sin API key lanza error con mencion explicita de autenticacion."""
-        from similarity_search_api_sdk import SimilaritySearchClient
+    def test_auth_missing_api_key_raises_authentication_error(self):
+        """Verifica que instanciar el cliente sin api_key lanza AuthenticationError descriptivo."""
+        from similarity_search_api_sdk import SimilaritySearchClient, AuthenticationError
 
-        with self.assertRaises((ValueError, PermissionError, KeyError)) as ctx:
-            client = SimilaritySearchClient(api_key=None, base_url=BASE_URL)
-            client.compute_similarity(VECTOR_A, VECTOR_B)
+        with self.assertRaises(AuthenticationError) as ctx:
+            SimilaritySearchClient(api_key=None)
 
         error_msg = str(ctx.exception).lower()
-        auth_terms = ["key", "auth", "credential", "token", "api"]
         self.assertTrue(
-            any(term in error_msg for term in auth_terms),
-            f"El mensaje de error debe mencionar autenticacion. Obtenido: '{ctx.exception}'",
+            "api_key" in error_msg or "authentication" in error_msg or "key" in error_msg,
+            msg=f"Error message not descriptive enough: {ctx.exception}",
         )
+
+    def test_auth_empty_string_api_key_raises_authentication_error(self):
+        """Verifica que api_key='' (string vacío) lanza AuthenticationError antes de cualquier llamada HTTP."""
+        from similarity_search_api_sdk import SimilaritySearchClient, AuthenticationError
+
+        with self.assertRaises(AuthenticationError):
+            SimilaritySearchClient(api_key="")
 
 
 class TestSimilaritySearchIdempotency(unittest.TestCase):
 
-    @patch("similarity_search_api_sdk.SimilaritySearchClient.compute_similarity")
-    def test_idempotency_same_vectors_same_composite_score_twice(self, mock_compute):
-        """Verifica que la misma par de vectores produce exactamente el mismo composite_score en dos llamadas."""
-        fixed_response = make_mock_similarity_response(
-            cosine_score=0.9982,
-            nmi_score=0.7641,
-            composite_score=0.8812,
-        )
-        mock_compute.return_value = fixed_response
+    @patch("similarity_search_api_sdk.SimilaritySearchClient._post")
+    def test_idempotency_same_vectors_same_fused_scores(self, mock_post):
+        """Verifica que dos llamadas idénticas devuelven exactamente los mismos fused_scores."""
+        mock_post.return_value = MOCK_RANKED_RESPONSE
 
         from similarity_search_api_sdk import SimilaritySearchClient
+        client = SimilaritySearchClient(api_key=MOCK_API_KEY)
 
-        client = SimilaritySearchClient(api_key=MOCK_API_KEY, base_url=BASE_URL)
+        payload = dict(query_vector=VECTOR_A, candidate_vectors=[VECTOR_B, VECTOR_C])
+        response_1 = client.rank_by_fused_similarity(**payload)
+        response_2 = client.rank_by_fused_similarity(**payload)
 
-        result_1 = client.compute_similarity(VECTOR_A, VECTOR_B)
-        result_2 = client.compute_similarity(VECTOR_A, VECTOR_B)
-
-        self.assertAlmostEqual(
-            result_1["composite_score"],
-            result_2["composite_score"],
-            places=10,
-            msg="compute_similarity debe ser determinista para los mismos inputs",
-        )
-        self.assertAlmostEqual(result_1["nmi_score"], result_2["nmi_score"], places=10)
-        self.assertEqual(mock_compute.call_count, 2)
+        scores_1 = [r["fused_score"] for r in response_1["results"]]
+        scores_2 = [r["fused_score"] for r in response_2["results"]]
+        self.assertEqual(scores_1, scores_2)
 
 
 if __name__ == "__main__":
