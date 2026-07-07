@@ -1,3 +1,10 @@
+"""
+similarity_search_sdk.py
+
+Thin HTTP wrapper over the Similarity Search API.
+Exposes composite-score similarity search (cosine + NMI) with calibrated p-values.
+"""
+
 from __future__ import annotations
 
 import time
@@ -5,170 +12,251 @@ from typing import Any
 
 import httpx
 
+DEFAULT_BASE_URL = "https://api.similarity-search.nexus/v1"
+DEFAULT_TIMEOUT = 30.0
+DEFAULT_ALPHA = 0.6
+
 
 class SimilaritySearchError(Exception):
-    def __init__(self, message: str, status_code: int | None = None, response_body: dict | None = None):
+    """Raised when the API returns a non-2xx response or a network error occurs."""
+
+    def __init__(self, message: str, status_code: int | None = None, response_body: Any = None):
         super().__init__(message)
         self.status_code = status_code
-        self.response_body = response_body or {}
+        self.response_body = response_body
 
 
 class AuthenticationError(SimilaritySearchError):
-    pass
+    """Raised when the API key is missing, empty, or rejected (401/403)."""
 
 
 class RateLimitError(SimilaritySearchError):
-    pass
+    """Raised when the API returns 429. Inspect retry_after for back-off guidance."""
+
+    def __init__(self, message: str, retry_after: float | None = None):
+        super().__init__(message, status_code=429)
+        self.retry_after = retry_after
 
 
 class ValidationError(SimilaritySearchError):
-    pass
+    """Raised when the API rejects the request due to malformed input (422)."""
 
 
-class ServerError(SimilaritySearchError):
-    pass
+class CompositeScoreResult:
+    """
+    Represents one item returned by composite_score_search or composite_score_pair.
 
+    Attributes
+    ----------
+    item_id : str
+        Identifier of the candidate item.
+    cosine_similarity : float
+        Raw cosine similarity in [-1, 1].
+    nmi_score : float
+        Normalized Mutual Information over activation histograms in [0, 1].
+    composite_score : float
+        Weighted combination: alpha * cosine + (1 - alpha) * nmi_score.
+    p_value : float
+        Chi-squared p-value corrected for corpus size via Bonferroni.
+        Values below 0.05 indicate statistically significant similarity.
+    alpha : float
+        The alpha used for this result (echoed from request).
+    metadata : dict
+        Any additional fields returned by the API for this item.
+    """
 
-def _raise_for_status(response: httpx.Response) -> None:
-    if response.status_code == 200:
-        return
-    try:
-        body = response.json()
-    except Exception:
-        body = {"detail": response.text}
-    message = body.get("detail", f"HTTP {response.status_code}")
-    if response.status_code == 401:
-        raise AuthenticationError(message, status_code=response.status_code, response_body=body)
-    if response.status_code == 422:
-        raise ValidationError(message, status_code=response.status_code, response_body=body)
-    if response.status_code == 429:
-        raise RateLimitError(message, status_code=response.status_code, response_body=body)
-    if response.status_code >= 500:
-        raise ServerError(message, status_code=response.status_code, response_body=body)
-    raise SimilaritySearchError(message, status_code=response.status_code, response_body=body)
-
-
-class HybridSimilarityResult:
     __slots__ = (
-        "hybrid_score",
+        "item_id",
+        "cosine_similarity",
         "nmi_score",
-        "cosine_score",
-        "nmi_weight",
-        "cosine_weight",
-        "confidence_interval_low",
-        "confidence_interval_high",
-        "confidence_level",
-        "categorical_feature_ratio",
-        "bootstrap_n",
-        "ranked_candidates",
+        "composite_score",
+        "p_value",
+        "alpha",
         "metadata",
     )
 
-    def __init__(self, raw: dict) -> None:
-        self.hybrid_score: float = raw["hybrid_score"]
-        self.nmi_score: float = raw["nmi_score"]
-        self.cosine_score: float = raw["cosine_score"]
-        self.nmi_weight: float = raw["nmi_weight"]
-        self.cosine_weight: float = raw["cosine_weight"]
-        self.confidence_interval_low: float = raw["confidence_interval"]["low"]
-        self.confidence_interval_high: float = raw["confidence_interval"]["high"]
-        self.confidence_level: float = raw["confidence_interval"]["level"]
-        self.categorical_feature_ratio: float = raw["categorical_feature_ratio"]
-        self.bootstrap_n: int = raw["bootstrap_n"]
-        self.ranked_candidates: list[dict] = raw.get("ranked_candidates", [])
-        self.metadata: dict = raw.get("metadata", {})
+    def __init__(
+        self,
+        item_id: str,
+        cosine_similarity: float,
+        nmi_score: float,
+        composite_score: float,
+        p_value: float,
+        alpha: float,
+        metadata: dict,
+    ):
+        self.item_id = item_id
+        self.cosine_similarity = cosine_similarity
+        self.nmi_score = nmi_score
+        self.composite_score = composite_score
+        self.p_value = p_value
+        self.alpha = alpha
+        self.metadata = metadata
+
+    def is_statistically_significant(self, threshold: float = 0.05) -> bool:
+        """Returns True if p_value < threshold (Bonferroni-corrected against corpus size)."""
+        return self.p_value < threshold
 
     def __repr__(self) -> str:
         return (
-            f"HybridSimilarityResult("
-            f"hybrid_score={self.hybrid_score:.4f}, "
-            f"nmi_weight={self.nmi_weight:.3f}, "
-            f"cosine_weight={self.cosine_weight:.3f}, "
-            f"ci=[{self.confidence_interval_low:.4f}, {self.confidence_interval_high:.4f}])"
+            f"CompositeScoreResult(item_id={self.item_id!r}, "
+            f"composite_score={self.composite_score:.4f}, "
+            f"p_value={self.p_value:.4e}, "
+            f"significant={self.is_statistically_significant()})"
         )
 
 
-class BatchSimilarityResult:
-    __slots__ = ("results", "total", "metadata")
+class IndexStats:
+    """
+    Corpus index statistics returned by corpus_index_stats.
 
-    def __init__(self, raw: dict) -> None:
-        self.results: list[HybridSimilarityResult] = [
-            HybridSimilarityResult(r) for r in raw["results"]
-        ]
-        self.total: int = raw["total"]
-        self.metadata: dict = raw.get("metadata", {})
+    Attributes
+    ----------
+    corpus_id : str
+    item_count : int
+    embedding_dim : int
+    index_created_at : str   ISO-8601 timestamp
+    storage_bytes : int
+    metadata : dict
+    """
+
+    __slots__ = (
+        "corpus_id",
+        "item_count",
+        "embedding_dim",
+        "index_created_at",
+        "storage_bytes",
+        "metadata",
+    )
+
+    def __init__(
+        self,
+        corpus_id: str,
+        item_count: int,
+        embedding_dim: int,
+        index_created_at: str,
+        storage_bytes: int,
+        metadata: dict,
+    ):
+        self.corpus_id = corpus_id
+        self.item_count = item_count
+        self.embedding_dim = embedding_dim
+        self.index_created_at = index_created_at
+        self.storage_bytes = storage_bytes
+        self.metadata = metadata
 
     def __repr__(self) -> str:
-        return f"BatchSimilarityResult(total={self.total}, results={len(self.results)})"
-
-
-def _validate_record(record: Any, label: str) -> None:
-    if record is None:
-        raise ValidationError(f"'{label}' must not be None")
-    if not isinstance(record, dict):
-        raise ValidationError(
-            f"'{label}' must be a dict mapping feature names to values, got {type(record).__name__}"
+        return (
+            f"IndexStats(corpus_id={self.corpus_id!r}, "
+            f"item_count={self.item_count}, "
+            f"embedding_dim={self.embedding_dim})"
         )
-    if not record:
-        raise ValidationError(f"'{label}' must not be an empty dict")
 
 
-def _validate_candidates(candidates: Any) -> None:
-    if candidates is None:
-        raise ValidationError("'candidates' must not be None")
-    if not isinstance(candidates, list):
-        raise ValidationError(
-            f"'candidates' must be a list of dicts, got {type(candidates).__name__}"
+def _validate_embedding(embedding: Any, param_name: str) -> list[float]:
+    if embedding is None:
+        raise ValueError(f"'{param_name}' must not be None.")
+    if not isinstance(embedding, (list, tuple)):
+        raise TypeError(
+            f"'{param_name}' must be a list or tuple of floats, got {type(embedding).__name__}."
         )
-    if not candidates:
-        raise ValidationError("'candidates' must contain at least one record")
-    if len(candidates) > 10_000:
-        raise ValidationError(
-            f"'candidates' exceeds maximum allowed size of 10,000 records (got {len(candidates)})"
-        )
-    for i, c in enumerate(candidates):
-        if not isinstance(c, dict):
-            raise ValidationError(
-                f"'candidates[{i}]' must be a dict, got {type(c).__name__}"
+    if len(embedding) == 0:
+        raise ValueError(f"'{param_name}' must not be empty.")
+    result = []
+    for i, v in enumerate(embedding):
+        if not isinstance(v, (int, float)):
+            raise TypeError(
+                f"'{param_name}[{i}]' must be numeric, got {type(v).__name__}."
             )
+        result.append(float(v))
+    return result
+
+
+def _validate_alpha(alpha: Any) -> float:
+    if not isinstance(alpha, (int, float)):
+        raise TypeError(f"'alpha' must be a float in [0.0, 1.0], got {type(alpha).__name__}.")
+    alpha = float(alpha)
+    if not (0.0 <= alpha <= 1.0):
+        raise ValueError(f"'alpha' must be in [0.0, 1.0], got {alpha}.")
+    return alpha
+
+
+def _validate_top_k(top_k: Any) -> int:
+    if not isinstance(top_k, int):
+        raise TypeError(f"'top_k' must be an int, got {type(top_k).__name__}.")
+    if not (1 <= top_k <= 1000):
+        raise ValueError(f"'top_k' must be between 1 and 1000, got {top_k}.")
+    return top_k
+
+
+def _validate_corpus_id(corpus_id: Any) -> str:
+    if corpus_id is None:
+        raise ValueError("'corpus_id' must not be None.")
+    if not isinstance(corpus_id, str):
+        raise TypeError(f"'corpus_id' must be a str, got {type(corpus_id).__name__}.")
+    corpus_id = corpus_id.strip()
+    if len(corpus_id) == 0:
+        raise ValueError("'corpus_id' must not be empty or whitespace.")
+    if len(corpus_id) > 128:
+        raise ValueError("'corpus_id' must not exceed 128 characters.")
+    return corpus_id
+
+
+def _parse_composite_score_result(raw: dict) -> CompositeScoreResult:
+    try:
+        return CompositeScoreResult(
+            item_id=str(raw["item_id"]),
+            cosine_similarity=float(raw["cosine_similarity"]),
+            nmi_score=float(raw["nmi_score"]),
+            composite_score=float(raw["composite_score"]),
+            p_value=float(raw["p_value"]),
+            alpha=float(raw["alpha"]),
+            metadata=raw.get("metadata") or {},
+        )
+    except KeyError as exc:
+        raise SimilaritySearchError(
+            f"API response missing expected field: {exc}. Raw item: {raw}"
+        ) from exc
 
 
 class Client:
     """
-    Thin HTTP wrapper for the Similarity Search API.
+    HTTP client for the Similarity Search API.
 
-    Computes a hybrid NMI+Cosine similarity score per-call, stateless,
-    with bootstrap confidence intervals — no index, no infrastructure setup.
+    Provides composite-score similarity (cosine + NMI) with Bonferroni-corrected
+    p-values — without requiring the caller to manage any vector database.
 
     Parameters
     ----------
     api_key : str
-        Secret key issued at purchase. Required for every request.
-    base_url : str
-        API base URL. Defaults to the production endpoint.
-    timeout : float
-        Per-request timeout in seconds. Default is 30.0.
-    max_retries : int
-        Number of retries on transient server errors (5xx). Default is 2.
+        Your Similarity Search API key. Must not be empty.
+    base_url : str, optional
+        Override the API base URL (useful for self-hosted or staging deployments).
+    timeout : float, optional
+        Per-request timeout in seconds. Default 30.0.
+    max_retries : int, optional
+        Number of automatic retries on transient 5xx errors. Default 2.
     """
-
-    _DEFAULT_BASE_URL = "https://api.nexus-similarity.io/v1"
 
     def __init__(
         self,
         api_key: str,
-        base_url: str | None = None,
-        timeout: float = 30.0,
+        base_url: str = DEFAULT_BASE_URL,
+        timeout: float = DEFAULT_TIMEOUT,
         max_retries: int = 2,
-    ) -> None:
-        if not api_key or not isinstance(api_key, str):
+    ):
+        if not api_key or not isinstance(api_key, str) or not api_key.strip():
             raise AuthenticationError(
-                "'api_key' must be a non-empty string. "
-                "Obtain one at https://nexus-similarity.io/keys"
+                "A non-empty 'api_key' string is required to initialize the Client."
             )
-        self._api_key = api_key
-        self._base_url = (base_url or self._DEFAULT_BASE_URL).rstrip("/")
-        self._timeout = timeout
+        if not isinstance(timeout, (int, float)) or timeout <= 0:
+            raise ValueError(f"'timeout' must be a positive number, got {timeout}.")
+        if not isinstance(max_retries, int) or max_retries < 0:
+            raise ValueError(f"'max_retries' must be a non-negative int, got {max_retries}.")
+
+        self._api_key = api_key.strip()
+        self._base_url = base_url.rstrip("/")
+        self._timeout = float(timeout)
         self._max_retries = max_retries
         self._http = httpx.Client(
             headers={
@@ -180,286 +268,368 @@ class Client:
             timeout=self._timeout,
         )
 
-    def _post_with_retries(self, path: str, payload: dict) -> dict:
+    def composite_score_search(
+        self,
+        query_embedding: list[float],
+        corpus_id: str,
+        top_k: int = 10,
+        alpha: float = DEFAULT_ALPHA,
+        min_composite_score: float | None = None,
+        significance_threshold: float | None = None,
+    ) -> list[CompositeScoreResult]:
+        """
+        Search a corpus for the top-k items most similar to query_embedding,
+        ranked by composite score (alpha * cosine + (1-alpha) * NMI).
+
+        Returns only results that pass optional filters for composite score
+        and/or statistical significance.
+
+        Parameters
+        ----------
+        query_embedding : list[float]
+            Dense embedding vector of the query item. Must match the
+            embedding dimension of the corpus (typically 384–3072 floats).
+        corpus_id : str
+            Identifier of the corpus to search. Max 128 characters.
+        top_k : int, optional
+            Number of candidates to return before filtering. Range [1, 1000].
+        alpha : float, optional
+            Weighting factor for cosine vs NMI. 0.0 = pure NMI, 1.0 = pure cosine.
+            Default 0.6. Must be in [0.0, 1.0].
+        min_composite_score : float, optional
+            If provided, exclude results with composite_score below this threshold.
+        significance_threshold : float, optional
+            If provided, exclude results with p_value >= this threshold.
+            Typical value: 0.05.
+
+        Returns
+        -------
+        list[CompositeScoreResult]
+            Ranked list of results, highest composite_score first.
+
+        Raises
+        ------
+        AuthenticationError
+            When the API key is rejected.
+        RateLimitError
+            When rate limit is exceeded.
+        ValidationError
+            When the API rejects the request payload.
+        SimilaritySearchError
+            On any other API or network failure.
+        """
+        query_embedding = _validate_embedding(query_embedding, "query_embedding")
+        corpus_id = _validate_corpus_id(corpus_id)
+        top_k = _validate_top_k(top_k)
+        alpha = _validate_alpha(alpha)
+
+        if min_composite_score is not None:
+            if not isinstance(min_composite_score, (int, float)):
+                raise TypeError("'min_composite_score' must be a float.")
+            min_composite_score = float(min_composite_score)
+
+        if significance_threshold is not None:
+            if not isinstance(significance_threshold, (int, float)):
+                raise TypeError("'significance_threshold' must be a float.")
+            significance_threshold = float(significance_threshold)
+
+        payload: dict[str, Any] = {
+            "query_embedding": query_embedding,
+            "corpus_id": corpus_id,
+            "top_k": top_k,
+            "alpha": alpha,
+        }
+        if min_composite_score is not None:
+            payload["min_composite_score"] = min_composite_score
+        if significance_threshold is not None:
+            payload["significance_threshold"] = significance_threshold
+
+        response = self._post("/search", payload)
+        raw_results = response.get("results")
+        if not isinstance(raw_results, list):
+            raise SimilaritySearchError(
+                f"Expected 'results' list in API response, got: {type(raw_results).__name__}."
+            )
+        return [_parse_composite_score_result(r) for r in raw_results]
+
+    def composite_score_pair(
+        self,
+        embedding_a: list[float],
+        embedding_b: list[float],
+        corpus_size: int,
+        alpha: float = DEFAULT_ALPHA,
+    ) -> CompositeScoreResult:
+        """
+        Compute the composite similarity score between exactly two embeddings,
+        with p-value calibrated against a user-specified corpus size
+        (Bonferroni correction over corpus_size comparisons).
+
+        Use this when you have two specific items to compare and want statistical
+        significance without maintaining a persistent corpus index.
+        Do NOT use this for batch search across many candidates — use
+        composite_score_search instead.
+
+        Parameters
+        ----------
+        embedding_a : list[float]
+            First dense embedding vector.
+        embedding_b : list[float]
+            Second dense embedding vector. Must have the same dimension as embedding_a.
+        corpus_size : int
+            Number of items in the reference corpus for Bonferroni correction.
+            Must be >= 1. Use 1 if comparing in isolation (no correction applied).
+        alpha : float, optional
+            Weighting factor for cosine vs NMI. Default 0.6.
+
+        Returns
+        -------
+        CompositeScoreResult
+            The composite score result. item_id will be 'pair' for pairwise calls.
+
+        Raises
+        ------
+        ValueError
+            If embedding dimensions differ.
+        AuthenticationError, RateLimitError, ValidationError, SimilaritySearchError
+            See composite_score_search for error semantics.
+        """
+        embedding_a = _validate_embedding(embedding_a, "embedding_a")
+        embedding_b = _validate_embedding(embedding_b, "embedding_b")
+        alpha = _validate_alpha(alpha)
+
+        if len(embedding_a) != len(embedding_b):
+            raise ValueError(
+                f"'embedding_a' and 'embedding_b' must have the same dimension. "
+                f"Got {len(embedding_a)} vs {len(embedding_b)}."
+            )
+        if not isinstance(corpus_size, int) or corpus_size < 1:
+            raise ValueError(
+                f"'corpus_size' must be a positive integer, got {corpus_size!r}."
+            )
+
+        payload = {
+            "embedding_a": embedding_a,
+            "embedding_b": embedding_b,
+            "corpus_size": corpus_size,
+            "alpha": alpha,
+        }
+        response = self._post("/pair", payload)
+        result_raw = response.get("result")
+        if not isinstance(result_raw, dict):
+            raise SimilaritySearchError(
+                f"Expected 'result' dict in API response, got: {type(result_raw).__name__}."
+            )
+        return _parse_composite_score_result(result_raw)
+
+    def corpus_upsert(
+        self,
+        corpus_id: str,
+        items: list[dict],
+    ) -> dict:
+        """
+        Insert or update items in a corpus. Existing items with the same
+        item_id are overwritten; new items are appended.
+
+        Each item in 'items' must be a dict with at minimum:
+            - 'item_id' (str): unique identifier within the corpus
+            - 'embedding' (list[float]): dense embedding vector
+
+        Optional per-item fields:
+            - 'metadata' (dict): arbitrary key-value pairs returned in search results
+
+        Parameters
+        ----------
+        corpus_id : str
+            Target corpus. Created automatically if it does not exist.
+        items : list[dict]
+            List of item dicts. Maximum 5000 items per call.
+
+        Returns
+        -------
+        dict
+            API response with keys: 'corpus_id', 'upserted_count', 'skipped_count'.
+
+        Raises
+        ------
+        ValueError
+            If items is empty or exceeds 5000.
+        AuthenticationError, RateLimitError, ValidationError, SimilaritySearchError
+            Standard error semantics.
+        """
+        corpus_id = _validate_corpus_id(corpus_id)
+
+        if not isinstance(items, list):
+            raise TypeError(f"'items' must be a list, got {type(items).__name__}.")
+        if len(items) == 0:
+            raise ValueError("'items' must not be empty.")
+        if len(items) > 5000:
+            raise ValueError(
+                f"'items' must not exceed 5000 per call, got {len(items)}. "
+                "Split into multiple corpus_upsert calls."
+            )
+
+        validated_items = []
+        for idx, item in enumerate(items):
+            if not isinstance(item, dict):
+                raise TypeError(f"items[{idx}] must be a dict, got {type(item).__name__}.")
+            item_id = item.get("item_id")
+            if not item_id or not isinstance(item_id, str):
+                raise ValueError(f"items[{idx}]['item_id'] must be a non-empty string.")
+            embedding = _validate_embedding(item.get("embedding"), f"items[{idx}]['embedding']")
+            validated_item: dict[str, Any] = {"item_id": item_id, "embedding": embedding}
+            if "metadata" in item:
+                if not isinstance(item["metadata"], dict):
+                    raise TypeError(f"items[{idx}]['metadata'] must be a dict.")
+                validated_item["metadata"] = item["metadata"]
+            validated_items.append(validated_item)
+
+        payload = {"corpus_id": corpus_id, "items": validated_items}
+        return self._post("/corpus/upsert", payload)
+
+    def corpus_index_stats(self, corpus_id: str) -> IndexStats:
+        """
+        Retrieve statistics for a corpus index: item count, embedding dimension,
+        creation timestamp, and storage usage.
+
+        Use this to verify a corpus exists and is ready before issuing searches,
+        or to determine corpus_size for Bonferroni correction in composite_score_pair.
+        Do NOT use this as a health-check polling loop — it bills per call.
+
+        Parameters
+        ----------
+        corpus_id : str
+            Corpus to inspect. Max 128 characters.
+
+        Returns
+        -------
+        IndexStats
+
+        Raises
+        ------
+        SimilaritySearchError (status_code=404)
+            If the corpus does not exist.
+        AuthenticationError, RateLimitError, ValidationError, SimilaritySearchError
+            Standard error semantics.
+        """
+        corpus_id = _validate_corpus_id(corpus_id)
+        response = self._get(f"/corpus/{corpus_id}/stats")
+        try:
+            return IndexStats(
+                corpus_id=str(response["corpus_id"]),
+                item_count=int(response["item_count"]),
+                embedding_dim=int(response["embedding_dim"]),
+                index_created_at=str(response["index_created_at"]),
+                storage_bytes=int(response["storage_bytes"]),
+                metadata=response.get("metadata") or {},
+            )
+        except KeyError as exc:
+            raise SimilaritySearchError(
+                f"API response missing expected field: {exc}. Raw response: {response}"
+            ) from exc
+
+    def _post(self, path: str, payload: dict) -> dict:
         url = f"{self._base_url}{path}"
         last_exc: Exception | None = None
         for attempt in range(self._max_retries + 1):
             try:
                 response = self._http.post(url, json=payload)
-                _raise_for_status(response)
-                return response.json()
-            except (RateLimitError, AuthenticationError, ValidationError):
-                raise
-            except ServerError as exc:
+                return self._handle_response(response)
+            except (httpx.ConnectError, httpx.TimeoutException, httpx.RemoteProtocolError) as exc:
                 last_exc = exc
                 if attempt < self._max_retries:
-                    time.sleep(0.5 * (2 ** attempt))
-            except httpx.TimeoutException as exc:
-                last_exc = SimilaritySearchError(
-                    f"Request to {url} timed out after {self._timeout}s"
-                )
-                if attempt < self._max_retries:
-                    time.sleep(0.5 * (2 ** attempt))
-            except httpx.RequestError as exc:
+                    time.sleep(0.5 * (attempt + 1))
+                    continue
                 raise SimilaritySearchError(
-                    f"Network error contacting {url}: {exc}"
+                    f"Network error after {self._max_retries + 1} attempt(s) "
+                    f"on POST {path}: {exc}"
                 ) from exc
-        raise last_exc
+        raise SimilaritySearchError(
+            f"Exhausted retries on POST {path}."
+        ) from last_exc
 
-    def compute_hybrid_similarity(
-        self,
-        query: dict[str, Any],
-        candidates: list[dict[str, Any]],
-        top_k: int = 10,
-        confidence_level: float = 0.95,
-        nmi_weight_override: float | None = None,
-    ) -> HybridSimilarityResult:
-        """
-        Compute hybrid NMI+Cosine similarity between one query record and a
-        list of candidate records.
+    def _get(self, path: str) -> dict:
+        url = f"{self._base_url}{path}"
+        last_exc: Exception | None = None
+        for attempt in range(self._max_retries + 1):
+            try:
+                response = self._http.get(url)
+                return self._handle_response(response)
+            except (httpx.ConnectError, httpx.TimeoutException, httpx.RemoteProtocolError) as exc:
+                last_exc = exc
+                if attempt < self._max_retries:
+                    time.sleep(0.5 * (attempt + 1))
+                    continue
+                raise SimilaritySearchError(
+                    f"Network error after {self._max_retries + 1} attempt(s) "
+                    f"on GET {path}: {exc}"
+                ) from exc
+        raise SimilaritySearchError(
+            f"Exhausted retries on GET {path}."
+        ) from last_exc
 
-        The API infers feature types per-call and calibrates the NMI/Cosine
-        weight split dynamically. No schema declaration required.
+    def _handle_response(self, response: httpx.Response) -> dict:
+        status = response.status_code
+        if status == 200 or status == 201:
+            try:
+                return response.json()
+            except Exception as exc:
+                raise SimilaritySearchError(
+                    f"API returned status {status} but response body is not valid JSON: {exc}. "
+                    f"Body snippet: {response.text[:300]!r}"
+                ) from exc
 
-        Use this when: you have one query and want ranked candidates with
-        confidence intervals on the top result.
-        Do NOT use this when: you need pairwise similarity across an entire
-        corpus — use `rank_candidates_by_hybrid_score` with `top_k` instead.
+        body: Any = None
+        try:
+            body = response.json()
+        except Exception:
+            body = response.text[:500]
 
-        Parameters
-        ----------
-        query : dict
-            The reference record. Keys are feature names; values can be
-            strings (categorical) or numbers (continuous).
-        candidates : list[dict]
-            Records to rank against the query. Maximum 10,000 per call.
-        top_k : int
-            Number of top-ranked candidates to return. Range: 1-100. Default 10.
-        confidence_level : float
-            Bootstrap confidence level for the score CI. Range: 0.80-0.99.
-            Default 0.95.
-        nmi_weight_override : float or None
-            If provided, fixes the NMI component weight in [0.0, 1.0] and
-            sets cosine_weight = 1 - nmi_weight_override, bypassing dynamic
-            calibration. Use only when you have domain knowledge of the
-            feature distribution.
+        detail = body.get("detail", body) if isinstance(body, dict) else body
 
-        Returns
-        -------
-        HybridSimilarityResult
-        """
-        _validate_record(query, "query")
-        _validate_candidates(candidates)
-        if not isinstance(top_k, int) or not (1 <= top_k <= 100):
-            raise ValidationError("'top_k' must be an integer in [1, 100]")
-        if not isinstance(confidence_level, (int, float)) or not (0.80 <= confidence_level <= 0.99):
-            raise ValidationError("'confidence_level' must be a float in [0.80, 0.99]")
-        if nmi_weight_override is not None:
-            if not isinstance(nmi_weight_override, (int, float)) or not (0.0 <= nmi_weight_override <= 1.0):
-                raise ValidationError("'nmi_weight_override' must be a float in [0.0, 1.0]")
-
-        payload: dict[str, Any] = {
-            "query": query,
-            "candidates": candidates,
-            "top_k": top_k,
-            "confidence_level": confidence_level,
-        }
-        if nmi_weight_override is not None:
-            payload["nmi_weight_override"] = float(nmi_weight_override)
-
-        raw = self._post_with_retries("/similarity/hybrid", payload)
-        return HybridSimilarityResult(raw)
-
-    def rank_candidates_by_hybrid_score(
-        self,
-        query: dict[str, Any],
-        candidates: list[dict[str, Any]],
-        top_k: int = 10,
-        confidence_level: float = 0.95,
-    ) -> list[HybridSimilarityResult]:
-        """
-        Rank all candidates against a query and return the top-k results,
-        each with its own hybrid score and confidence interval.
-
-        Use this when: you need a full ranked list with per-candidate
-        confidence intervals, not just the aggregate top result.
-        Do NOT use this when: candidates > 10,000 — split into batches
-        and use `compute_hybrid_similarity` per shard.
-
-        Parameters
-        ----------
-        query : dict
-            The reference record.
-        candidates : list[dict]
-            Records to rank. Maximum 10,000.
-        top_k : int
-            Number of ranked results to return. Range: 1-100.
-        confidence_level : float
-            Bootstrap CI level applied to each candidate score. Range: 0.80-0.99.
-
-        Returns
-        -------
-        list[HybridSimilarityResult], ordered descending by hybrid_score.
-        """
-        _validate_record(query, "query")
-        _validate_candidates(candidates)
-        if not isinstance(top_k, int) or not (1 <= top_k <= 100):
-            raise ValidationError("'top_k' must be an integer in [1, 100]")
-        if not isinstance(confidence_level, (int, float)) or not (0.80 <= confidence_level <= 0.99):
-            raise ValidationError("'confidence_level' must be a float in [0.80, 0.99]")
-
-        payload: dict[str, Any] = {
-            "query": query,
-            "candidates": candidates,
-            "top_k": top_k,
-            "confidence_level": confidence_level,
-        }
-        raw = self._post_with_retries("/similarity/rank", payload)
-        return [HybridSimilarityResult(r) for r in raw["ranked_results"]]
-
-    def compute_pairwise_nmi(
-        self,
-        record_a: dict[str, Any],
-        record_b: dict[str, Any],
-        categorical_features: list[str] | None = None,
-    ) -> dict[str, Any]:
-        """
-        Compute raw NMI-only similarity between two records, normalized by
-        joint entropy. Returns NMI score, joint entropy, and per-feature
-        contributions.
-
-        Use this when: you want to isolate the categorical dependency signal
-        from the hybrid score, or when all features are categorical.
-        Do NOT use this when: your data is predominantly continuous — cosine
-        dominates in that regime and `compute_hybrid_similarity` is more
-        appropriate.
-
-        Parameters
-        ----------
-        record_a : dict
-            First record.
-        record_b : dict
-            Second record.
-        categorical_features : list[str] or None
-            Explicit list of feature keys to treat as categorical. If None,
-            the API infers types automatically.
-
-        Returns
-        -------
-        dict with keys: nmi_score, joint_entropy, per_feature_nmi,
-        detected_categorical_features.
-        """
-        _validate_record(record_a, "record_a")
-        _validate_record(record_b, "record_b")
-        if categorical_features is not None:
-            if not isinstance(categorical_features, list):
-                raise ValidationError("'categorical_features' must be a list of strings or None")
-            for i, f in enumerate(categorical_features):
-                if not isinstance(f, str) or not f:
-                    raise ValidationError(
-                        f"'categorical_features[{i}]' must be a non-empty string"
-                    )
-
-        payload: dict[str, Any] = {
-            "record_a": record_a,
-            "record_b": record_b,
-        }
-        if categorical_features is not None:
-            payload["categorical_features"] = categorical_features
-
-        return self._post_with_retries("/similarity/nmi-pairwise", payload)
-
-    def estimate_score_confidence_interval(
-        self,
-        query: dict[str, Any],
-        candidate: dict[str, Any],
-        bootstrap_n: int = 500,
-        confidence_level: float = 0.95,
-    ) -> dict[str, Any]:
-        """
-        Run a standalone bootstrap confidence interval estimation on the
-        hybrid score between one query and one candidate, with configurable
-        resample count.
-
-        Use this when: you need tighter or wider CI control (e.g., bootstrap_n
-        > 500 for publication-grade estimates) on a single pair.
-        Do NOT use this when: you are ranking multiple candidates — calling
-        this per-candidate in a loop is wasteful; use `rank_candidates_by_hybrid_score`.
-
-        Parameters
-        ----------
-        query : dict
-            Reference record.
-        candidate : dict
-            Single candidate record to compare.
-        bootstrap_n : int
-            Number of bootstrap resamples. Range: 100-2000. Default 500.
-        confidence_level : float
-            Confidence level for the interval. Range: 0.80-0.99.
-
-        Returns
-        -------
-        dict with keys: hybrid_score, ci_low, ci_high, ci_level,
-        bootstrap_n, standard_error, nmi_weight, cosine_weight.
-        """
-        _validate_record(query, "query")
-        _validate_record(candidate, "candidate")
-        if not isinstance(bootstrap_n, int) or not (100 <= bootstrap_n <= 2000):
-            raise ValidationError("'bootstrap_n' must be an integer in [100, 2000]")
-        if not isinstance(confidence_level, (int, float)) or not (0.80 <= confidence_level <= 0.99):
-            raise ValidationError("'confidence_level' must be a float in [0.80, 0.99]")
-
-        payload: dict[str, Any] = {
-            "query": query,
-            "candidate": candidate,
-            "bootstrap_n": bootstrap_n,
-            "confidence_level": confidence_level,
-        }
-        return self._post_with_retries("/similarity/bootstrap-ci", payload)
-
-    def main_method(
-        self,
-        data: dict[str, Any],
-    ) -> HybridSimilarityResult:
-        """
-        Convenience entry point matching the canonical SDK invocation pattern.
-
-        Expects `data` to contain:
-            - 'query' (dict): the reference record
-            - 'candidates' (list[dict]): records to rank
-            - 'top_k' (int, optional): default 10
-            - 'confidence_level' (float, optional): default 0.95
-            - 'nmi_weight_override' (float, optional)
-
-        Returns
-        -------
-        HybridSimilarityResult
-        """
-        if data is None:
-            raise ValidationError("'data' must not be None")
-        if not isinstance(data, dict):
-            raise ValidationError(
-                f"'data' must be a dict, got {type(data).__name__}"
+        if status == 401 or status == 403:
+            raise AuthenticationError(
+                f"Authentication failed (HTTP {status}): {detail}",
+                status_code=status,
+                response_body=body,
             )
-        query = data.get("query")
-        candidates = data.get("candidates")
-        top_k = data.get("top_k", 10)
-        confidence_level = data.get("confidence_level", 0.95)
-        nmi_weight_override = data.get("nmi_weight_override", None)
-
-        return self.compute_hybrid_similarity(
-            query=query,
-            candidates=candidates,
-            top_k=top_k,
-            confidence_level=confidence_level,
-            nmi_weight_override=nmi_weight_override,
+        if status == 422:
+            raise ValidationError(
+                f"Request validation error (HTTP 422): {detail}",
+                status_code=422,
+                response_body=body,
+            )
+        if status == 429:
+            retry_after: float | None = None
+            raw_retry = response.headers.get("Retry-After")
+            if raw_retry is not None:
+                try:
+                    retry_after = float(raw_retry)
+                except ValueError:
+                    pass
+            raise RateLimitError(
+                f"Rate limit exceeded (HTTP 429): {detail}. "
+                f"Retry after {retry_after}s." if retry_after else
+                f"Rate limit exceeded (HTTP 429): {detail}.",
+                retry_after=retry_after,
+            )
+        if status >= 500:
+            raise SimilaritySearchError(
+                f"API server error (HTTP {status}): {detail}",
+                status_code=status,
+                response_body=body,
+            )
+        raise SimilaritySearchError(
+            f"Unexpected API response (HTTP {status}): {detail}",
+            status_code=status,
+            response_body=body,
         )
 
-    def close(self) -> None:
+    def close(self):
+        """Release the underlying HTTP connection pool."""
         self._http.close()
 
     def __enter__(self) -> "Client":
         return self
 
-    def __exit__(self, *args: Any) -> None:
+    def __exit__(self, *_: Any) -> None:
         self.close()
