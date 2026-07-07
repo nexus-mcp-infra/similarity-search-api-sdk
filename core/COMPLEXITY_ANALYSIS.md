@@ -1,43 +1,25 @@
-# Análisis de Complejidad Computacional — Similarity Search API (NMI+Cosine Fusion)
+# Análisis de Complejidad Computacional — Similarity Search API
 
-## Parámetros de referencia
+## Endpoints Públicos
 
-- `n` = número de items en el corpus del payload
-- `f` = número de features por item
-- `c` = cardinalidad promedio de features categóricas
-- `k` = resultados solicitados (top-k)
+### `POST /similarity` — Score híbrido NMI+Cosine entre dos items
 
----
-
-## Endpoints públicos
-
-### `POST /similarity/search`
-
-**Temporal:** `O(n · f · c)` dominado por el cálculo de NMI sobre features categóricas: por cada par (query, item) se estima la entropía conjunta con tabla de contingencia de tamaño `c²`, dando `O(n · f · c²)` en el peor caso con alta cardinalidad categórica. El cosine sobre TF-IDF es `O(n · f)` y queda subordinado.
-**Espacial:** `O(n · f)` para materializar las representaciones vectoriales del corpus completo en memoria por request — sin índice persistente, todo vive en el heap de la invocación.
-**Mejor caso:** `O(n · f)` cuando todas las features son numéricas continuas (NMI no se activa, solo cosine). **Promedio:** `O(n · f · c)` con `c ≈ 10–20`. **Peor caso:** `O(n · f · c²)` con features categóricas de alta cardinalidad (`c > 100`, e.g. códigos postales, SKUs).
-**Cuello de botella:** la construcción de tablas de contingencia para NMI es `O(n · c²)` por feature categórica — con `f_cat` features categóricas de alta cardinalidad el costo crece cuadráticamente en `c` y domina completamente.
+**Temporal:** O(F_cat · H + F_cont · D + B) donde F_cat = features categoriales, H = cardinalidad máxima por feature (cálculo NMI via tabla de contingencia), F_cont = dimensión del embedding Cosine, B = n_bootstrap = 500 remuestreos fijos. **Mejor caso:** features 100% continuas, sin paso NMI → O(F_cont · D + B); **peor caso:** features mixtas con cardinalidad H elevada → O(F_cat · H² + F_cont · D + B), dominado por la tabla de contingencia NMI cuando H > 50. **Espacial:** O(H²) por la matriz de contingencia por feature categorial + O(B) para la distribución bootstrap. **Cuello de botella:** el bootstrap CI con n=500 es O(B · F) constante pero añade ~15–25ms fijos por llamada independientemente del tamaño del input; no escala con datos, pero tampoco se puede eliminar sin perder los intervalos de confianza.
 
 ---
 
-### `POST /similarity/score`
+### `POST /similarity/batch` — Score híbrido sobre N pares simultáneos
 
-**Temporal:** `O(f · c)` — opera sobre un par único (query, item) sin iterar corpus. NMI se calcula feature a feature con corrección de Laplace en `O(c log c)` por feature categórica; cosine en `O(f)`.
-**Espacial:** `O(f)` — solo dos vectores en memoria.
-**Mejor / promedio / peor:** `O(f)` / `O(f · c)` / `O(f · c log c)` según proporción de features categóricas y su cardinalidad.
-**Cuello de botella:** ninguno relevante a escala de par único; el overhead dominante es la serialización/deserialización JSON del payload, no el cálculo.
+**Temporal:** O(N · (F_cat · H² + F_cont · D + B)) en el caso general; la inferencia de tipo de feature se ejecuta una vez por par, no una vez por batch, porque cada par puede tener schema distinto. **Mejor caso:** N pares homogéneos con features continuas → reutilización de embeddings Cosine reduce a O(N · D + B); **peor caso:** N pares con schemas heterogéneos y H variable → sin posibilidad de vectorizar el paso NMI entre pares. **Espacial:** O(N · H²) — matrices de contingencia no se comparten entre pares; con N=100 y H=100, esto equivale a ~4MB en float32. **Cuello de botella:** la ausencia de schema declarado fuerza inferencia de tipo en cada par; si el cliente puede declarar schema, este paso O(F) se elimina del hot path.
 
 ---
 
-### `POST /similarity/rank`
+### `GET /similarity/calibration` — Consulta de pesos NMI/Cosine recalibrados por dominio
 
-**Temporal:** `O(n · f · c + n log k)` — fusión NMI+cosine sobre todo el corpus seguida de un heap parcial de tamaño `k` para extraer top-k en `O(n log k)` en lugar de sort completo `O(n log n)`.
-**Espacial:** `O(n · f + k)` — corpus materializado más el heap de resultados.
-**Mejor caso:** `O(n · f + n log k)` con features puramente numéricas. **Promedio/peor:** igual que `/search` con el heap añadido, que es despreciable frente al costo NMI.
-**Cuello de botella:** idéntico a `/search`: la fase NMI domina; el heap top-k es `O(n log k)` y no compite.
+**Temporal:** O(1) — lectura de tabla de pesos pre-computados desde ClickHouse con query puntual por `domain_id`. **Mejor / promedio / peor:** O(1) en los tres casos; la varianza es de latencia de red al cluster ClickHouse, no de cómputo. **Espacial:** O(1) respuesta. **Cuello de botella:** dependencia de latencia externa a ClickHouse (~2–5ms p50, ~20ms p99); un cache LRU por `domain_id` con TTL de 60s lo convierte en O(1) local en el 95% de llamadas.
 
 ---
 
-## Saturación y estrategia de escala
+## Saturación y Estrategia de Escala
 
-Con `n = 500` items, `f = 20` features y `c = 15`, cada request ejecuta ~150 000 operaciones elementales; en serverless Python 3.11 con Uvicorn el throughput empírico estimado ronda **40–80 req/s por instancia** antes de que la CPU sature (el paso NMI no libera el GIL al ser puro Python/NumPy en loop categórico). Para escalar más allá: (1) vectorizar la construcción de tablas de contingencia con `numpy.histogramdd` eliminando el loop por item — reduce la constante de NMI ~4x; (2) aplicar early-exit cosine pre-filter descartando items con cosine < umbral antes de computar NMI, reduciendo `n` efectivo en 60–80% en corpus con distribución natural; (3) escalar horizontalmente con concurrencia stateless pura — cada instancia es independiente, sin coordinación.
+Con Uvicorn en modo async y workers = 2 × CPU_cores, el punto de saturación se estima en **~120 req/s por instancia** para el endpoint `/similarity` con configuración mixta típica (F_cat ≈ 5, H ≈ 20, F_cont ≈ 384 dimensiones), limitado por el bootstrap fijo de 500 remuestreos que ocupa ~18ms de CPU por llamada. Para escalar más allá: (1) mover el bootstrap a un worker thread pool para no bloquear el event loop, (2) reducir n_bootstrap adaptativamente a 200 cuando el score híbrido supera 0.85 de confianza preliminar — los módulos `src/math/statistics` soportan early stopping por convergencia de CI — y (3) cachear la inferencia de tipo de feature por hash de schema para eliminar O(F) redundante en batches homogéneos.
