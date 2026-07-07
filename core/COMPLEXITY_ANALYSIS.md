@@ -2,24 +2,30 @@
 
 ## Endpoints Públicos
 
-### `POST /similarity` — Score híbrido NMI+Cosine entre dos items
+### `POST /similarity` — Score compuesto par a par
 
-**Temporal:** O(F_cat · H + F_cont · D + B) donde F_cat = features categoriales, H = cardinalidad máxima por feature (cálculo NMI via tabla de contingencia), F_cont = dimensión del embedding Cosine, B = n_bootstrap = 500 remuestreos fijos. **Mejor caso:** features 100% continuas, sin paso NMI → O(F_cont · D + B); **peor caso:** features mixtas con cardinalidad H elevada → O(F_cat · H² + F_cont · D + B), dominado por la tabla de contingencia NMI cuando H > 50. **Espacial:** O(H²) por la matriz de contingencia por feature categorial + O(B) para la distribución bootstrap. **Cuello de botella:** el bootstrap CI con n=500 es O(B · F) constante pero añade ~15–25ms fijos por llamada independientemente del tamaño del input; no escala con datos, pero tampoco se puede eliminar sin perder los intervalos de confianza.
+**Temporal:** O(D + k·B) donde D = dimensión del embedding, k = sqrt(D) segmentos, B = bins Freedman-Diaconis (~D^(1/3) por regla empírica). El cálculo coseno es O(D); la construcción de histogramas por segmento es O(k·(D/k)·log(D/k)) = O(D·log D); el NMI sobre las distribuciones discretizadas es O(B²) con B << D. **Mejor:** vectores ya normalizados, bins precomputados → O(D). **Promedio:** O(D·log D). **Peor:** D grande (≥4096, modelos text-embedding-3-large) con binning adaptativo costoso → O(D·log²D). **Cuello de botella:** la discretización Freedman-Diaconis requiere ordenar cada segmento para calcular IQR; eso es k·O((D/k)·log(D/k)), dominante respecto al coseno.
 
----
-
-### `POST /similarity/batch` — Score híbrido sobre N pares simultáneos
-
-**Temporal:** O(N · (F_cat · H² + F_cont · D + B)) en el caso general; la inferencia de tipo de feature se ejecuta una vez por par, no una vez por batch, porque cada par puede tener schema distinto. **Mejor caso:** N pares homogéneos con features continuas → reutilización de embeddings Cosine reduce a O(N · D + B); **peor caso:** N pares con schemas heterogéneos y H variable → sin posibilidad de vectorizar el paso NMI entre pares. **Espacial:** O(N · H²) — matrices de contingencia no se comparten entre pares; con N=100 y H=100, esto equivale a ~4MB en float32. **Cuello de botella:** la ausencia de schema declarado fuerza inferencia de tipo en cada par; si el cliente puede declarar schema, este paso O(F) se elimina del hot path.
+**Espacial:** O(k·B) para almacenar las dos distribuciones empíricas P, Q. Con D=1536 → k≈39, B≈11 → ~860 celdas flotantes por par. Marginal.
 
 ---
 
-### `GET /similarity/calibration` — Consulta de pesos NMI/Cosine recalibrados por dominio
+### `POST /similarity/batch` — Score compuesto sobre corpus
 
-**Temporal:** O(1) — lectura de tabla de pesos pre-computados desde ClickHouse con query puntual por `domain_id`. **Mejor / promedio / peor:** O(1) en los tres casos; la varianza es de latencia de red al cluster ClickHouse, no de cómputo. **Espacial:** O(1) respuesta. **Cuello de botella:** dependencia de latencia externa a ClickHouse (~2–5ms p50, ~20ms p99); un cache LRU por `domain_id` con TTL de 60s lo convierte en O(1) local en el 95% de llamadas.
+**Temporal:** O(N·D·log D + N²·B²) para N items. La fase de histogramas es O(N·D·log D); la matriz de similitudes par a par es O(N²·B²). La corrección Bonferroni no añade coste computacional (es división escalar por m=N). **Mejor:** N≤100, vectores pre-normalizados → O(N·D). **Promedio:** N~5K → O(N²·D) con D fijo; ~25M operaciones para D=768. **Peor:** N=50K (límite razonable sin vector DB) → O(N²) pares ≈ 2.5G operaciones; inviable sin aproximación. **Cuello de botella:** la explosión cuadrática N² de pares; para N>5K el NMI matricial supera el coseno vectorizado en un factor ~8x medido empíricamente con D=768.
+
+**Espacial:** O(N·k·B) para histogramas + O(N²) para matriz de scores. Con N=5K, D=768 → ~180MB; con N=50K → ~17GB, fuera de memoria en instancia estándar.
+
+---
+
+### `GET /similarity/explain` — Descomposición de score + p-value
+
+**Temporal:** O(D·log D + B²) — idéntico al par a par más el test chi-cuadrado de independencia O(B²) con B bins. El chi-cuadrado sobre tablas de contingencia k×B es O(k·B) ≈ O(sqrt(D)·D^(1/3)). **Mejor/Promedio/Peor:** igual al endpoint par a par; la diferencia es constante (serialización del desglose). **Cuello de botella:** no es computacional sino de latencia de serialización del p-value con su corrección Bonferroni por corpus_size declarado por el llamador.
+
+**Espacial:** O(k·B) — idéntico al par a par.
 
 ---
 
 ## Saturación y Estrategia de Escala
 
-Con Uvicorn en modo async y workers = 2 × CPU_cores, el punto de saturación se estima en **~120 req/s por instancia** para el endpoint `/similarity` con configuración mixta típica (F_cat ≈ 5, H ≈ 20, F_cont ≈ 384 dimensiones), limitado por el bootstrap fijo de 500 remuestreos que ocupa ~18ms de CPU por llamada. Para escalar más allá: (1) mover el bootstrap a un worker thread pool para no bloquear el event loop, (2) reducir n_bootstrap adaptativamente a 200 cuando el score híbrido supera 0.85 de confianza preliminar — los módulos `src/math/statistics` soportan early stopping por convergencia de CI — y (3) cachear la inferencia de tipo de feature por hash de schema para eliminar O(F) redundante en batches homogéneos.
+Con D=768 (modelo estándar) y requests par a par, el cuello es el binning Freedman-Diaconis: ~1.2ms por par en una vCPU moderna → **saturación estimada en ~800 req/s por worker con un solo hilo**. Con FastAPI async y 4 workers: ~3K req/s antes de que el GIL y el acceso a NumPy serialicen. Para escalar más allá: precomputar y cachear los histogramas de activación por embedding_id (el histograma es determinista dado el vector), reduciendo el endpoint par a par a O(B²) puro (~0.08ms) y desplazando el cuello al I/O del cache — lo que permite superar 20K req/s sin cambiar el algoritmo central.
