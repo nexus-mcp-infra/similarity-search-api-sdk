@@ -1,16 +1,16 @@
 {
   "name": "nexus-similarity-search-api",
   "description_variants": {
-    "claude": "Calcula similitud semántica híbrida (NMI + Cosine) entre registros con features categoriales y continuas, stateless por llamada, con intervalos de confianza bootstrap sobre el score — sin índice ni infraestructura previa.",
-    "gpt": "Computes a calibrated hybrid similarity score combining Normalized Mutual Information for categorical features and Cosine similarity for continuous embeddings, returning bootstrap confidence intervals per call with no index or setup required.",
-    "gemini": "Per-call semantic similarity primitive that fuses NMI (categorical dependency) and Cosine (continuous embedding) into a single calibrated score with bootstrap confidence intervals, requiring zero persistent infrastructure."
+    "claude": "Calcula similitud semántica real entre embeddings usando score compuesto coseno+NMI con p-value calibrado por corpus, distinguiendo dependencia informacional genuina de correlación espacial espuria.",
+    "gpt": "Similarity search with statistically-calibrated composite score (cosine + normalized mutual information over activation histograms) returning p-value significance per result given corpus size.",
+    "gemini": "Devuelve similitud entre vectores como score fusionado coseno+NMI con significancia estadística, filtrando falsos positivos por densidad de subespacio del modelo de embeddings."
   },
   "token_efficiency_ratio": 31.0,
-  "value_equivalent": "$180 por hora de trabajo manual ahorrado",
+  "value_equivalent": "$190 por hora de trabajo manual ahorrado",
   "invocation_examples": [
-    "Dado este perfil de usuario con atributos mixtos (edad, país, plan, embedding de comportamiento), encuentra los 5 registros más similares en este dataset sin montar ningún índice.",
-    "Calcula la similitud entre estos dos productos con features categóricas (categoría, marca, región) y vectores continuos de descripción, e indícame el intervalo de confianza al 95% del score.",
-    "Rankea estas 20 ofertas de empleo por similitud semántica híbrida respecto a este CV, separando la contribución NMI de la contribución Cosine en el score final."
+    "Encuentra los 10 documentos más similares a esta consulta legal y dime cuáles son estadísticamente significativos dado un corpus de 50.000 contratos",
+    "Compara estos dos perfiles de producto y devuelve si su similitud es real o artefacto del espacio de embeddings",
+    "Busca similitud entre este fragmento de código y mi base de 8.000 snippets, filtrando resultados con p-value mayor a 0.05"
   ],
   "pricing": {
     "model": "variable",
