@@ -1,401 +1,408 @@
 from fastapi import FastAPI, HTTPException, Security, status
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.security.api_key import APIKeyHeader
 from pydantic import BaseModel, Field, field_validator
 from typing import Optional
 import numpy as np
-from scipy.stats import entropy as scipy_entropy
-from sklearn.metrics import normalized_mutual_info_score
-from sklearn.preprocessing import LabelEncoder
-import hashlib
-import hmac
+from scipy.stats import chi2_contingency
+from scipy.spatial.distance import cosine as cosine_distance
 import os
-import time
-
+import math
 
 app = FastAPI(
-    title="Hybrid Semantic Similarity API",
-    description="Stateless NMI+Cosine hybrid similarity with bootstrap confidence intervals",
+    title="Similarity Search API",
+    description="Cosine + NMI composite similarity with calibrated p-values. No vector DB required.",
     version="1.0.0",
 )
 
-_bearer = HTTPBearer()
-
-_VALID_TOKEN_HASH = hashlib.sha256(
-    os.environ.get("SIMILARITY_API_TOKEN", "insecure-default-token").encode()
-).hexdigest()
+API_KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=True)
+_VALID_API_KEY = os.environ.get("SIMILARITY_API_KEY", "")
 
 
-def _verify_token(credentials: HTTPAuthorizationCredentials = Security(_bearer)) -> str:
-    token_hash = hashlib.sha256(credentials.credentials.encode()).hexdigest()
-    if not hmac.compare_digest(token_hash, _VALID_TOKEN_HASH):
+def _authenticate(api_key: str = Security(API_KEY_HEADER)) -> str:
+    if not _VALID_API_KEY:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Server misconfiguration: SIMILARITY_API_KEY not set.",
+        )
+    if api_key != _VALID_API_KEY:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid or missing bearer token",
+            detail="Invalid or missing API key.",
         )
-    return credentials.credentials
+    return api_key
 
 
-class FeatureVector(BaseModel):
-    values: list[float | int | str] = Field(
-        ...,
-        min_length=1,
-        max_length=4096,
-        description="Mixed-type feature vector: floats/ints treated as continuous, strings as categorical",
-    )
-
-    @field_validator("values")
-    @classmethod
-    def validate_no_none_elements(cls, v):
-        for i, el in enumerate(v):
-            if el is None:
-                raise ValueError(f"Element at index {i} is None — all values must be non-null")
-        return v
+def _freedman_diaconis_bins(data: np.ndarray) -> int:
+    n = len(data)
+    if n < 2:
+        return 1
+    iqr = np.percentile(data, 75) - np.percentile(data, 25)
+    if iqr == 0.0:
+        return max(1, int(np.sqrt(n)))
+    bin_width = 2.0 * iqr * (n ** (-1.0 / 3.0))
+    data_range = data.max() - data.min()
+    if bin_width == 0.0 or data_range == 0.0:
+        return 1
+    return max(1, int(math.ceil(data_range / bin_width)))
 
 
-class SimilarityRequest(BaseModel):
-    query: FeatureVector
-    candidates: list[FeatureVector] = Field(..., min_length=1, max_length=512)
-    top_k: int = Field(default=10, ge=1, le=512)
-    bootstrap_samples: int = Field(default=500, ge=100, le=2000)
-    confidence_level: float = Field(default=0.95, ge=0.80, le=0.99)
-
-    @field_validator("candidates")
-    @classmethod
-    def validate_uniform_length(cls, v, info):
-        if "query" in info.data:
-            q_len = len(info.data["query"].values)
-            for i, c in enumerate(v):
-                if len(c.values) != q_len:
-                    raise ValueError(
-                        f"Candidate at index {i} has {len(c.values)} features but query has {q_len} — lengths must match"
-                    )
-        return v
+def _segment_magnitudes(embedding: np.ndarray) -> np.ndarray:
+    D = len(embedding)
+    k = max(1, int(math.isqrt(D)))
+    segment_size = D // k
+    magnitudes = np.empty(k)
+    for i in range(k):
+        start = i * segment_size
+        end = start + segment_size if i < k - 1 else D
+        magnitudes[i] = np.linalg.norm(embedding[start:end])
+    return magnitudes
 
 
-class SimilarityScore(BaseModel):
-    candidate_index: int
-    hybrid_score: float
-    cosine_score: float
-    nmi_score: float
-    categorical_weight: float
-    continuous_weight: float
-    ci_lower: float
-    ci_upper: float
-    confidence_level: float
+def _activation_histogram(embedding: np.ndarray, bins: Optional[int] = None) -> np.ndarray:
+    magnitudes = _segment_magnitudes(embedding)
+    if bins is None:
+        bins = _freedman_diaconis_bins(magnitudes)
+    hist, _ = np.histogram(magnitudes, bins=bins, density=False)
+    return hist.astype(np.float64)
 
 
-class SimilarityResponse(BaseModel):
-    results: list[SimilarityScore]
-    query_feature_profile: dict
-    computation_ms: float
-    api_version: str = "1.0.0"
+def _shannon_entropy(distribution: np.ndarray) -> float:
+    total = distribution.sum()
+    if total == 0.0:
+        return 0.0
+    p = distribution / total
+    p = p[p > 0]
+    return float(-np.sum(p * np.log(p)))
 
 
-class BatchRequest(BaseModel):
-    queries: list[SimilarityRequest] = Field(..., min_length=1, max_length=32)
+def _normalized_mutual_information(hist_p: np.ndarray, hist_q: np.ndarray) -> tuple[float, float]:
+    n_bins = max(len(hist_p), len(hist_q))
+    if len(hist_p) < n_bins:
+        hist_p = np.pad(hist_p, (0, n_bins - len(hist_p)))
+    if len(hist_q) < n_bins:
+        hist_q = np.pad(hist_q, (0, n_bins - len(hist_q)))
+
+    joint = np.outer(hist_p, hist_q)
+    total = joint.sum()
+    if total == 0.0:
+        return 0.0, 1.0
+
+    joint_normalized = joint / total
+    p_marginal = joint_normalized.sum(axis=1, keepdims=True)
+    q_marginal = joint_normalized.sum(axis=0, keepdims=True)
+
+    independence = p_marginal * q_marginal
+    nonzero = (joint_normalized > 0) & (independence > 0)
+    mi = float(np.sum(
+        joint_normalized[nonzero] * np.log(joint_normalized[nonzero] / independence[nonzero])
+    ))
+
+    h_p = _shannon_entropy(hist_p)
+    h_q = _shannon_entropy(hist_q)
+    denom = math.sqrt(h_p * h_q)
+    nmi = mi / denom if denom > 0.0 else 0.0
+    nmi = float(np.clip(nmi, 0.0, 1.0))
+
+    contingency_table = np.outer(hist_p, hist_q)
+    row_sums = contingency_table.sum(axis=1)
+    col_sums = contingency_table.sum(axis=0)
+    nonzero_rows = row_sums > 0
+    nonzero_cols = col_sums > 0
+    trimmed = contingency_table[np.ix_(nonzero_rows, nonzero_cols)]
+
+    if trimmed.shape[0] < 2 or trimmed.shape[1] < 2:
+        chi2_pvalue = 1.0
+    else:
+        try:
+            _, chi2_pvalue, _, _ = chi2_contingency(trimmed, correction=False)
+        except ValueError:
+            chi2_pvalue = 1.0
+
+    return nmi, float(chi2_pvalue)
 
 
-class BatchResponse(BaseModel):
-    responses: list[SimilarityResponse]
-    total_computation_ms: float
-
-
-def _detect_feature_types(values: list) -> tuple[list[int], list[int]]:
-    categorical_indices = []
-    continuous_indices = []
-    for i, v in enumerate(values):
-        if isinstance(v, str):
-            categorical_indices.append(i)
-        else:
-            continuous_indices.append(i)
-    return categorical_indices, continuous_indices
-
-
-def _encode_categorical(values: list, indices: list[int]) -> np.ndarray:
-    if not indices:
-        return np.array([])
-    subset = [str(values[i]) for i in indices]
-    le = LabelEncoder()
-    return le.fit_transform(subset).astype(float)
-
-
-def _extract_continuous(values: list, indices: list[int]) -> np.ndarray:
-    if not indices:
-        return np.array([])
-    return np.array([float(values[i]) for i in indices])
+def _bonferroni_correction(raw_pvalue: float, corpus_size: int) -> float:
+    m = max(1, corpus_size)
+    corrected = min(1.0, raw_pvalue * m)
+    return float(corrected)
 
 
 def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
-    if a.size == 0 or b.size == 0:
-        return 0.0
     norm_a = np.linalg.norm(a)
     norm_b = np.linalg.norm(b)
-    if norm_a < 1e-12 or norm_b < 1e-12:
+    if norm_a == 0.0 or norm_b == 0.0:
         return 0.0
-    return float(np.dot(a, b) / (norm_a * norm_b))
+    return float(1.0 - cosine_distance(a, b))
 
 
-def _nmi_categorical_pair(q_cat: np.ndarray, c_cat: np.ndarray) -> float:
-    if q_cat.size == 0 or c_cat.size == 0:
-        return 0.0
-    if np.all(q_cat == q_cat[0]) and np.all(c_cat == c_cat[0]):
-        return 1.0 if q_cat[0] == c_cat[0] else 0.0
-    if np.all(q_cat == q_cat[0]) or np.all(c_cat == c_cat[0]):
-        return 0.0
-    try:
-        nmi = normalized_mutual_info_score(q_cat.astype(int), c_cat.astype(int), average_method="arithmetic")
-        return float(np.clip(nmi, 0.0, 1.0))
-    except Exception:
-        return 0.0
-
-
-def _dynamic_weights(n_cat: int, n_cont: int) -> tuple[float, float]:
-    total = n_cat + n_cont
-    if total == 0:
-        return 0.5, 0.5
-    w_cat = n_cat / total
-    w_cont = n_cont / total
-    return float(w_cat), float(w_cont)
-
-
-def _hybrid_score_single(
-    query_values: list,
-    candidate_values: list,
-    cat_idx: list[int],
-    cont_idx: list[int],
-    w_cat: float,
-    w_cont: float,
-) -> float:
-    q_cont = _extract_continuous(query_values, cont_idx)
-    c_cont = _extract_continuous(candidate_values, cont_idx)
-    cosine = _cosine_similarity(q_cont, c_cont) if cont_idx else 0.0
-
-    q_cat_enc = _encode_categorical(query_values, cat_idx)
-    c_cat_enc_raw = [str(candidate_values[i]) for i in cat_idx] if cat_idx else []
-    if cat_idx:
-        all_labels = list(set([str(query_values[i]) for i in cat_idx] + c_cat_enc_raw))
-        le = LabelEncoder()
-        le.fit(all_labels)
-        q_cat_arr = le.transform([str(query_values[i]) for i in cat_idx]).astype(float)
-        c_cat_arr = le.transform(c_cat_enc_raw).astype(float)
-        nmi = _nmi_categorical_pair(q_cat_arr, c_cat_arr)
-    else:
-        nmi = 0.0
-
-    score = w_cat * nmi + w_cont * cosine
-    return float(np.clip(score, 0.0, 1.0)), float(cosine), float(nmi)
-
-
-def _bootstrap_ci(
-    query_values: list,
-    candidate_values: list,
-    cat_idx: list[int],
-    cont_idx: list[int],
-    w_cat: float,
-    w_cont: float,
-    n_samples: int,
-    confidence_level: float,
-) -> tuple[float, float]:
-    all_indices = list(range(len(query_values)))
-    if len(all_indices) < 2:
-        base_score, _, _ = _hybrid_score_single(query_values, candidate_values, cat_idx, cont_idx, w_cat, w_cont)
-        return base_score, base_score
-
-    rng = np.random.default_rng(seed=42)
-    bootstrap_scores = []
-
-    for _ in range(n_samples):
-        sampled = rng.choice(all_indices, size=len(all_indices), replace=True).tolist()
-        s_cat_idx = [j for j, orig in enumerate(sampled) if orig in cat_idx]
-        s_cont_idx = [j for j, orig in enumerate(sampled) if orig in cont_idx]
-        s_query = [query_values[i] for i in sampled]
-        s_candidate = [candidate_values[i] for i in sampled]
-        n_cat_s = len(s_cat_idx)
-        n_cont_s = len(s_cont_idx)
-        w_cat_s, w_cont_s = _dynamic_weights(n_cat_s, n_cont_s)
-        score, _, _ = _hybrid_score_single(s_query, s_candidate, s_cat_idx, s_cont_idx, w_cat_s, w_cont_s)
-        bootstrap_scores.append(score)
-
-    alpha = 1.0 - confidence_level
-    lower = float(np.percentile(bootstrap_scores, 100 * alpha / 2))
-    upper = float(np.percentile(bootstrap_scores, 100 * (1 - alpha / 2)))
-    return lower, upper
-
-
-def _compute_similarity_response(req: SimilarityRequest) -> SimilarityResponse:
-    t0 = time.perf_counter()
-
-    query_values = req.query.values
-    cat_idx, cont_idx = _detect_feature_types(query_values)
-    w_cat, w_cont = _dynamic_weights(len(cat_idx), len(cont_idx))
-
-    scores: list[SimilarityScore] = []
-    for idx, candidate in enumerate(req.candidates):
-        c_values = candidate.values
-        hybrid, cosine, nmi = _hybrid_score_single(query_values, c_values, cat_idx, cont_idx, w_cat, w_cont)
-        ci_lower, ci_upper = _bootstrap_ci(
-            query_values, c_values, cat_idx, cont_idx, w_cat, w_cont,
-            req.bootstrap_samples, req.confidence_level
-        )
-        scores.append(SimilarityScore(
-            candidate_index=idx,
-            hybrid_score=round(hybrid, 6),
-            cosine_score=round(cosine, 6),
-            nmi_score=round(nmi, 6),
-            categorical_weight=round(w_cat, 4),
-            continuous_weight=round(w_cont, 4),
-            ci_lower=round(ci_lower, 6),
-            ci_upper=round(ci_upper, 6),
-            confidence_level=req.confidence_level,
-        ))
-
-    scores.sort(key=lambda s: s.hybrid_score, reverse=True)
-    top = scores[: req.top_k]
-
-    elapsed_ms = (time.perf_counter() - t0) * 1000.0
-
-    return SimilarityResponse(
-        results=top,
-        query_feature_profile={
-            "total_features": len(query_values),
-            "categorical_features": len(cat_idx),
-            "continuous_features": len(cont_idx),
-            "categorical_weight": round(w_cat, 4),
-            "continuous_weight": round(w_cont, 4),
-        },
-        computation_ms=round(elapsed_ms, 2),
-    )
-
-
-@app.post(
-    "/v1/similarity/ranked",
-    response_model=SimilarityResponse,
-    summary="Compute hybrid NMI+Cosine similarity and return ranked candidates",
-    status_code=status.HTTP_200_OK,
-)
-def rank_candidates_by_hybrid_similarity(
-    req: SimilarityRequest,
-    _token: str = Security(_verify_token),
-) -> SimilarityResponse:
-    if not req.query.values:
-        raise HTTPException(status_code=422, detail="Query feature vector must not be empty")
-    return _compute_similarity_response(req)
-
-
-@app.post(
-    "/v1/similarity/batch",
-    response_model=BatchResponse,
-    summary="Batch hybrid similarity ranking for multiple independent queries",
-    status_code=status.HTTP_200_OK,
-)
-def batch_rank_candidates_by_hybrid_similarity(
-    req: BatchRequest,
-    _token: str = Security(_verify_token),
-) -> BatchResponse:
-    t0 = time.perf_counter()
-    responses = []
-    for sub_req in req.queries:
-        responses.append(_compute_similarity_response(sub_req))
-    total_ms = (time.perf_counter() - t0) * 1000.0
-    return BatchResponse(responses=responses, total_computation_ms=round(total_ms, 2))
-
-
-@app.post(
-    "/v1/similarity/score",
-    summary="Return raw hybrid score between exactly two vectors (no ranking)",
-    status_code=status.HTTP_200_OK,
-)
-def score_vector_pair(
-    query: FeatureVector,
-    candidate: FeatureVector,
-    bootstrap_samples: int = 500,
-    confidence_level: float = 0.95,
-    _token: str = Security(_verify_token),
-) -> dict:
-    if not query.values:
-        raise HTTPException(status_code=422, detail="Query vector must not be empty")
-    if len(query.values) != len(candidate.values):
+def _validate_embedding(raw: list, field_name: str) -> np.ndarray:
+    if raw is None or len(raw) == 0:
         raise HTTPException(
-            status_code=422,
-            detail=f"Vector length mismatch: query has {len(query.values)} features, candidate has {len(candidate.values)}",
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"'{field_name}' must be a non-empty list of floats.",
         )
-    if bootstrap_samples < 100 or bootstrap_samples > 2000:
-        raise HTTPException(status_code=422, detail="bootstrap_samples must be between 100 and 2000")
-    if confidence_level < 0.80 or confidence_level > 0.99:
-        raise HTTPException(status_code=422, detail="confidence_level must be between 0.80 and 0.99")
+    try:
+        arr = np.array(raw, dtype=np.float64)
+    except (ValueError, TypeError):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"'{field_name}' contains non-numeric values.",
+        )
+    if arr.ndim != 1:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"'{field_name}' must be a 1-D array.",
+        )
+    if not np.all(np.isfinite(arr)):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"'{field_name}' contains NaN or Inf values.",
+        )
+    return arr
 
-    cat_idx, cont_idx = _detect_feature_types(query.values)
-    w_cat, w_cont = _dynamic_weights(len(cat_idx), len(cont_idx))
-    hybrid, cosine, nmi = _hybrid_score_single(query.values, candidate.values, cat_idx, cont_idx, w_cat, w_cont)
-    ci_lower, ci_upper = _bootstrap_ci(
-        query.values, candidate.values, cat_idx, cont_idx, w_cat, w_cont,
-        bootstrap_samples, confidence_level
+
+class PairSimilarityRequest(BaseModel):
+    embedding_a: list[float] = Field(..., min_length=1, max_length=32768)
+    embedding_b: list[float] = Field(..., min_length=1, max_length=32768)
+    alpha: float = Field(default=0.6, ge=0.0, le=1.0)
+    corpus_size: int = Field(default=1, ge=1, le=500000)
+
+    @field_validator("embedding_a", "embedding_b")
+    @classmethod
+    def embeddings_must_be_finite(cls, v):
+        if any(not math.isfinite(x) for x in v):
+            raise ValueError("Embedding contains NaN or Inf.")
+        return v
+
+
+class PairSimilarityResponse(BaseModel):
+    cosine_similarity: float
+    nmi: float
+    composite_score: float
+    p_value_raw: float
+    p_value_bonferroni: float
+    statistically_significant: bool
+    alpha_used: float
+    corpus_size: int
+
+
+class BatchSimilarityRequest(BaseModel):
+    query_embedding: list[float] = Field(..., min_length=1, max_length=32768)
+    corpus_embeddings: list[list[float]] = Field(..., min_length=1, max_length=5000)
+    alpha: float = Field(default=0.6, ge=0.0, le=1.0)
+    top_k: int = Field(default=10, ge=1, le=500)
+    significance_threshold: float = Field(default=0.05, ge=0.0, le=1.0)
+
+    @field_validator("query_embedding")
+    @classmethod
+    def query_must_be_finite(cls, v):
+        if any(not math.isfinite(x) for x in v):
+            raise ValueError("Query embedding contains NaN or Inf.")
+        return v
+
+
+class BatchSimilarityResult(BaseModel):
+    index: int
+    cosine_similarity: float
+    nmi: float
+    composite_score: float
+    p_value_bonferroni: float
+    statistically_significant: bool
+
+
+class BatchSimilarityResponse(BaseModel):
+    results: list[BatchSimilarityResult]
+    corpus_size: int
+    alpha_used: float
+    significance_threshold: float
+    top_k_requested: int
+
+
+class SignificanceFilterRequest(BaseModel):
+    query_embedding: list[float] = Field(..., min_length=1, max_length=32768)
+    corpus_embeddings: list[list[float]] = Field(..., min_length=1, max_length=5000)
+    alpha: float = Field(default=0.6, ge=0.0, le=1.0)
+    significance_threshold: float = Field(default=0.05, ge=0.001, le=0.5)
+    min_composite_score: float = Field(default=0.0, ge=0.0, le=1.0)
+
+
+class SignificanceFilterResponse(BaseModel):
+    significant_indices: list[int]
+    significant_count: int
+    corpus_size: int
+    rejection_rate: float
+
+
+@app.post("/v1/similarity/pair", response_model=PairSimilarityResponse)
+def compute_pair_similarity(
+    request: PairSimilarityRequest,
+    api_key: str = Security(_authenticate),
+) -> PairSimilarityResponse:
+    emb_a = _validate_embedding(request.embedding_a, "embedding_a")
+    emb_b = _validate_embedding(request.embedding_b, "embedding_b")
+
+    if len(emb_a) != len(emb_b):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Embedding dimensions must match: got {len(emb_a)} vs {len(emb_b)}.",
+        )
+
+    cosine_sim = _cosine_similarity(emb_a, emb_b)
+
+    shared_bins = max(
+        _freedman_diaconis_bins(_segment_magnitudes(emb_a)),
+        _freedman_diaconis_bins(_segment_magnitudes(emb_b)),
     )
-    return {
-        "hybrid_score": round(hybrid, 6),
-        "cosine_score": round(cosine, 6),
-        "nmi_score": round(nmi, 6),
-        "categorical_weight": round(w_cat, 4),
-        "continuous_weight": round(w_cont, 4),
-        "ci_lower": round(ci_lower, 6),
-        "ci_upper": round(ci_upper, 6),
-        "confidence_level": confidence_level,
-        "feature_profile": {
-            "total": len(query.values),
-            "categorical": len(cat_idx),
-            "continuous": len(cont_idx),
-        },
-    }
+    hist_a = _activation_histogram(emb_a, bins=shared_bins)
+    hist_b = _activation_histogram(emb_b, bins=shared_bins)
+
+    nmi, p_raw = _normalized_mutual_information(hist_a, hist_b)
+    p_bonferroni = _bonferroni_correction(p_raw, request.corpus_size)
+    composite = request.alpha * cosine_sim + (1.0 - request.alpha) * nmi
+
+    return PairSimilarityResponse(
+        cosine_similarity=round(cosine_sim, 6),
+        nmi=round(nmi, 6),
+        composite_score=round(composite, 6),
+        p_value_raw=round(p_raw, 8),
+        p_value_bonferroni=round(p_bonferroni, 8),
+        statistically_significant=p_bonferroni < 0.05,
+        alpha_used=request.alpha,
+        corpus_size=request.corpus_size,
+    )
 
 
-@app.get(
-    "/v1/health",
-    summary="Liveness check — returns service status and math backend versions",
-    status_code=status.HTTP_200_OK,
-)
+@app.post("/v1/similarity/batch", response_model=BatchSimilarityResponse)
+def compute_batch_similarity(
+    request: BatchSimilarityRequest,
+    api_key: str = Security(_authenticate),
+) -> BatchSimilarityResponse:
+    query = _validate_embedding(request.query_embedding, "query_embedding")
+    corpus_size = len(request.corpus_embeddings)
+
+    if corpus_size == 0:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="corpus_embeddings must contain at least one vector.",
+        )
+
+    query_seg = _segment_magnitudes(query)
+    query_bins = _freedman_diaconis_bins(query_seg)
+    query_hist = _activation_histogram(query, bins=query_bins)
+
+    scored: list[tuple[int, float, float, float, float]] = []
+
+    for idx, raw_vec in enumerate(request.corpus_embeddings):
+        candidate = _validate_embedding(raw_vec, f"corpus_embeddings[{idx}]")
+        if len(candidate) != len(query):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"corpus_embeddings[{idx}] dimension {len(candidate)} != query dimension {len(query)}.",
+            )
+
+        cosine_sim = _cosine_similarity(query, candidate)
+        cand_hist = _activation_histogram(candidate, bins=query_bins)
+        nmi, p_raw = _normalized_mutual_information(query_hist, cand_hist)
+        p_bonferroni = _bonferroni_correction(p_raw, corpus_size)
+        composite = request.alpha * cosine_sim + (1.0 - request.alpha) * nmi
+        scored.append((idx, cosine_sim, nmi, composite, p_bonferroni))
+
+    scored.sort(key=lambda x: x[3], reverse=True)
+    top = scored[: request.top_k]
+
+    results = [
+        BatchSimilarityResult(
+            index=item[0],
+            cosine_similarity=round(item[1], 6),
+            nmi=round(item[2], 6),
+            composite_score=round(item[3], 6),
+            p_value_bonferroni=round(item[4], 8),
+            statistically_significant=item[4] < request.significance_threshold,
+        )
+        for item in top
+    ]
+
+    return BatchSimilarityResponse(
+        results=results,
+        corpus_size=corpus_size,
+        alpha_used=request.alpha,
+        significance_threshold=request.significance_threshold,
+        top_k_requested=request.top_k,
+    )
+
+
+@app.post("/v1/similarity/filter-significant", response_model=SignificanceFilterResponse)
+def filter_statistically_significant(
+    request: SignificanceFilterRequest,
+    api_key: str = Security(_authenticate),
+) -> SignificanceFilterResponse:
+    query = _validate_embedding(request.query_embedding, "query_embedding")
+    corpus_size = len(request.corpus_embeddings)
+
+    if corpus_size == 0:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="corpus_embeddings must contain at least one vector.",
+        )
+
+    query_bins = _freedman_diaconis_bins(_segment_magnitudes(query))
+    query_hist = _activation_histogram(query, bins=query_bins)
+
+    significant_indices: list[int] = []
+
+    for idx, raw_vec in enumerate(request.corpus_embeddings):
+        candidate = _validate_embedding(raw_vec, f"corpus_embeddings[{idx}]")
+        if len(candidate) != len(query):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"corpus_embeddings[{idx}] dimension {len(candidate)} != query dimension {len(query)}.",
+            )
+
+        cosine_sim = _cosine_similarity(query, candidate)
+        cand_hist = _activation_histogram(candidate, bins=query_bins)
+        nmi, p_raw = _normalized_mutual_information(query_hist, cand_hist)
+        p_bonferroni = _bonferroni_correction(p_raw, corpus_size)
+        composite = request.alpha * cosine_sim + (1.0 - request.alpha) * nmi
+
+        if p_bonferroni < request.significance_threshold and composite >= request.min_composite_score:
+            significant_indices.append(idx)
+
+    rejection_rate = round(1.0 - len(significant_indices) / corpus_size, 4)
+
+    return SignificanceFilterResponse(
+        significant_indices=significant_indices,
+        significant_count=len(significant_indices),
+        corpus_size=corpus_size,
+        rejection_rate=rejection_rate,
+    )
+
+
+@app.get("/v1/health")
 def health_check() -> dict:
-    import sklearn
-    import scipy
+    return {"status": "ok", "version": "1.0.0"}
+
+
+@app.get("/v1/schema/composite-score")
+def describe_composite_score_formula() -> dict:
     return {
-        "status": "ok",
-        "api_version": "1.0.0",
-        "math_backends": {
-            "numpy": np.__version__,
-            "scipy": scipy.__version__,
-            "scikit_learn": sklearn.__version__,
+        "formula": "S = alpha * cosine_similarity + (1 - alpha) * NMI",
+        "alpha_default": 0.6,
+        "alpha_range": [0.0, 1.0],
+        "nmi_definition": "MI(P, Q) / sqrt(H(P) * H(Q))",
+        "activation_histogram": {
+            "method": "segment embedding into k=floor(sqrt(D)) windows, compute L2 norm per window",
+            "binning": "Freedman-Diaconis rule applied to per-segment magnitudes",
         },
-    }
-
-
-@app.get(
-    "/v1/similarity/explain",
-    summary="Explain hybrid score formula and weight calibration for a given feature profile",
-    status_code=status.HTTP_200_OK,
-)
-def explain_hybrid_score_formula(
-    n_categorical: int = 0,
-    n_continuous: int = 0,
-    _token: str = Security(_verify_token),
-) -> dict:
-    if n_categorical < 0 or n_continuous < 0:
-        raise HTTPException(status_code=422, detail="Feature counts must be non-negative integers")
-    if n_categorical + n_continuous == 0:
-        raise HTTPException(status_code=422, detail="At least one feature must be declared")
-    if n_categorical > 4096 or n_continuous > 4096:
-        raise HTTPException(status_code=422, detail="Feature count per type must not exceed 4096")
-
-    w_cat, w_cont = _dynamic_weights(n_categorical, n_continuous)
-    return {
-        "formula": "hybrid_score = w_cat * NMI(categorical_features) + w_cont * Cosine(continuous_features)",
-        "w_cat": round(w_cat, 4),
-        "w_cont": round(w_cont, 4),
-        "calibration_method": "proportional to feature count ratio, per-call",
-        "nmi_normalization": "arithmetic mean of marginal entropies H(X) and H(Y)",
-        "cosine_domain": "continuous numeric features extracted from mixed vector",
-        "bootstrap_ci": "BCa-approximated via percentile method over n=500..2000 index resamples",
-        "n_categorical": n_categorical,
-        "n_continuous": n_continuous,
-        "type_inference": "automatic — strings -> categorical, int/float -> continuous, no schema declaration needed",
+        "p_value": {
+            "base_test": "chi-squared test of independence on joint activation histogram",
+            "correction": "Bonferroni: p_corrected = min(1, p_raw * corpus_size)",
+            "interpretation": "p_bonferroni < 0.05 means similarity is statistically significant given corpus size",
+        },
+        "when_cosine_misleads": (
+            "High cosine (> 0.85) with low NMI (< 0.3) indicates vectors are geometrically "
+            "close due to embedding space density, not shared informational structure. "
+            "The composite score and p-value together disambiguate this case."
+        ),
     }
 
 # --- NEXUS: servidor MCP real montado en el mismo proceso (inyectado por forge_agent) ---
@@ -430,35 +437,35 @@ async def _nexus_mcp_call_core(method: str, path: str, params: dict) -> Any:
         return resp.json()
 
 
-@_nexus_mcp.tool(name='nexus_similarity_search_api_score_hybrid_nmi_cosine_similarity', description='Computes a calibrated hybrid similarity score between two mixed-feature records by fusing Normalized Mutual Information (for categorical features) and Cosine similarity (for continuous embedding vectors) into a single weighted score with bootstrap confidence intervals. Use when comparing two individual records with a known split between categorical and continuous features. Do NOT use for batch ranking against a corpus (use rank_corpus_by_hybrid_similarity instead), and do NOT use when all features are purely continuous (use score_cosine_with_bootstrap instead).')
-async def score_hybrid_nmi_cosine_similarity(continuous_vec_a: Annotated[list[float], Field(..., description='Continuous embedding vector for record A. Must have the same length as continuous_vec_b. Values must be finite floats.', min_length=2, max_length=4096)], continuous_vec_b: Annotated[list[float], Field(..., description='Continuous embedding vector for record B. Must match the length of continuous_vec_a.', min_length=2, max_length=4096)], categorical_vec_a: Annotated[list[str], Field(..., description="Ordered list of categorical feature values for record A. Must have the same length as categorical_vec_b. Each element is a discrete label (e.g., 'electronics', 'US', 'premium').", min_length=1, max_length=64)], categorical_vec_b: Annotated[list[str], Field(..., description='Ordered list of categorical feature values for record B. Must match the length and positional semantics of categorical_vec_a.', min_length=1, max_length=64)], categorical_weight: Annotated[float, Field(0.5, description='Weight assigned to the NMI component in the final hybrid score. The continuous (cosine) component receives weight (1 - categorical_weight). Must be in [0.0, 1.0]. A value of 0.5 treats both modalities equally.', ge=0.0, le=1.0)], bootstrap_iterations: Annotated[float, Field(500, description='Number of bootstrap resampling iterations used to compute the 95% confidence interval on the hybrid score. Higher values increase precision but add latency. Recommended range: 200-1000.', ge=100, le=2000)]) -> dict[str, Any]:
-    """NMI+Cosine Hybrid Score"""
-    params = {"continuous_vec_a": continuous_vec_a, "continuous_vec_b": continuous_vec_b, "categorical_vec_a": categorical_vec_a, "categorical_vec_b": categorical_vec_b, "categorical_weight": categorical_weight, "bootstrap_iterations": bootstrap_iterations}
-    return await _nexus_mcp_call_core('POST', '/v1/similarity/hybrid-score', params)
+@_nexus_mcp.tool(name='nexus_similarity_search_api_rank_by_nmi_cosine_composite', description='Ranks a corpus of candidate embeddings against a query embedding using a composite score that fuses cosine similarity with normalized mutual information (NMI) computed over activation-histogram distributions of each embedding. Returns ranked candidates with composite score, raw cosine, raw NMI, and calibrated p-value indicating whether the similarity is statistically significant given corpus size. Use when you need to distinguish genuine semantic similarity from spatial correlation artifacts in dense embedding subspaces. Do NOT use for exact nearest-neighbor lookup where statistical significance is irrelevant, or when corpus has fewer than 30 vectors (p-value calibration degrades below this threshold).')
+async def rank_by_nmi_cosine_composite(query_embedding: Annotated[list[float], Field(..., description='Dense float vector representing the query item. Must match dimensionality of all candidate_embeddings vectors. Typically 128–4096 dims depending on model.', min_length=32, max_length=8192)], candidate_embeddings: Annotated[list[list[float]], Field(..., description='2-D array of candidate float vectors to rank. Each row is one embedding. All rows must share the same dimensionality as query_embedding. Minimum 30 rows for reliable p-value calibration.', min_length=2, max_length=10000)], histogram_bins: Annotated[float, Field(16, description="Number of bins used to discretize each embedding's activation distribution before computing NMI. Higher values increase NMI resolution but raise compute cost. Typical range 8–64; default 16 balances precision vs. speed.", ge=4, le=128)], alpha: Annotated[float, Field(0.05, description="Significance threshold for the calibrated p-value. Results with p > alpha are flagged as statistically non-significant. Does not filter results, only sets the 'significant' boolean field in each result row.", ge=0.001, le=0.2)], top_k: Annotated[float, Field(10, description='Maximum number of top-ranked results to return, ordered by composite score descending. Set to 0 to return all candidates.', ge=0, le=10000)], composite_weight_nmi: Annotated[float, Field(0.4, description='Weight assigned to normalized NMI in the composite score formula: composite = (1 - w) * cosine + w * nmi_normalized. Weight for cosine is implicitly (1 - composite_weight_nmi). Use higher values when embedding space is known to be anisotropic or cluster-dense.', ge=0.0, le=1.0)]) -> dict[str, Any]:
+    """NMI-Cosine Composite Ranking"""
+    params = {"query_embedding": query_embedding, "candidate_embeddings": candidate_embeddings, "histogram_bins": histogram_bins, "alpha": alpha, "top_k": top_k, "composite_weight_nmi": composite_weight_nmi}
+    return await _nexus_mcp_call_core('POST', '/v1/similarity/rank-composite', params)
 
-@_nexus_mcp.tool(name='nexus_similarity_search_api_rank_corpus_by_hybrid_similarity', description='Ranks a corpus of candidate records against a single query record using the NMI+Cosine hybrid score, returning the top-k most similar candidates with their scores and confidence intervals. Operates fully stateless — no index is built or persisted. Use when you have a query record and a list of candidates to rank in a single call, without any prior indexing step. Do NOT use for corpora larger than 500 candidates per call (latency will exceed 5s); for larger corpora, batch the candidates manually. Do NOT use when you only need a score between two records (use score_hybrid_nmi_cosine_similarity instead).')
-async def rank_corpus_by_hybrid_similarity(query_continuous_vec: Annotated[list[float], Field(..., description='Continuous embedding vector of the query record.', min_length=2, max_length=4096)], query_categorical_vec: Annotated[list[str], Field(..., description='Ordered categorical feature values of the query record.', min_length=1, max_length=64)], corpus_continuous_vecs: Annotated[list[list[float]], Field(..., description='Matrix of continuous embedding vectors for the candidate corpus. Each row is one candidate. All rows must have the same dimensionality as query_continuous_vec.', min_length=1, max_length=500)], corpus_categorical_vecs: Annotated[Any, Field(..., description='Matrix of categorical feature vectors for the candidate corpus. Row i corresponds to corpus_continuous_vecs[i]. Each row must match the length of query_categorical_vec.', min_length=1, max_length=500)], top_k: Annotated[float, Field(10, description='Number of top-ranked candidates to return. Must not exceed the number of corpus entries.', ge=1, le=500)], categorical_weight: Annotated[float, Field(0.5, description='Weight of the NMI component in the hybrid score. Continuous cosine component receives (1 - categorical_weight).', ge=0.0, le=1.0)], bootstrap_iterations: Annotated[float, Field(200, description='Bootstrap iterations for confidence intervals on each ranked score. Lower values reduce latency for large corpora.', ge=100, le=1000)]) -> dict[str, Any]:
-    """Hybrid Similarity Corpus Ranking"""
-    params = {"query_continuous_vec": query_continuous_vec, "query_categorical_vec": query_categorical_vec, "corpus_continuous_vecs": corpus_continuous_vecs, "corpus_categorical_vecs": corpus_categorical_vecs, "top_k": top_k, "categorical_weight": categorical_weight, "bootstrap_iterations": bootstrap_iterations}
-    return await _nexus_mcp_call_core('POST', '/v1/similarity/rank-corpus', params)
+@_nexus_mcp.tool(name='nexus_similarity_search_api_compare_embedding_pair_significance', description="Computes the composite similarity score and calibrated p-value for exactly one query-candidate pair, given a reference corpus used solely for null-distribution calibration. Use when you need to audit a single pair's similarity in isolation — e.g., deduplication checks, plagiarism signals, or validating a specific match from a prior ranking call. Do NOT use as a batch ranking method (use rank_by_nmi_cosine_composite instead); invoking this tool in a loop over N candidates is O(N) API calls and defeats the purpose.")
+async def compare_embedding_pair_significance(embedding_a: Annotated[list[float], Field(..., description='First embedding vector of the pair being tested. Dimensionality must match embedding_b and all reference_corpus vectors.', min_length=32, max_length=8192)], embedding_b: Annotated[list[float], Field(..., description='Second embedding vector of the pair being tested.', min_length=32, max_length=8192)], reference_corpus: Annotated[list[list[float]], Field(..., description='Background corpus of embeddings used to build the null distribution for p-value calibration. Must have at least 30 rows. Not ranked or scored — used only for statistical reference.', min_length=30, max_length=10000)], histogram_bins: Annotated[float, Field(16, description='Bin count for activation-histogram discretization, consistent with what was used in any prior ranking call for comparability.', ge=4, le=128)]) -> dict[str, Any]:
+    """Pairwise NMI-Cosine Significance Test"""
+    params = {"embedding_a": embedding_a, "embedding_b": embedding_b, "reference_corpus": reference_corpus, "histogram_bins": histogram_bins}
+    return await _nexus_mcp_call_core('POST', '/v1/similarity/pair-significance', params)
 
-@_nexus_mcp.tool(name='nexus_similarity_search_api_score_cosine_with_bootstrap', description='Computes Cosine similarity between two continuous embedding vectors and returns the point estimate plus a bootstrap-derived 95% confidence interval. Use when records have only continuous features and no categorical component, or when you need a pure cosine baseline to compare against the hybrid score. Do NOT use when categorical features are present and informative — their non-linear dependence will be lost; use score_hybrid_nmi_cosine_similarity instead.')
-async def score_cosine_with_bootstrap(vec_a: Annotated[list[float], Field(..., description='First continuous embedding vector. Must be non-zero and have finite values.', min_length=2, max_length=4096)], vec_b: Annotated[list[float], Field(..., description='Second continuous embedding vector. Must match the length of vec_a.', min_length=2, max_length=4096)], bootstrap_iterations: Annotated[float, Field(500, description='Number of bootstrap resampling iterations for the confidence interval estimate.', ge=100, le=2000)], confidence_level: Annotated[float, Field(0.95, description='Confidence level for the interval, expressed as a proportion (e.g., 0.95 for 95% CI).', ge=0.8, le=0.99)]) -> dict[str, Any]:
-    """Cosine Similarity + Bootstrap CI"""
-    params = {"vec_a": vec_a, "vec_b": vec_b, "bootstrap_iterations": bootstrap_iterations, "confidence_level": confidence_level}
-    return await _nexus_mcp_call_core('POST', '/v1/similarity/cosine-bootstrap', params)
+@_nexus_mcp.tool(name='nexus_similarity_search_api_estimate_corpus_anisotropy', description='Analyzes a corpus of embeddings to quantify anisotropy — the degree to which embeddings cluster in a low-dimensional subspace, which inflates cosine similarity scores for unrelated items. Returns the explained-variance ratio of the top principal components, average pairwise cosine baseline, and a recommended composite_weight_nmi value to compensate for the measured anisotropy. Use this BEFORE your first ranking call on a new corpus to calibrate composite_weight_nmi appropriately. Do NOT use as a substitute for actual similarity ranking — it produces diagnostics, not similarity scores.')
+async def estimate_corpus_anisotropy(corpus_embeddings: Annotated[list[list[float]], Field(..., description='Full corpus of embeddings to analyze. Minimum 30 vectors required for meaningful PCA-based anisotropy estimation. Sampling a representative subset is acceptable for large corpora.', min_length=30, max_length=50000)], pca_components: Annotated[float, Field(20, description='Number of principal components to inspect when computing explained-variance ratio. Set to a value that covers the subspace you suspect is dominant (e.g., 10–50 for typical transformer embeddings).', ge=2, le=512)]) -> dict[str, Any]:
+    """Corpus Anisotropy Diagnostics"""
+    params = {"corpus_embeddings": corpus_embeddings, "pca_components": pca_components}
+    return await _nexus_mcp_call_core('POST', '/v1/similarity/corpus-anisotropy', params)
 
-@_nexus_mcp.tool(name='nexus_similarity_search_api_compute_pairwise_nmi_categorical_matrix', description='Computes the full pairwise Normalized Mutual Information matrix across a set of categorical feature vectors, returning an N x N symmetric matrix of NMI scores. Use to understand inter-record categorical dependence structure before deciding categorical_weight in hybrid scoring, or when you need NMI in isolation without a continuous component. Do NOT use for N greater than 200 (O(N^2) complexity becomes prohibitive); do NOT use when continuous features are the primary signal.')
-async def compute_pairwise_nmi_categorical_matrix(categorical_matrix: Annotated[Any, Field(..., description='N x F matrix where each row is the categorical feature vector of one record and each column is one categorical feature dimension. All rows must have equal length.', min_length=2, max_length=200)], normalize_per_feature: Annotated[bool, Field(True, description='If true, NMI is computed per feature dimension and averaged. If false, the joint NMI across all features is computed as a single value per pair. Default true is recommended for heterogeneous feature sets.')]) -> dict[str, Any]:
-    """Pairwise NMI Categorical Matrix"""
-    params = {"categorical_matrix": categorical_matrix, "normalize_per_feature": normalize_per_feature}
-    return await _nexus_mcp_call_core('POST', '/v1/similarity/nmi-pairwise-matrix', params)
+@_nexus_mcp.tool(name='nexus_similarity_search_api_filter_spurious_cosine_matches', description='Given a pre-ranked list of (candidate_index, cosine_score) pairs and the corresponding embeddings, recomputes NMI for each pair and removes matches whose composite score drops below a significance threshold — i.e., matches that were high-cosine but low-NMI, indicating spatial correlation rather than informational dependence. Returns the filtered and re-ranked list with composite scores and p-values. Use as a post-processing step on results from any cosine-only retrieval system (FAISS, Pinecone, etc.) to remove false positives before surfacing results to end users. Do NOT use as a primary ranking method when you have access to raw embeddings upfront — use rank_by_nmi_cosine_composite directly instead.')
+async def filter_spurious_cosine_matches(query_embedding: Annotated[list[float], Field(..., description='The original query embedding used to produce the cosine-ranked candidate list.', min_length=32, max_length=8192)], candidate_embeddings: Annotated[list[list[float]], Field(..., description='Embeddings of the pre-ranked candidates, in the same order as cosine_scores. Must have the same number of rows as cosine_scores.', min_length=1, max_length=1000)], cosine_scores: Annotated[list[float], Field(..., description='Pre-computed cosine similarity scores for each candidate, parallel to candidate_embeddings. Values must be in [-1.0, 1.0]. Passed in to avoid redundant recomputation.', ge=-1.0, le=1.0, min_length=1, max_length=1000)], min_composite_score: Annotated[float, Field(0.5, description='Minimum composite score threshold below which a candidate is classified as a spurious match and excluded from the output. Candidates at or above this value are retained and re-ranked.', ge=0.0, le=1.0)], histogram_bins: Annotated[float, Field(16, description='Bin count for NMI histogram discretization. Should match the value used in any prior ranking call for score consistency.', ge=4, le=128)]) -> dict[str, Any]:
+    """Spurious Cosine Match Filter"""
+    params = {"query_embedding": query_embedding, "candidate_embeddings": candidate_embeddings, "cosine_scores": cosine_scores, "min_composite_score": min_composite_score, "histogram_bins": histogram_bins}
+    return await _nexus_mcp_call_core('POST', '/v1/similarity/filter-spurious', params)
 
-@_nexus_mcp.tool(name='nexus_similarity_search_api_calibrate_hybrid_weight_from_labeled_pairs', description='Given a set of labeled record pairs with ground-truth similarity scores, estimates the optimal categorical_weight parameter that minimizes mean squared error between the hybrid NMI+Cosine score and the ground-truth labels. Returns the optimal weight, the MSE at that weight, and a 95% confidence interval on the weight via bootstrap. Use once before production deployment to set categorical_weight empirically rather than by intuition. Do NOT use with fewer than 30 labeled pairs (results will be statistically unreliable); do NOT use as a per-request operation — it is a one-time calibration call.')
-async def calibrate_hybrid_weight_from_labeled_pairs(labeled_pairs: Annotated[list[list[float]], Field(None, description='List of labeled pairs, each encoded as a flat array: [ground_truth_score]. The actual feature vectors are passed separately via continuous_pairs and categorical_pairs. Length must match continuous_pairs and categorical_pairs.', min_length=30, max_length=2000)], ground_truth_scores: Annotated[list[float], Field(..., description='Array of ground-truth similarity scores in [0.0, 1.0] for each pair. Index i corresponds to pair i in continuous_pairs_a/b and categorical_pairs_a/b.', min_length=30, max_length=2000)], continuous_pairs_a: Annotated[list[list[float]], Field(..., description='Continuous vectors for the A-side of each labeled pair. Row i is the continuous embedding for pair i, record A.', min_length=30, max_length=2000)], continuous_pairs_b: Annotated[list[list[float]], Field(..., description='Continuous vectors for the B-side of each labeled pair. Must match dimensions and row count of continuous_pairs_a.', min_length=30, max_length=2000)], categorical_pairs_a: Annotated[Any, Field(..., description='Categorical feature vectors for the A-side of each labeled pair.', min_length=30, max_length=2000)], categorical_pairs_b: Annotated[Any, Field(..., description='Categorical feature vectors for the B-side of each labeled pair.', min_length=30, max_length=2000)], weight_search_resolution: Annotated[float, Field(20, description='Number of evenly spaced candidate weights in [0.0, 1.0] to evaluate during grid search. Higher resolution narrows the optimum more precisely at the cost of more compute.', ge=10, le=100)], bootstrap_iterations: Annotated[float, Field(500, description='Bootstrap iterations for confidence interval on the optimal weight estimate.', ge=200, le=2000)]) -> dict[str, Any]:
-    """Hybrid Weight Calibration"""
-    params = {"labeled_pairs": labeled_pairs, "ground_truth_scores": ground_truth_scores, "continuous_pairs_a": continuous_pairs_a, "continuous_pairs_b": continuous_pairs_b, "categorical_pairs_a": categorical_pairs_a, "categorical_pairs_b": categorical_pairs_b, "weight_search_resolution": weight_search_resolution, "bootstrap_iterations": bootstrap_iterations}
-    return await _nexus_mcp_call_core('POST', '/v1/similarity/calibrate-hybrid-weight', params)
+@_nexus_mcp.tool(name='nexus_similarity_search_api_calibrate_pvalue_null_distribution', description='Precomputes the null distribution of composite similarity scores for a given corpus by sampling random pairs and fitting a parametric distribution (beta or gamma) to their composite scores. Returns the distribution parameters and a lookup table of composite-score-to-p-value mappings. Use this once per stable corpus to cache calibration parameters and pass them to ranking calls, avoiding redundant null-distribution recomputation on every query. Do NOT call this on every query — it is intended for one-time or periodic calibration when corpus membership changes significantly (more than 10% churn).')
+async def calibrate_pvalue_null_distribution(corpus_embeddings: Annotated[list[list[float]], Field(..., description='Full corpus of embeddings from which random pairs are sampled to build the null distribution. Minimum 50 vectors for stable distribution fitting.', min_length=50, max_length=50000)], n_null_samples: Annotated[float, Field(1000, description='Number of random pairs to sample from the corpus when constructing the null distribution. More samples produce a more stable p-value calibration at higher compute cost. 500–2000 is typical.', ge=100, le=10000)], histogram_bins: Annotated[float, Field(16, description='Bin count for NMI discretization, must match the value you intend to use in subsequent ranking calls for calibration to be valid.', ge=4, le=128)], composite_weight_nmi: Annotated[float, Field(0.4, description='NMI weight used in composite scoring, must match the value you intend to use in subsequent ranking calls.', ge=0.0, le=1.0)]) -> dict[str, Any]:
+    """Null Distribution p-value Calibration"""
+    params = {"corpus_embeddings": corpus_embeddings, "n_null_samples": n_null_samples, "histogram_bins": histogram_bins, "composite_weight_nmi": composite_weight_nmi}
+    return await _nexus_mcp_call_core('POST', '/v1/similarity/calibrate-null', params)
 
 
 # Crea el sub-app ASGI de streamable HTTP -- DEBE llamarse antes de
