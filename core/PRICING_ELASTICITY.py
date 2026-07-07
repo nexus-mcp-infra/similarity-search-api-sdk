@@ -1,161 +1,193 @@
 import numpy as np
 from scipy.optimize import minimize_scalar
+from scipy.stats import chi2
 from dataclasses import dataclass
-from typing import NamedTuple
+from typing import Tuple
 
-# Parametros de mercado derivados del segmento developer-tools / stateless similarity
-P_MIN = 0.001   # USD por operacion (floor: competitivo con llamadas embedding standalone)
-P_MAX = 0.05    # USD por operacion (ceiling: umbral de arbitraje vs vector DB managed)
-Q_BASE = 500_000  # operaciones/mes referencia central del segmento (geometric mean 1K-10M)
+# Parametros de mercado calibrados para developer tools con billing per-call
+P_MIN = 0.001   # USD por operacion, floor del mercado
+P_MAX = 0.05    # USD por operacion, techo observado en competidores
+Q_MAX = 10_000_000  # operaciones/mes, cliente enterprise saturado
+Q_BASE = 50_000     # operaciones/mes, cliente mediano en cold start
 
-# Elasticidad empirica para developer tools de infraestructura:
-# -1.8 refleja mercado sensible al precio pero con lock-in moderado por stateless convenience
-# Fuente estructural: elasticidades tipicas de API infra oscilan entre -1.5 y -2.2
-ELASTICITY_BASE = -1.8
-
-# Coeficiente NMI+Cosine: el diferenciador tecnico reduce elasticidad en ~0.3
-# porque no hay sustituto directo que combine ambas metricas en una llamada stateless
-MOAT_ELASTICITY_DISCOUNT = 0.3
-ELASTICITY_EFFECTIVE = ELASTICITY_BASE + MOAT_ELASTICITY_DISCOUNT  # -> -1.5
-
-# Parametro de escala para Q = Q_BASE * (P / P_REF)^epsilon
-P_REF = 0.005  # precio de referencia: punto medio logaritmico del rango target
+# Elasticidad empirica para APIs de infraestructura cognitiva: inelastica por lock-in tecnico
+EPSILON_BASE = -1.4  # elasticidad precio-demanda propia, estimada para dev tools de nicho
 
 
-@dataclass(frozen=True)
+@dataclass
 class AdoptionScenario:
-    name: str
-    elasticity: float       # refleja sustituibilidad percibida en ese segmento
-    q_base_scale: float     # multiplicador sobre Q_BASE segun tamano del cliente
-    freemium_threshold: int # operaciones/mes donde el costo supera friccion de pago
+    label: str
+    monthly_ops_per_client: float
+    client_count: int
+    willingness_to_pay: float  # maximo USD/op que este segmento acepta
+    nmi_value_weight: float    # cuanto valoran el diferenciador NMI vs coseno puro
 
 
-class DemandCurve:
-    """Demanda isoelastica: Q(P) = Q_BASE * scale * (P_REF / P)^|epsilon|"""
+def nmi_corrected_demand(price: float, alpha_sensitivity: float = 1.4,
+                          beta_floor: float = 0.15) -> float:
+    """
+    Q(P) = Q_BASE * (P_MIN / P)^epsilon * sigmoid_adoption(P)
 
-    def __init__(self, elasticity: float, q_scale: float):
-        # epsilon negativo -> exponente positivo al invertir la base
-        self.epsilon = abs(elasticity)
-        self.q_scale = q_scale
-        self.q_anchor = Q_BASE * q_scale
+    El termino sigmoid captura que bajo P_MIN/3 la demanda no escala linealmente:
+    developers perciben precio irrelevante y el limite pasa a ser awareness, no costo.
+    beta_floor evita que Q colapse a 0 por encima del techo de mercado.
+    """
+    if price <= 0:
+        raise ValueError(f"price debe ser positivo, recibido: {price}")
 
-    def quantity(self, price: float) -> float:
-        if price <= 0:
-            raise ValueError(f"Price must be positive, got {price}")
-        # formula isoelastica calibrada en P_REF
-        return self.q_anchor * (P_REF / price) ** self.epsilon
+    # Demanda base por ley de potencia: elasticidad constante en rango observable
+    q_power = Q_BASE * (P_MIN / price) ** alpha_sensitivity
 
-    def elasticity_at(self, price: float) -> float:
-        # por definicion del modelo isoelastico la elasticidad es constante = -epsilon
-        # pero verificamos analiticamenete: dQ/dP = -epsilon * Q_anchor * P_REF^epsilon * P^(-epsilon-1)
-        # epsilon_punto = (dQ/dP) * (P/Q) = -epsilon (constante) -> confirmado
-        return -self.epsilon
+    # Factor de adopcion: refleja que NMI-corrected tiene barrera de comprension inicial
+    # Los developers necesitan ver el p-value antes de confiar; eso deprime adopcion early
+    comprehension_barrier = 1 / (1 + np.exp(6 * (price - 0.018)))  # inflexion en $0.018
+    nmi_premium_capture = 0.35 * (1 - comprehension_barrier)       # adoption adicional post-comprension
 
-    def revenue(self, price: float) -> float:
-        return price * self.quantity(price)
-
-    def optimal_price(self) -> float:
-        # Para Q isoelastica con epsilon != 1, revenue = P * A * (P_REF/P)^epsilon
-        # = A * P_REF^epsilon * P^(1-epsilon)
-        # d(revenue)/dP = (1-epsilon) * A * P_REF^epsilon * P^(-epsilon) = 0
-        # Si epsilon > 1: revenue decrece con P -> optimo en P_MAX (constraint)
-        # Si epsilon < 1: revenue crece con P -> optimo en P_MAX tambien (constraint)
-        # El maximo real esta en la restriccion superior del mercado: P_MAX
-        # Verificamos numericamente para capturar efectos de saturacion de volumen
-        result = minimize_scalar(
-            lambda p: -self.revenue(p),
-            bounds=(P_MIN, P_MAX),
-            method="bounded"
-        )
-        return float(result.x)
-
-    def freemium_paid_crossover(self, threshold_ops: int, free_tier_ops: int = 1000) -> float:
-        # precio donde el costo de pagar supera la friccion cognitiva del freemium
-        # se estima como el precio tal que revenue(P) * (threshold_ops - free_tier_ops) = 10 USD
-        # (10 USD/mes es el umbral psicologico de compra de tarjeta tipico en devtools)
-        paid_ops = max(threshold_ops - free_tier_ops, 1)
-        crossover_price = 10.0 / paid_ops
-        # se clampea al rango de mercado
-        return float(np.clip(crossover_price, P_MIN, P_MAX))
+    q = q_power * (beta_floor + (1 - beta_floor) * (comprehension_barrier + nmi_premium_capture))
+    return max(q, 0.0)
 
 
-# EXACTAMENTE 3 escenarios de adopcion segun perfil de cliente
-SCENARIOS: list[AdoptionScenario] = [
-    AdoptionScenario(
-        name="indie_developer",
-        # alta sensibilidad: puede usar cosine simple sin NMI si el precio sube
-        elasticity=-2.1,
-        # volumen bajo: ~5K ops/mes, 1% de Q_BASE
-        q_base_scale=0.01,
-        # pasa a paid cuando el ahorro vs vector DB (>20 USD/mes) justifica la tarjeta
-        freemium_threshold=5_000,
-    ),
-    AdoptionScenario(
-        name="saas_platform_mid",
-        # elasticidad media: dependencia operacional pero alternativas existen
-        elasticity=-1.5,
-        # volumen medio: ~200K ops/mes, 40% de Q_BASE
-        q_base_scale=0.4,
-        # adopcion paid cuando la busqueda semantica es feature critico del producto
-        freemium_threshold=50_000,
-    ),
-    AdoptionScenario(
-        name="enterprise_data_pipeline",
-        # baja elasticidad: lock-in por bootstrap CI + auditabilidad de scores
-        elasticity=-0.9,
-        # volumen alto: ~3M ops/mes, 600% de Q_BASE
-        q_base_scale=6.0,
-        # enterprise entra directo a paid; threshold es el minimo de contrato
-        freemium_threshold=100_000,
-    ),
-]
+def price_elasticity_at(price: float, delta: float = 1e-6) -> float:
+    """
+    epsilon(P) = (dQ/dP) * (P/Q) — calculado numericamente para respetar la forma exacta de Q(P)
+    delta elegido para evitar cancelacion catastrofica en flotante doble precision
+    """
+    if price <= delta:
+        raise ValueError(f"price demasiado bajo para diferenciacion numerica estable: {price}")
+    q_center = nmi_corrected_demand(price)
+    if q_center <= 0:
+        return float('-inf')
+    dq_dp = (nmi_corrected_demand(price + delta) - nmi_corrected_demand(price - delta)) / (2 * delta)
+    return dq_dp * (price / q_center)
 
 
-class SimilaritySearchPriceEquilibrium(NamedTuple):
-    scenario_name: str
-    optimal_price_usd: float
-    quantity_at_optimal: float
-    revenue_at_optimal_usd: float
-    elasticity: float
-    freemium_crossover_price_usd: float
-    freemium_crossover_monthly_revenue_usd: float
+def revenue(price: float) -> float:
+    """R(P) = P * Q(P) — objetivo de maximizacion directa"""
+    return price * nmi_corrected_demand(price)
 
 
-def compute_equilibrium(scenario: AdoptionScenario) -> SimilaritySearchPriceEquilibrium:
-    curve = DemandCurve(elasticity=scenario.elasticity, q_scale=scenario.q_base_scale)
-    p_opt = curve.optimal_price()
-    q_opt = curve.quantity(p_opt)
-    rev_opt = curve.revenue(p_opt)
-    eps = curve.elasticity_at(p_opt)
-    p_cross = curve.freemium_paid_crossover(scenario.freemium_threshold)
-    rev_cross = p_cross * (scenario.freemium_threshold - 1000)
-    return SimilaritySearchPriceEquilibrium(
-        scenario_name=scenario.name,
-        optimal_price_usd=round(p_opt, 6),
-        quantity_at_optimal=round(q_opt, 0),
-        revenue_at_optimal_usd=round(rev_opt, 2),
-        elasticity=round(eps, 2),
-        freemium_crossover_price_usd=round(p_cross, 6),
-        freemium_crossover_monthly_revenue_usd=round(rev_cross, 2),
+def optimal_price_nmi_api() -> Tuple[float, float, float]:
+    """
+    Maximiza R(P) en el rango de disposicion a pagar real del mercado objetivo.
+    Usa minimize_scalar sobre -R para aprovechar bracket garantizado en intervalo cerrado.
+    """
+    result = minimize_scalar(
+        lambda p: -revenue(p),
+        bounds=(P_MIN, P_MAX),
+        method='bounded',
+        options={'xatol': 1e-8}
     )
+    p_opt = result.x
+    q_opt = nmi_corrected_demand(p_opt)
+    r_opt = revenue(p_opt)
+    return p_opt, q_opt, r_opt
 
 
-def run_similarity_search_pricing_model() -> list[SimilaritySearchPriceEquilibrium]:
+def freemium_to_paid_equilibrium(free_ops_limit: int = 500,
+                                  conversion_rate_base: float = 0.04) -> dict:
+    """
+    Punto de equilibrio donde el costo de oportunidad del tier free supera el friction de pago.
+    conversion_rate_base: 4% empirico para APIs tecnicas con free tier limitado.
+    El NMI-corrected score tiene mayor conversion esperada porque el p-value es un gancho
+    de credibilidad que el free tier expone pero no permite actuar a escala.
+    """
+    nmi_credibility_multiplier = 1.85  # p-value visible en free tier sube conversion
+    effective_conversion = conversion_rate_base * nmi_credibility_multiplier
+
+    # Equilibrio: revenue esperado de converted >= costo de soporte del free tier
+    # costo de soporte estimado en $0.00008/op para infraestructura NMI (mas costosa que coseno puro)
+    infra_cost_per_op = 0.000_08
+    free_tier_monthly_cost = free_ops_limit * infra_cost_per_op
+
+    p_opt, q_opt, _ = optimal_price_nmi_api()
+    revenue_per_converted = p_opt * Q_BASE * 0.1  # converted empieza en 10% del volumen base
+
+    # Numero minimo de usuarios free para que el funnel sea rentable
+    free_users_breakeven = free_tier_monthly_cost / (effective_conversion * revenue_per_converted)
+
+    return {
+        "p_optimal_usd_per_op": round(p_opt, 6),
+        "conversion_rate_effective": round(effective_conversion, 4),
+        "free_users_needed_for_breakeven": int(np.ceil(free_users_breakeven)),
+        "monthly_cost_per_free_user_usd": round(free_tier_monthly_cost, 6),
+        "equilibrium_condition": "revenue_converted >= infra_cost_free_tier"
+    }
+
+
+def simulate_adoption_scenarios() -> list[dict]:
+    """EXACTAMENTE 3 escenarios que cubren la distribucion real de clientes en este mercado."""
+    scenarios = [
+        AdoptionScenario(
+            label="indie_developer_semantic_search",
+            monthly_ops_per_client=8_000,
+            client_count=1_200,
+            willingness_to_pay=0.008,  # sensible al precio, usa free tier primero
+            nmi_value_weight=0.3       # valora resultado, no entiende NMI en profundidad
+        ),
+        AdoptionScenario(
+            label="ml_team_embedding_validation",
+            monthly_ops_per_client=280_000,
+            client_count=85,
+            willingness_to_pay=0.022,  # paga por correctness estadistica, tiene budget
+            nmi_value_weight=0.75      # el p-value es el feature que justifica el gasto
+        ),
+        AdoptionScenario(
+            label="enterprise_recsys_pipeline",
+            monthly_ops_per_client=4_200_000,
+            client_count=12,
+            willingness_to_pay=0.041,  # precio subordinado a SLA y precision
+            nmi_value_weight=0.90      # NMI-corrected es requisito de auditoria interna
+        ),
+    ]
+
     results = []
-    for scenario in SCENARIOS:
-        eq = compute_equilibrium(scenario)
-        results.append(eq)
-        print(
-            f"[{eq.scenario_name}] "
-            f"P_opt={eq.optimal_price_usd} USD | "
-            f"Q={eq.quantity_at_optimal:.0f} ops | "
-            f"Rev={eq.revenue_at_optimal_usd} USD/mo | "
-            f"eps={eq.elasticity} | "
-            f"freemium->paid at P={eq.freemium_crossover_price_usd} USD "
-            f"({eq.freemium_crossover_monthly_revenue_usd} USD/mo)"
-        )
+    p_opt, _, _ = optimal_price_nmi_api()
+
+    for s in scenarios:
+        # Precio efectivo: minimo entre optimo del proveedor y WTP del segmento
+        p_effective = min(p_opt, s.willingness_to_pay)
+        q_per_client = nmi_corrected_demand(p_effective) * (s.monthly_ops_per_client / Q_BASE)
+        monthly_revenue = p_effective * q_per_client * s.client_count
+        epsilon = price_elasticity_at(p_effective)
+
+        # Chi2 stat aproximado para ilustrar significancia del diferenciador NMI en este segmento
+        # Grados de libertad = segmentos - 1; corpus_size proxy = ops/mes del segmento
+        corpus_proxy = int(s.monthly_ops_per_client * 0.01)  # 1% de ops son pares evaluados
+        bonferroni_threshold = 0.05 / max(corpus_proxy, 1)
+        chi2_critical = chi2.ppf(1 - bonferroni_threshold, df=9)  # df=9: k=sqrt(768)~27, agrupado
+
+        results.append({
+            "scenario": s.label,
+            "price_usd_per_op": round(p_effective, 6),
+            "monthly_ops_per_client": int(q_per_client),
+            "client_count": s.client_count,
+            "monthly_revenue_usd": round(monthly_revenue, 2),
+            "elasticity_at_price": round(epsilon, 4),
+            "nmi_value_weight": s.nmi_value_weight,
+            "bonferroni_corrected_alpha": round(bonferroni_threshold, 10),
+            "chi2_critical_for_significance": round(chi2_critical, 4),
+        })
+
     return results
 
 
 if __name__ == "__main__":
-    equilibria = run_similarity_search_pricing_model()
+    import json
+
+    p_opt, q_opt, r_opt = optimal_price_nmi_api()
+    epsilon_opt = price_elasticity_at(p_opt)
+    equilibrium = freemium_to_paid_equilibrium()
+    scenarios = simulate_adoption_scenarios()
+
+    output = {
+        "optimal_pricing": {
+            "p_opt_usd_per_op": round(p_opt, 6),
+            "q_opt_ops_per_month": int(q_opt),
+            "r_opt_usd_per_month": round(r_opt, 2),
+            "elasticity_at_optimum": round(epsilon_opt, 4),
+        },
+        "freemium_equilibrium": equilibrium,
+        "adoption_scenarios": scenarios,
+    }
+
+    print(json.dumps(output, indent=2))
