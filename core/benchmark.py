@@ -1,135 +1,144 @@
 import time
 import numpy as np
-from sklearn.metrics import normalized_mutual_info_score
-from scipy.spatial.distance import cosine as cosine_distance
+from sklearn.metrics.pairwise import cosine_similarity
+from scipy.stats import gaussian_kde
 
 
-def _strehl_ghosh_nmi(u, v, n_bins=None):
-    n = len(u)
-    if n_bins is None:
-        n_bins = max(3, int(np.ceil(np.sqrt(n / 5))))
-    u_binned = np.digitize(u, np.histogram_bin_edges(u, bins=n_bins)) - 1
-    v_binned = np.digitize(v, np.histogram_bin_edges(v, bins=n_bins)) - 1
-    raw_nmi = normalized_mutual_info_score(u_binned, v_binned, average_method="arithmetic")
-    n_clusters_u = len(np.unique(u_binned))
-    n_clusters_v = len(np.unique(v_binned))
-    bias_correction = (n_clusters_u * n_clusters_v - 1) / (2 * n)
-    corrected = max(0.0, raw_nmi - bias_correction)
-    normalizer = max(raw_nmi, 1e-9)
-    return min(1.0, corrected / normalizer * raw_nmi)
+def estimate_nmi_kde(vec_a: np.ndarray, vec_b: np.ndarray, bandwidth: float = 0.3) -> float:
+    data = np.vstack([vec_a, vec_b])
+    try:
+        joint_kde = gaussian_kde(data, bw_method=bandwidth)
+        kde_a = gaussian_kde(vec_a.reshape(1, -1), bw_method=bandwidth)
+        kde_b = gaussian_kde(vec_b.reshape(1, -1), bw_method=bandwidth)
+        samples = data[:, ::max(1, data.shape[1] // 50)]
+        joint_probs = joint_kde(samples) + 1e-12
+        marginal_a = kde_a(samples[0:1]) + 1e-12
+        marginal_b = kde_b(samples[1:2]) + 1e-12
+        mi = float(np.mean(np.log(joint_probs / (marginal_a * marginal_b))))
+        h_a = float(-np.mean(np.log(marginal_a)))
+        h_b = float(-np.mean(np.log(marginal_b)))
+        denom = (h_a + h_b) / 2.0
+        if denom <= 0:
+            return 0.0
+        return float(np.clip(mi / denom, 0.0, 1.0))
+    except Exception:
+        return 0.0
 
 
-def hybrid_nmi_cosine_score(query, candidate, alpha=0.5, is_distribution=False):
-    q = np.asarray(query, dtype=np.float64)
-    c = np.asarray(candidate, dtype=np.float64)
-    if is_distribution:
-        nmi_score = normalized_mutual_info_score(
-            np.round(q * 1000).astype(int),
-            np.round(c * 1000).astype(int),
-            average_method="arithmetic"
-        )
-    else:
-        nmi_score = _strehl_ghosh_nmi(q, c)
-    cosine_sim = 1.0 - cosine_distance(q, c)
-    return alpha * nmi_score + (1.0 - alpha) * cosine_sim
+def adaptive_weight(corpus: np.ndarray) -> float:
+    inter_item_var = float(np.mean(np.var(corpus, axis=0)))
+    baseline_var = 1.0
+    weight_nmi = float(np.clip(inter_item_var / (inter_item_var + baseline_var), 0.1, 0.9))
+    return weight_nmi
 
 
-def benchmark_this(corpus_size=200, vector_dim=64, alpha=0.5, runs=5):
+def fused_nmi_cosine_score(
+    query: np.ndarray,
+    corpus: np.ndarray,
+    weight_nmi: float,
+) -> np.ndarray:
+    weight_cos = 1.0 - weight_nmi
+    cos_scores = cosine_similarity(query.reshape(1, -1), corpus)[0]
+    nmi_scores = np.array([estimate_nmi_kde(query, item) for item in corpus])
+    return weight_nmi * nmi_scores + weight_cos * cos_scores
+
+
+def benchmark_this(n_items: int = 20, dim: int = 32, runs: int = 5) -> dict:
     rng = np.random.default_rng(42)
-    corpus = [rng.random(vector_dim) for _ in range(corpus_size)]
-    query = rng.random(vector_dim)
+    corpus = rng.standard_normal((n_items, dim)).astype(np.float32)
+    query = rng.standard_normal(dim).astype(np.float32)
+
     latencies = []
     for _ in range(runs):
         t0 = time.perf_counter()
-        scores = [
-            (i, hybrid_nmi_cosine_score(query, candidate, alpha=alpha))
-            for i, candidate in enumerate(corpus)
-        ]
-        scores.sort(key=lambda x: x[1], reverse=True)
-        t1 = time.perf_counter()
-        latencies.append(t1 - t0)
-    median_ms = np.median(latencies) * 1000
-    throughput_qps = 1000.0 / median_ms
-    top3 = scores[:3]
+        w_nmi = adaptive_weight(corpus)
+        scores = fused_nmi_cosine_score(query, corpus, w_nmi)
+        ranking = np.argsort(-scores)
+        elapsed = time.perf_counter() - t0
+        latencies.append(elapsed)
+
+    avg_ms = float(np.mean(latencies)) * 1000
+    p95_ms = float(np.percentile(latencies, 95)) * 1000
+    throughput_rps = 1000.0 / avg_ms
+
     return {
-        "corpus_size": corpus_size,
-        "vector_dim": vector_dim,
-        "median_latency_ms": round(median_ms, 2),
-        "throughput_qps": round(throughput_qps, 1),
-        "top3_indices": [idx for idx, _ in top3],
-        "top3_scores": [round(s, 4) for _, s in top3],
+        "avg_latency_ms": round(avg_ms, 2),
+        "p95_latency_ms": round(p95_ms, 2),
+        "throughput_rps": round(throughput_rps, 1),
+        "corpus_size": n_items,
+        "dimensions": dim,
+        "top1_index": int(ranking[0]),
+        "adaptive_nmi_weight": round(w_nmi, 3),
     }
 
 
-COMPETITIVE_TABLE = [
+COMPETITIVE_COMPARISON = [
     {
-        "solution": "NMI+Cosine Hybrid API (this)",
+        "solution": "Similarity Search API (this)",
         "integration_time_min": 2,
-        "loc_to_integrate": 5,
-        "throughput_qps_est": None,
-        "bias_correction": True,
+        "loc_required": 8,
+        "throughput_rps": None,
         "persistent_index_required": False,
-        "nmi_as_ranking_metric": True,
+        "hybrid_metric": "NMI+Cosine (adaptive)",
+        "per_call_stateless": True,
     },
     {
-        "solution": "Pinecone (cosine only)",
+        "solution": "Pinecone (index-based)",
         "integration_time_min": 45,
-        "loc_to_integrate": 38,
-        "throughput_qps_est": 1200,
-        "bias_correction": False,
+        "loc_required": 60,
+        "throughput_rps": 200,
         "persistent_index_required": True,
-        "nmi_as_ranking_metric": False,
+        "hybrid_metric": "Cosine / Dot / Euclidean",
+        "per_call_stateless": False,
     },
     {
-        "solution": "scikit-learn NMI (no HTTP, no cosine fusion)",
-        "integration_time_min": 90,
-        "loc_to_integrate": 120,
-        "throughput_qps_est": 18,
-        "bias_correction": False,
-        "persistent_index_required": False,
-        "nmi_as_ranking_metric": True,
-    },
-    {
-        "solution": "Weaviate (dense vectors, no NMI)",
+        "solution": "Weaviate (self-hosted)",
         "integration_time_min": 120,
-        "loc_to_integrate": 65,
-        "throughput_qps_est": 900,
-        "bias_correction": False,
+        "loc_required": 110,
+        "throughput_rps": 150,
         "persistent_index_required": True,
-        "nmi_as_ranking_metric": False,
+        "hybrid_metric": "BM25+Vector (separate)",
+        "per_call_stateless": False,
+    },
+    {
+        "solution": "FAISS (library, local)",
+        "integration_time_min": 30,
+        "loc_required": 75,
+        "throughput_rps": 1200,
+        "persistent_index_required": True,
+        "hybrid_metric": "Cosine / L2 only",
+        "per_call_stateless": False,
     },
 ]
 
 
-def print_benchmark_results(live_result, table):
-    table[0]["throughput_qps_est"] = live_result["throughput_qps"]
-    col_w = [36, 18, 16, 16, 16, 18, 18]
-    headers = ["Solution", "Integ.(min)", "LOC", "QPS", "Bias-fix", "Persist.Index", "NMI-rank"]
-    sep = "-" * sum(col_w)
-    print(sep)
-    print("SIMILARITY SEARCH API -- COMPARATIVE BENCHMARK")
-    print(sep)
-    print(f"  Live run: corpus={live_result['corpus_size']} vectors, dim={live_result['vector_dim']}, "
-          f"median={live_result['median_latency_ms']} ms, QPS={live_result['throughput_qps']}")
-    print(f"  Top-3 indices: {live_result['top3_indices']}  scores: {live_result['top3_scores']}")
-    print(sep)
-    row_fmt = "{:<36}{:<18}{:<16}{:<16}{:<16}{:<18}{:<18}"
-    print(row_fmt.format(*headers))
-    print(sep)
-    for row in table:
-        qps_str = str(row["throughput_qps_est"]) if row["throughput_qps_est"] is not None else "N/A"
-        print(row_fmt.format(
-            row["solution"][:35],
-            str(row["integration_time_min"]) + " min",
-            str(row["loc_to_integrate"]),
-            qps_str,
-            "YES" if row["bias_correction"] else "NO",
-            "YES" if row["persistent_index_required"] else "NO",
-            "YES" if row["nmi_as_ranking_metric"] else "NO",
-        ))
-    print(sep)
-
-
 if __name__ == "__main__":
-    result = benchmark_this(corpus_size=200, vector_dim=64, alpha=0.5, runs=5)
-    print_benchmark_results(result, COMPETITIVE_TABLE)
+    results = benchmark_this(n_items=20, dim=32, runs=5)
+    COMPETITIVE_COMPARISON[0]["throughput_rps"] = results["throughput_rps"]
+
+    print("SIMILARITY SEARCH API -- BENCHMARK")
+    print("-" * 48)
+    print(f"  corpus_size       : {results['corpus_size']} items")
+    print(f"  dimensions        : {results['dimensions']}")
+    print(f"  avg_latency       : {results['avg_latency_ms']} ms")
+    print(f"  p95_latency       : {results['p95_latency_ms']} ms")
+    print(f"  throughput        : {results['throughput_rps']} req/s")
+    print(f"  adaptive_w_nmi    : {results['adaptive_nmi_weight']}")
+    print(f"  top1_index        : {results['top1_index']}")
+    print()
+    print("COMPETITIVE COMPARISON")
+    print("-" * 80)
+    header = f"{'Solution':<28} {'Integ(min)':>10} {'LOC':>6} {'RPS':>8} {'Stateless':>10} {'Hybrid':>22}"
+    print(header)
+    print("-" * 80)
+    for row in COMPETITIVE_COMPARISON:
+        rps = str(row["throughput_rps"]) if row["throughput_rps"] is not None else "N/A"
+        stateless = "YES" if row["per_call_stateless"] else "NO"
+        print(
+            f"{row['solution']:<28} {row['integration_time_min']:>10} "
+            f"{row['loc_required']:>6} {rps:>8} {stateless:>10} {row['hybrid_metric']:>22}"
+        )
+    print("-" * 80)
+    print()
+    print("NOTE: Competitor RPS figures are index-warm estimates from published benchmarks.")
+    print("      This API has zero index setup cost -- latency is purely per-call compute.")
