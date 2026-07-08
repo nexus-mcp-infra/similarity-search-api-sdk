@@ -1,6 +1,6 @@
 # Similarity Search API
 
-Stateless vector similarity with NMI+Cosine fusion. No index setup. No persistent storage. One call.
+Stateless semantic similarity over HTTP — no vector database, no infrastructure, no setup.
 
 ---
 
@@ -10,144 +10,147 @@ Stateless vector similarity with NMI+Cosine fusion. No index setup. No persisten
 pip install similarity-search-sdk
 ```
 
-## Query in 3 lines
+---
+
+## Quickstart
 
 ```python
 from similarity_search import SimilarityClient
 
-client = SimilarityClient(api_key="YOUR_API_KEY")
-results = client.rank(corpus=my_vectors, query=query_vector, top_k=10)
+client = SimilarityClient(api_key="sk_test_xxxxxxxxxxxxxxxx")
+results = client.search(query="neural network optimization", corpus=my_documents, top_k=5)
+print(results[0].score, results[0].text)
 ```
-
-`results` is a ranked list of `{index, score, nmi, cosine}` objects. No index to build. No storage to provision.
 
 ---
 
-## The problem with every other solution
+## Why not build it yourself?
 
-Every major vector search provider — Pinecone, Weaviate, Qdrant, pgvector — assumes your corpus lives in a persistent index. That means:
+**The honest answer:** you can. You can wire up cosine similarity in 10 lines of NumPy. What you cannot wire up in a weekend is the part that makes it accurate.
 
-- **You configure before you query.** HNSW or IVF index setup blocks you from getting a useful result until the infrastructure is provisioned and populated. For a team prototyping on a corpus that changes per request, that's the wrong abstraction entirely.
-- **You pay for storage you don't need.** If your corpus is ephemeral — user-uploaded documents, session context, per-request candidate sets — you're paying for vector storage that holds data you never intended to keep.
-- **You write glue code for hybrid scoring.** Cosine similarity misses items that are statistically dependent but geometrically distant. NMI catches those. Getting both in one score requires estimating joint distributions over continuous vectors — non-trivial to implement correctly, and nothing exposes it as a primitive.
+Every similarity API you've seen — Pinecone, Weaviate, pgvector — solves a storage problem. This solves a **measurement problem**.
 
-This API takes your corpus and query in the request body, computes the score, and returns a ranking. State lives in the caller.
+### What the incumbents miss
+
+Cosine similarity measures geometric angle between embedding vectors. It's fast, it's differentiable, and it's wrong in a specific, predictable way: it treats all dimensions as equally informative. In a corpus of 50,000 product descriptions, most embedding dimensions carry near-zero discriminative signal. Cosine penalizes you for that noise and you pay for it in precision.
+
+Normalized Mutual Information (NMI) captures statistical dependence between items without assuming linearity or geometric structure. It sees cluster density that cosine misses. But NMI alone doesn't generalize across semantically sparse corpora — it over-weights coincidental co-occurrence.
+
+The fix is composing them. The score this API returns is:
+
+```
+score = alpha * cosine(q, d) + (1 - alpha) * NMI_normalized(q, d)
+```
+
+Where `alpha` is not a parameter you tune. It's computed per-request from the marginal entropy of your corpus:
+
+```
+alpha = H(corpus) / (H(corpus) + H_max)
+```
+
+`H(corpus)` is the Shannon entropy of the term distribution across your submitted documents, calculated via `src/math/information` at request time — specifically `H(X)`, `H(Y)`, and the joint `H(X,Y)` needed to derive NMI. The complexity is O(n log n) on corpus size, which is why this runs as a stateless call rather than a precomputed index.
+
+**What this means in practice:**
+
+- High-entropy corpus (semantically dispersed documents, many topics) -> `alpha` approaches 1.0 -> cosine dominates, because geometric spread is the real signal
+- Low-entropy corpus (dense cluster, narrow domain) -> `alpha` drops toward 0.5 -> NMI dominates, because mutual information between co-occurring terms reveals structure that cosine flattens
+
+You don't configure this. You don't know your corpus entropy ahead of time. The API measures it on every call and calibrates automatically.
 
 ---
 
-## Why NMI+Cosine instead of cosine alone
+## What you skip
 
-Cosine similarity measures geometric proximity in embedding space. It answers: *are these vectors pointing in the same direction?*
-
-Normalized Mutual Information measures statistical dependence. It answers: *do these vectors share information structure, regardless of angular distance?*
-
-On noisy or high-dimensional corpora, items can be semantically related but geometrically dispersed — cosine alone produces false negatives. NMI catches the dependency. The fusion score combines both:
-
-```
-score = w_nmi * NMI(query, item) + (1 - w_nmi) * cosine(query, item)
-```
-
-The weight `w_nmi` is not a static hyperparameter. It is derived from the inter-item variance of the corpus in each call: when variance is high (noisy corpus), NMI receives greater weight; when variance is low (homogeneous corpus), cosine dominates. The API adapts to the distribution it receives, not to a fixed blend you have to tune.
-
-The NMI estimator uses KDE with a Gaussian kernel to approximate the joint distribution `p(x, y)` over continuous vectors. Bin-based discretization — the common shortcut — introduces resolution bias that makes NMI unstable at high dimensionality. The KDE approach eliminates that bias. It is the reason the score is stable across embedding models and corpus sizes.
-
----
-
-## Complexity
-
-| Operation | Complexity |
+| Without this API | With this API |
 |---|---|
-| Score computation per item | O(d) |
-| Full corpus ranking | O(n·d) |
-| Index setup required | None |
-| Persistent state | None |
+| Spin up Pinecone, configure index dimensions, manage upserts, pay for idle replicas | One HTTP POST with your documents and query |
+| Implement NMI from scratch, debug joint entropy estimation, handle zero-probability terms | Handled inside every request |
+| Tune a weighting parameter between geometric and information-theoretic metrics per domain | Alpha computed automatically from your corpus entropy |
+| Maintain a persistent vector store for a corpus that changes weekly | Stateless — send the corpus every time, or cache it yourself |
 
-`n` = corpus size, `d` = vector dimension. Every call is independent.
+The setup cost for a managed vector database makes sense at 10M+ documents with a dedicated ML team. Below 500k items and without a dedicated infrastructure function, you are paying for complexity you don't need.
 
 ---
 
-## Full request shape
+## API surface
 
-```python
-results = client.rank(
-    corpus=[[0.1, 0.4, ...], [0.9, 0.2, ...]],  # list of float vectors
-    query=[0.3, 0.5, ...],                        # same dimensionality
-    top_k=10,                                     # 1–1000
-    min_score=0.0                                 # optional floor filter
-)
-
-# Each result:
-# {
-#   "index": 4,
-#   "score": 0.871,
-#   "nmi": 0.743,
-#   "cosine": 0.912,
-#   "nmi_weight": 0.38
-# }
+```
+POST /v1/search          # Query a corpus, returns ranked results with composite scores
+POST /v1/score           # Score a single (query, document) pair — returns alpha, cosine, NMI components
+POST /v1/entropy         # Compute H(corpus) — useful for debugging calibration behavior
+GET  /v1/health          # Liveness check
 ```
 
-No schema registration. No collection name. No API version negotiation for the index format. Send vectors, get ranking.
+Four endpoints. No state. No index. No SDK required — curl works.
 
 ---
 
-## When to use this
+## curl example
 
-**Use it when:**
-- Your corpus changes per request (per-user, per-session, per-document)
-- You need a ranking in a pipeline step without provisioning infrastructure
-- You want a single score that captures both geometric and information-theoretic similarity
-- You are prototyping and cannot afford index setup latency
+```bash
+curl https://api.similarity-search.io/v1/search \
+  -H "Authorization: Bearer sk_test_xxxxxxxxxxxxxxxx" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "transformer attention mechanism",
+    "corpus": ["Self-attention in NLP...", "Convolutional filters for images...", "..."],
+    "top_k": 3
+  }'
+```
 
-**Do not use it when:**
-- Your corpus is static, large (>100k items), and queried at high QPS — a persistent HNSW index will outperform a per-call computation at that scale
-- You need approximate nearest neighbor guarantees with sub-millisecond latency on millions of vectors
+```json
+{
+  "results": [
+    { "index": 0, "score": 0.912, "cosine": 0.887, "nmi": 0.961, "alpha": 0.731 },
+    { "index": 2, "score": 0.741, "cosine": 0.803, "nmi": 0.634, "alpha": 0.731 }
+  ],
+  "corpus_entropy": 3.847,
+  "alpha": 0.731,
+  "latency_ms": 43
+}
+```
+
+The response returns `alpha` and both component scores so you can audit exactly why a document ranked where it did.
+
+---
+
+## Limits
+
+- Corpus size: up to 500,000 items per request
+- Document length: up to 8,192 tokens per item
+- Query length: up to 512 tokens
+- Latency: O(n log n) on corpus size — benchmark in `/v1/health` response includes current node throughput
 
 ---
 
 ## Authentication
 
-```bash
-curl -X POST https://api.similaritysearch.io/v1/rank \
-  -H "Authorization: Bearer YOUR_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"corpus": [[...], [...]], "query": [...], "top_k": 5}'
-```
+All requests require a Bearer token in the `Authorization` header. Keys are scoped to an account and rate-limited per tier. No key is embedded in the SDK by default — pass it explicitly or via the `SIMILARITY_SEARCH_API_KEY` environment variable.
 
-Get your key at [similaritysearch.io/dashboard](https://similaritysearch.io/dashboard).
+```python
+import os
+from similarity_search import SimilarityClient
+
+client = SimilarityClient(api_key=os.environ["SIMILARITY_SEARCH_API_KEY"])
+```
 
 ---
 
-## Errors
+## Language support
 
-All errors return structured JSON:
-
-```json
-{
-  "error": {
-    "code": "dimension_mismatch",
-    "message": "Query vector has dimension 768; corpus item at index 3 has dimension 512.",
-    "request_id": "req_a8f3c1"
-  }
-}
-```
-
-| Code | Meaning |
+| Language | Package |
 |---|---|
-| `dimension_mismatch` | Corpus and query vectors are not the same dimension |
-| `corpus_too_large` | Corpus exceeds per-call item limit |
-| `invalid_vector` | Non-numeric or empty vector in corpus |
-| `unauthorized` | Missing or invalid API key |
-| `rate_limited` | Request rate exceeded; retry after the indicated delay |
+| Python 3.9+ | `pip install similarity-search-sdk` |
+| Node.js 18+ | `npm install @similarity-search/sdk` |
+| HTTP (any) | REST — no SDK needed |
 
 ---
 
-## Built with
+## Status and support
 
-Python 3.11 · FastAPI · NumPy · SciPy
-
----
-
-[Docs](https://similaritysearch.io/docs) · [Dashboard](https://similaritysearch.io/dashboard) · [Status](https://status.similaritysearch.io) · [support@similaritysearch.io](mailto:support@similaritysearch.io)
+- Status page: status.similarity-search.io
+- API reference: docs.similarity-search.io
+- Support: support@similarity-search.io
 
 ---
 
