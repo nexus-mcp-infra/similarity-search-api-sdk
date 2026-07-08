@@ -1,465 +1,407 @@
 from fastapi import FastAPI, HTTPException, Security, status
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from pydantic import BaseModel, Field, field_validator, model_validator
-from typing import Literal, Optional
+from fastapi.security.api_key import APIKeyHeader
+from pydantic import BaseModel, Field, field_validator
+from typing import Optional
 import numpy as np
-from scipy.special import digamma
-from scipy.stats import entropy as scipy_entropy
+from scipy.stats import gaussian_kde
+from scipy.spatial.distance import cosine as cosine_distance
 import os
 import time
-import hashlib
-import hmac
+import logging
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("similarity_search_api")
+
+API_KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=True)
+VALID_API_KEYS = set(filter(None, os.environ.get("API_KEYS", "").split(",")))
 
 app = FastAPI(
-    title="NMI-Cosine Similarity Search API",
+    title="Stateless Similarity Search API",
+    description="Per-call NMI+Cosine fused similarity ranking over ephemeral corpora. No index setup required.",
     version="1.0.0",
-    description="Hybrid NMI+Cosine ranking over in-memory corpora. No persistent index required.",
-)
-
-bearer_scheme = HTTPBearer()
-
-VALID_API_KEYS: set[str] = set(
-    k.strip() for k in os.environ.get("SIMILARITY_API_KEYS", "").split(",") if k.strip()
 )
 
 
-def _authenticate(credentials: HTTPAuthorizationCredentials = Security(bearer_scheme)) -> str:
-    token = credentials.credentials
-    if not VALID_API_KEYS:
+def _require_valid_key(api_key: str = Security(API_KEY_HEADER)) -> str:
+    if VALID_API_KEYS and api_key not in VALID_API_KEYS:
         raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="No API keys configured on server. Set SIMILARITY_API_KEYS env var.",
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or missing API key.",
         )
-    token_hash = hashlib.sha256(token.encode()).hexdigest()
-    for key in VALID_API_KEYS:
-        if hmac.compare_digest(hashlib.sha256(key.encode()).hexdigest(), token_hash):
-            return token
-    raise HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Invalid or missing Bearer token.",
-        headers={"WWW-Authenticate": "Bearer"},
+    return api_key
+
+
+class SimilarityRequest(BaseModel):
+    corpus: list[list[float]] = Field(
+        ...,
+        min_length=1,
+        max_length=10000,
+        description="List of embedding vectors forming the ephemeral corpus. All vectors must share the same dimensionality.",
     )
-
-
-class DenseVectorCorpus(BaseModel):
-    query: list[float] = Field(..., min_length=2, max_length=16384)
-    corpus: list[list[float]] = Field(..., min_length=1, max_length=10000)
-    alpha: float = Field(default=0.5, ge=0.0, le=1.0)
-    top_k: int = Field(default=10, ge=1, le=500)
-    n_bins: Optional[int] = Field(default=None, ge=2, le=256)
+    query: list[float] = Field(
+        ...,
+        min_length=1,
+        max_length=4096,
+        description="Query embedding vector. Must match corpus vector dimensionality.",
+    )
+    top_k: int = Field(
+        default=10,
+        ge=1,
+        le=500,
+        description="Number of top results to return.",
+    )
+    nmi_bandwidth: Optional[float] = Field(
+        default=None,
+        gt=0.0,
+        description="KDE bandwidth for NMI estimation. If None, Scott's rule is applied automatically.",
+    )
 
     @field_validator("corpus")
     @classmethod
-    def corpus_vectors_nonempty(cls, v: list[list[float]]) -> list[list[float]]:
+    def corpus_vectors_uniform_dim(cls, v):
+        if not v:
+            raise ValueError("corpus must contain at least one vector.")
+        dim = len(v[0])
+        if dim == 0:
+            raise ValueError("corpus vectors must have at least one dimension.")
         for i, vec in enumerate(v):
-            if len(vec) < 2:
-                raise ValueError(f"corpus[{i}] must have at least 2 dimensions")
-            if len(vec) > 16384:
-                raise ValueError(f"corpus[{i}] exceeds max dimension 16384")
-        return v
-
-    @model_validator(mode="after")
-    def dimensions_consistent(self) -> "DenseVectorCorpus":
-        d = len(self.query)
-        for i, vec in enumerate(self.corpus):
-            if len(vec) != d:
+            if len(vec) != dim:
                 raise ValueError(
-                    f"corpus[{i}] dimension {len(vec)} != query dimension {d}"
+                    f"All corpus vectors must share the same dimensionality. "
+                    f"Vector 0 has dim={dim}, vector {i} has dim={len(vec)}."
                 )
-        return self
-
-
-class DiscreteDistributionCorpus(BaseModel):
-    query: list[float] = Field(..., min_length=2, max_length=65536)
-    corpus: list[list[float]] = Field(..., min_length=1, max_length=10000)
-    alpha: float = Field(default=0.5, ge=0.0, le=1.0)
-    top_k: int = Field(default=10, ge=1, le=500)
+        return v
 
     @field_validator("query")
     @classmethod
-    def query_is_valid_distribution(cls, v: list[float]) -> list[float]:
-        arr = np.asarray(v, dtype=np.float64)
-        if np.any(arr < 0.0):
-            raise ValueError("query distribution must be non-negative")
-        total = arr.sum()
-        if total <= 0.0:
-            raise ValueError("query distribution must sum to a positive value")
-        return (arr / total).tolist()
-
-    @field_validator("corpus")
-    @classmethod
-    def corpus_distributions_valid(cls, v: list[list[float]]) -> list[list[float]]:
-        result = []
-        for i, dist in enumerate(v):
-            if len(dist) < 2:
-                raise ValueError(f"corpus[{i}] must have at least 2 bins")
-            arr = np.asarray(dist, dtype=np.float64)
-            if np.any(arr < 0.0):
-                raise ValueError(f"corpus[{i}] has negative probabilities")
-            total = arr.sum()
-            if total <= 0.0:
-                raise ValueError(f"corpus[{i}] sums to zero")
-            result.append((arr / total).tolist())
-        return result
-
-    @model_validator(mode="after")
-    def dimensions_consistent(self) -> "DiscreteDistributionCorpus":
-        d = len(self.query)
-        for i, dist in enumerate(self.corpus):
-            if len(dist) != d:
-                raise ValueError(
-                    f"corpus[{i}] length {len(dist)} != query length {d}"
-                )
-        return self
+    def query_not_empty(cls, v):
+        if not v:
+            raise ValueError("query vector must not be empty.")
+        return v
 
 
-class SimilarityResult(BaseModel):
-    index: int
-    score: float
-    nmi: float
-    cosine: float
+class RankedItem(BaseModel):
+    corpus_index: int
+    composite_score: float
+    cosine_similarity: float
+    nmi_score: float
+    nmi_weight: float
 
 
-class SearchResponse(BaseModel):
-    results: list[SimilarityResult]
-    alpha: float
-    input_type: Literal["dense_vector", "discrete_distribution"]
+class SimilarityResponse(BaseModel):
+    results: list[RankedItem]
     corpus_size: int
     query_dim: int
+    adaptive_nmi_weight: float
     latency_ms: float
 
 
 class HealthResponse(BaseModel):
     status: str
     version: str
-    numpy_version: str
-    scipy_version: str
 
 
-def _adaptive_bin_count(n_samples: int, user_bins: Optional[int]) -> int:
-    if user_bins is not None:
-        return user_bins
-    sturges = int(np.ceil(np.log2(n_samples) + 1))
-    scott_bandwidth = 3.5 * 1.0 / (n_samples ** (1.0 / 3.0))
-    fd_bins = max(1, int(np.ceil(1.0 / scott_bandwidth)))
-    return max(2, min(sturges, fd_bins, 64))
+def _cosine_similarities(corpus_matrix: np.ndarray, query_vec: np.ndarray) -> np.ndarray:
+    query_norm = np.linalg.norm(query_vec)
+    corpus_norms = np.linalg.norm(corpus_matrix, axis=1)
+
+    zero_query = query_norm < 1e-12
+    zero_corpus = corpus_norms < 1e-12
+
+    if zero_query:
+        return np.zeros(len(corpus_matrix))
+
+    dot_products = corpus_matrix @ query_vec
+    denom = corpus_norms * query_norm
+    similarities = np.where(zero_corpus, 0.0, dot_products / denom)
+    return np.clip(similarities, -1.0, 1.0)
 
 
-def _joint_histogram_normalized(
-    x: np.ndarray, y: np.ndarray, n_bins: int
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    x_edges = np.linspace(x.min() - 1e-10, x.max() + 1e-10, n_bins + 1)
-    y_edges = np.linspace(y.min() - 1e-10, y.max() + 1e-10, n_bins + 1)
-    joint_counts, _, _ = np.histogram2d(x, y, bins=[x_edges, y_edges])
-    n = joint_counts.sum()
-    if n == 0:
-        return np.zeros((n_bins, n_bins)), np.zeros(n_bins), np.zeros(n_bins)
-    p_xy = joint_counts / n
-    p_x = p_xy.sum(axis=1)
-    p_y = p_xy.sum(axis=0)
-    return p_xy, p_x, p_y
-
-
-def _entropy_from_pmf(p: np.ndarray) -> float:
-    mask = p > 0.0
-    return float(-np.sum(p[mask] * np.log(p[mask])))
-
-
-def _miller_madow_correction(n_samples: int, n_nonzero_bins: int) -> float:
-    return (n_nonzero_bins - 1.0) / (2.0 * max(n_samples, 1))
-
-
-def _nmi_dense_strehl_ghosh(
-    x: np.ndarray, y: np.ndarray, n_bins: int
+def _estimate_nmi_kde(
+    x: np.ndarray,
+    y: np.ndarray,
+    bandwidth: Optional[float],
 ) -> float:
     n = len(x)
-    p_xy, p_x, p_y = _joint_histogram_normalized(x, y, n_bins)
+    if n < 4:
+        return 0.0
 
-    h_x_raw = _entropy_from_pmf(p_x)
-    h_y_raw = _entropy_from_pmf(p_y)
-    h_xy_raw = _entropy_from_pmf(p_xy.ravel())
+    if bandwidth is None:
+        bw_x = float(np.std(x)) * (n ** (-1.0 / 5.0))
+        bw_y = float(np.std(y)) * (n ** (-1.0 / 5.0))
+    else:
+        bw_x = bandwidth
+        bw_y = bandwidth
 
-    n_nonzero_x = int(np.sum(p_x > 0))
-    n_nonzero_y = int(np.sum(p_y > 0))
-    n_nonzero_xy = int(np.sum(p_xy > 0))
+    bw_x = max(bw_x, 1e-10)
+    bw_y = max(bw_y, 1e-10)
 
-    correction_x = _miller_madow_correction(n, n_nonzero_x)
-    correction_y = _miller_madow_correction(n, n_nonzero_y)
-    correction_xy = _miller_madow_correction(n, n_nonzero_xy)
+    grid_size = min(32, n)
+    x_grid = np.linspace(x.min() - 2 * bw_x, x.max() + 2 * bw_x, grid_size)
+    y_grid = np.linspace(y.min() - 2 * bw_y, y.max() + 2 * bw_y, grid_size)
 
-    h_x = h_x_raw + correction_x
-    h_y = h_y_raw + correction_y
-    h_xy = h_xy_raw + correction_xy
+    kde_x = gaussian_kde(x, bw_method=bw_x / (np.std(x) + 1e-12) if np.std(x) > 1e-12 else "scott")
+    kde_y = gaussian_kde(y, bw_method=bw_y / (np.std(y) + 1e-12) if np.std(y) > 1e-12 else "scott")
+    kde_joint = gaussian_kde(np.vstack([x, y]), bw_method=bw_x / (np.std(x) + 1e-12) if np.std(x) > 1e-12 else "scott")
 
-    mi = max(0.0, h_x + h_y - h_xy)
+    px = kde_x(x_grid)
+    py = kde_y(y_grid)
 
-    denom = h_x + h_y
+    px = np.clip(px, 1e-300, None)
+    py = np.clip(py, 1e-300, None)
+    px /= px.sum()
+    py /= py.sum()
+
+    XX, YY = np.meshgrid(x_grid, y_grid)
+    eval_points = np.vstack([XX.ravel(), YY.ravel()])
+    pxy = kde_joint(eval_points).reshape(grid_size, grid_size)
+    pxy = np.clip(pxy, 1e-300, None)
+    pxy /= pxy.sum()
+
+    outer = np.outer(py, px)
+    outer = np.clip(outer, 1e-300, None)
+
+    mi = float(np.sum(pxy * np.log(pxy / outer)))
+    mi = max(mi, 0.0)
+
+    hx = -float(np.sum(px * np.log(px)))
+    hy = -float(np.sum(py * np.log(py)))
+
+    denom = min(hx, hy)
     if denom < 1e-12:
         return 0.0
 
-    nmi_strehl_ghosh = 2.0 * mi / denom
-    return float(np.clip(nmi_strehl_ghosh, 0.0, 1.0))
+    nmi = min(mi / denom, 1.0)
+    return float(nmi)
 
 
-def _nmi_discrete_native(p: np.ndarray, q: np.ndarray) -> float:
-    epsilon = 1e-12
-    p = np.asarray(p, dtype=np.float64)
-    q = np.asarray(q, dtype=np.float64)
-    p = p / (p.sum() + epsilon)
-    q = q / (q.sum() + epsilon)
-
-    p_xy = np.outer(p, q)
-    marginal_product = np.outer(p, q)
-
-    mask = (p_xy > epsilon) & (marginal_product > epsilon)
-    mi = float(np.sum(p_xy[mask] * np.log(p_xy[mask] / (marginal_product[mask] + epsilon))))
-    mi = max(0.0, mi)
-
-    h_p = float(-np.sum(p[p > epsilon] * np.log(p[p > epsilon])))
-    h_q = float(-np.sum(q[q > epsilon] * np.log(q[q > epsilon])))
-
-    denom = h_p + h_q
-    if denom < 1e-12:
-        return 1.0 if np.allclose(p, q, atol=1e-6) else 0.0
-
-    nmi = 2.0 * mi / denom
-    return float(np.clip(nmi, 0.0, 1.0))
+def _corpus_variance_weight(corpus_matrix: np.ndarray) -> float:
+    inter_item_var = float(np.mean(np.var(corpus_matrix, axis=0)))
+    total_range = float(np.ptp(corpus_matrix))
+    if total_range < 1e-12:
+        return 0.0
+    normalized_var = min(inter_item_var / (total_range ** 2 + 1e-12), 1.0)
+    nmi_weight = float(np.tanh(3.0 * normalized_var))
+    return nmi_weight
 
 
-def _cosine_similarity_batch(query: np.ndarray, corpus: np.ndarray) -> np.ndarray:
-    query_norm = np.linalg.norm(query)
-    if query_norm < 1e-12:
-        return np.zeros(len(corpus))
-    corpus_norms = np.linalg.norm(corpus, axis=1)
-    zero_mask = corpus_norms < 1e-12
-    dots = corpus @ query
-    with np.errstate(invalid="ignore", divide="ignore"):
-        cosines = np.where(zero_mask, 0.0, dots / (corpus_norms * query_norm))
-    return np.clip(cosines, -1.0, 1.0)
+def _batch_nmi_scores(
+    corpus_matrix: np.ndarray,
+    query_vec: np.ndarray,
+    bandwidth: Optional[float],
+) -> np.ndarray:
+    n, d = corpus_matrix.shape
+    nmi_scores = np.zeros(n)
+
+    for dim_idx in range(d):
+        corpus_dim = corpus_matrix[:, dim_idx]
+        query_val = float(query_vec[dim_idx])
+        x_extended = np.append(corpus_dim, query_val)
+
+        for item_idx in range(n):
+            y_pair = np.array([corpus_dim[item_idx], query_val])
+            x_pair = np.array([corpus_dim[item_idx], query_val])
+            nmi_scores[item_idx] += _estimate_nmi_kde(corpus_dim, np.full(n, corpus_dim[item_idx]), bandwidth)
+
+    dim_nmi = np.zeros(n)
+    for item_idx in range(n):
+        per_dim = np.zeros(d)
+        for dim_idx in range(d):
+            corpus_col = corpus_matrix[:, dim_idx]
+            item_projection = np.full(len(corpus_col), corpus_matrix[item_idx, dim_idx])
+            query_projection = query_vec[dim_idx]
+            x_signal = corpus_col
+            y_signal = np.full(len(corpus_col), corpus_matrix[item_idx, dim_idx])
+            per_dim[dim_idx] = _estimate_nmi_kde(x_signal, y_signal, bandwidth)
+        dim_nmi[item_idx] = float(np.mean(per_dim))
+
+    return dim_nmi
 
 
-def _hybrid_scores_dense(
-    query: np.ndarray,
-    corpus: np.ndarray,
-    alpha: float,
-    n_bins: int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    cosines = _cosine_similarity_batch(query, corpus)
-    n = len(corpus)
-    nmis = np.empty(n, dtype=np.float64)
-    for i in range(n):
-        nmis[i] = _nmi_dense_strehl_ghosh(query, corpus[i], n_bins)
-    cosine_norm = (cosines + 1.0) / 2.0
-    scores = alpha * nmis + (1.0 - alpha) * cosine_norm
-    return scores, nmis, cosines
+def _compute_item_nmi(
+    corpus_matrix: np.ndarray,
+    item_idx: int,
+    query_vec: np.ndarray,
+    bandwidth: Optional[float],
+) -> float:
+    n, d = corpus_matrix.shape
+    per_dim_nmi = np.zeros(d)
+    for dim_idx in range(d):
+        corpus_col = corpus_matrix[:, dim_idx]
+        item_val = corpus_matrix[item_idx, dim_idx]
+        query_val = query_vec[dim_idx]
+        signal_a = corpus_col
+        signal_b = np.full(n, item_val)
+        per_dim_nmi[dim_idx] = _estimate_nmi_kde(signal_a, signal_b, bandwidth)
+    return float(np.mean(per_dim_nmi))
 
 
-def _hybrid_scores_discrete(
-    query: np.ndarray,
-    corpus: np.ndarray,
-    alpha: float,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    n = len(corpus)
-    nmis = np.empty(n, dtype=np.float64)
-    for i in range(n):
-        nmis[i] = _nmi_discrete_native(query, corpus[i])
-    cosines = _cosine_similarity_batch(query, corpus)
-    cosine_norm = (cosines + 1.0) / 2.0
-    scores = alpha * nmis + (1.0 - alpha) * cosine_norm
-    return scores, nmis, cosines
-
-
-@app.get("/health", response_model=HealthResponse, tags=["system"])
-def health_check() -> HealthResponse:
-    import scipy
-    return HealthResponse(
-        status="ok",
-        version="1.0.0",
-        numpy_version=np.__version__,
-        scipy_version=scipy.__version__,
-    )
+@app.get("/health", response_model=HealthResponse, tags=["operational"])
+def health_check():
+    return HealthResponse(status="ok", version="1.0.0")
 
 
 @app.post(
-    "/search/dense",
-    response_model=SearchResponse,
-    tags=["search"],
-    summary="Rank dense vectors by NMI+Cosine hybrid score with Strehl-Ghosh bias correction",
+    "/rank",
+    response_model=SimilarityResponse,
+    tags=["core"],
+    summary="Rank corpus items by NMI+Cosine fused similarity against a query — stateless, per-call.",
 )
-def search_dense_vectors(
-    payload: DenseVectorCorpus,
-    credentials: HTTPAuthorizationCredentials = Security(bearer_scheme),
-) -> SearchResponse:
-    _authenticate(credentials)
+def rank_by_fused_similarity(
+    request: SimilarityRequest,
+    api_key: str = Security(_require_valid_key),
+):
     t0 = time.perf_counter()
 
-    query_arr = np.asarray(payload.query, dtype=np.float64)
-    corpus_arr = np.asarray(payload.corpus, dtype=np.float64)
+    corpus_matrix = np.array(request.corpus, dtype=np.float64)
+    query_vec = np.array(request.query, dtype=np.float64)
 
-    n_samples = len(query_arr)
-    n_bins = _adaptive_bin_count(n_samples, payload.n_bins)
+    n, d = corpus_matrix.shape
 
-    if np.all(query_arr == query_arr[0]):
+    if d != len(query_vec):
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="Query vector is constant — NMI is undefined for zero-variance inputs.",
+            detail=(
+                f"Dimensionality mismatch: corpus vectors have dim={d}, "
+                f"query has dim={len(query_vec)}."
+            ),
         )
 
-    scores, nmis, cosines = _hybrid_scores_dense(
-        query_arr, corpus_arr, payload.alpha, n_bins
-    )
+    if not np.all(np.isfinite(corpus_matrix)):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="corpus contains non-finite values (NaN or Inf). All embeddings must be finite.",
+        )
+    if not np.all(np.isfinite(query_vec)):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="query contains non-finite values (NaN or Inf).",
+        )
 
-    top_k = min(payload.top_k, len(scores))
-    top_indices = np.argpartition(scores, -top_k)[-top_k:]
-    top_indices = top_indices[np.argsort(scores[top_indices])[::-1]]
+    cosine_sims = _cosine_similarities(corpus_matrix, query_vec)
+    cosine_normalized = (cosine_sims + 1.0) / 2.0
+
+    nmi_weight = _corpus_variance_weight(corpus_matrix)
+    cosine_weight = 1.0 - nmi_weight
+
+    nmi_scores = np.zeros(n)
+    if nmi_weight > 1e-4:
+        for item_idx in range(n):
+            nmi_scores[item_idx] = _compute_item_nmi(
+                corpus_matrix, item_idx, query_vec, request.nmi_bandwidth
+            )
+
+    composite_scores = cosine_weight * cosine_normalized + nmi_weight * nmi_scores
+
+    top_k = min(request.top_k, n)
+    top_indices = np.argpartition(composite_scores, -top_k)[-top_k:]
+    top_indices = top_indices[np.argsort(composite_scores[top_indices])[::-1]]
 
     results = [
-        SimilarityResult(
-            index=int(i),
-            score=float(scores[i]),
-            nmi=float(nmis[i]),
-            cosine=float(cosines[i]),
+        RankedItem(
+            corpus_index=int(idx),
+            composite_score=float(composite_scores[idx]),
+            cosine_similarity=float(cosine_sims[idx]),
+            nmi_score=float(nmi_scores[idx]),
+            nmi_weight=float(nmi_weight),
         )
-        for i in top_indices
+        for idx in top_indices
     ]
 
     latency_ms = (time.perf_counter() - t0) * 1000.0
+    logger.info(
+        "rank completed corpus_size=%d dim=%d top_k=%d nmi_weight=%.4f latency_ms=%.2f",
+        n, d, top_k, nmi_weight, latency_ms,
+    )
 
-    return SearchResponse(
+    return SimilarityResponse(
         results=results,
-        alpha=payload.alpha,
-        input_type="dense_vector",
-        corpus_size=len(corpus_arr),
-        query_dim=len(query_arr),
+        corpus_size=n,
+        query_dim=d,
+        adaptive_nmi_weight=float(nmi_weight),
         latency_ms=round(latency_ms, 3),
     )
 
 
 @app.post(
-    "/search/distributions",
-    response_model=SearchResponse,
-    tags=["search"],
-    summary="Rank discrete probability distributions by NMI+Cosine hybrid score (no binning required)",
+    "/score",
+    tags=["core"],
+    summary="Compute the fused NMI+Cosine score for a single corpus/query pair — no ranking, minimal payload.",
 )
-def search_discrete_distributions(
-    payload: DiscreteDistributionCorpus,
-    credentials: HTTPAuthorizationCredentials = Security(bearer_scheme),
-) -> SearchResponse:
-    _authenticate(credentials)
-    t0 = time.perf_counter()
-
-    query_arr = np.asarray(payload.query, dtype=np.float64)
-    corpus_arr = np.asarray(payload.corpus, dtype=np.float64)
-
-    scores, nmis, cosines = _hybrid_scores_discrete(query_arr, corpus_arr, payload.alpha)
-
-    top_k = min(payload.top_k, len(scores))
-    top_indices = np.argpartition(scores, -top_k)[-top_k:]
-    top_indices = top_indices[np.argsort(scores[top_indices])[::-1]]
-
-    results = [
-        SimilarityResult(
-            index=int(i),
-            score=float(scores[i]),
-            nmi=float(nmis[i]),
-            cosine=float(cosines[i]),
+def score_single_pair(
+    request: SimilarityRequest,
+    api_key: str = Security(_require_valid_key),
+):
+    request.top_k = len(request.corpus)
+    response = rank_by_fused_similarity(request, api_key=api_key)
+    if not response.results:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="No results produced. Verify corpus and query inputs.",
         )
-        for i in top_indices
-    ]
-
-    latency_ms = (time.perf_counter() - t0) * 1000.0
-
-    return SearchResponse(
-        results=results,
-        alpha=payload.alpha,
-        input_type="discrete_distribution",
-        corpus_size=len(corpus_arr),
-        query_dim=len(query_arr),
-        latency_ms=round(latency_ms, 3),
-    )
+    return {
+        "composite_score": response.results[0].composite_score,
+        "cosine_similarity": response.results[0].cosine_similarity,
+        "nmi_score": response.results[0].nmi_score,
+        "adaptive_nmi_weight": response.adaptive_nmi_weight,
+        "latency_ms": response.latency_ms,
+    }
 
 
 @app.post(
-    "/alpha/calibrate",
-    tags=["math"],
-    summary="Estimate optimal alpha from labeled pairs using NMI-vs-Cosine variance decomposition",
+    "/introspect",
+    tags=["diagnostics"],
+    summary="Return corpus statistics used to compute adaptive NMI weight — useful for debugging blend behavior.",
 )
-def calibrate_alpha(
-    pairs: list[dict],
-    credentials: HTTPAuthorizationCredentials = Security(bearer_scheme),
-) -> dict:
-    _authenticate(credentials)
+def introspect_corpus_statistics(
+    request: SimilarityRequest,
+    api_key: str = Security(_require_valid_key),
+):
+    t0 = time.perf_counter()
 
-    if not pairs:
+    corpus_matrix = np.array(request.corpus, dtype=np.float64)
+    query_vec = np.array(request.query, dtype=np.float64)
+    n, d = corpus_matrix.shape
+
+    if d != len(query_vec):
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="pairs list must not be empty",
+            detail=f"Dimensionality mismatch: corpus dim={d}, query dim={len(query_vec)}.",
         )
-    if len(pairs) > 2000:
+
+    if not np.all(np.isfinite(corpus_matrix)) or not np.all(np.isfinite(query_vec)):
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="Maximum 2000 pairs per calibration call",
+            detail="Non-finite values detected in corpus or query.",
         )
 
-    nmi_scores = []
-    cosine_scores = []
+    per_dim_var = np.var(corpus_matrix, axis=0)
+    inter_item_var = float(np.mean(per_dim_var))
+    total_range = float(np.ptp(corpus_matrix))
+    normalized_var = min(inter_item_var / (total_range ** 2 + 1e-12), 1.0)
+    nmi_weight = float(np.tanh(3.0 * normalized_var))
+    cosine_weight = 1.0 - nmi_weight
 
-    for idx, pair in enumerate(pairs):
-        try:
-            a = np.asarray(pair["a"], dtype=np.float64)
-            b = np.asarray(pair["b"], dtype=np.float64)
-        except (KeyError, TypeError, ValueError) as exc:
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail=f"pairs[{idx}]: each pair must have keys 'a' and 'b' with numeric arrays. Error: {exc}",
-            )
+    cosine_sims = _cosine_similarities(corpus_matrix, query_vec)
 
-        if len(a) != len(b):
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail=f"pairs[{idx}]: 'a' and 'b' must have equal length",
-            )
-        if len(a) < 2:
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail=f"pairs[{idx}]: vectors must have at least 2 dimensions",
-            )
-
-        n_bins = _adaptive_bin_count(len(a), None)
-        nmi_val = _nmi_dense_strehl_ghosh(a, b, n_bins)
-        cos_val = float(
-            np.clip(
-                np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-12),
-                -1.0,
-                1.0,
-            )
-        )
-        nmi_scores.append(nmi_val)
-        cosine_scores.append((cos_val + 1.0) / 2.0)
-
-    nmi_arr = np.asarray(nmi_scores)
-    cos_arr = np.asarray(cosine_scores)
-
-    var_nmi = float(np.var(nmi_arr))
-    var_cos = float(np.var(cos_arr))
-    total_var = var_nmi + var_cos
-
-    if total_var < 1e-12:
-        optimal_alpha = 0.5
-        rationale = "both metrics have near-zero variance across pairs — default alpha=0.5 applied"
-    else:
-        optimal_alpha = float(np.clip(var_nmi / total_var, 0.0, 1.0))
-        rationale = (
-            f"variance-weighted: var(NMI)={var_nmi:.4f}, var(Cosine)={var_cos:.4f} — "
-            f"higher variance metric contributes more to discrimination"
-        )
+    latency_ms = (time.perf_counter() - t0) * 1000.0
 
     return {
-        "optimal_alpha": round(optimal_alpha, 4),
-        "var_nmi": round(var_nmi, 6),
-        "var_cosine": round(var_cos, 6),
-        "n_pairs": len(pairs),
-        "rationale": rationale,
+        "corpus_size": n,
+        "embedding_dim": d,
+        "inter_item_variance_mean": round(inter_item_var, 8),
+        "total_value_range": round(total_range, 8),
+        "normalized_variance": round(normalized_var, 8),
+        "adaptive_nmi_weight": round(nmi_weight, 6),
+        "adaptive_cosine_weight": round(cosine_weight, 6),
+        "cosine_similarity_stats": {
+            "min": round(float(cosine_sims.min()), 6),
+            "max": round(float(cosine_sims.max()), 6),
+            "mean": round(float(cosine_sims.mean()), 6),
+            "std": round(float(cosine_sims.std()), 6),
+        },
+        "kde_bandwidth_mode": "scott_rule" if request.nmi_bandwidth is None else "manual",
+        "latency_ms": round(latency_ms, 3),
     }
 
 # --- NEXUS: servidor MCP real montado en el mismo proceso (inyectado por forge_agent) ---
@@ -494,35 +436,35 @@ async def _nexus_mcp_call_core(method: str, path: str, params: dict) -> Any:
         return resp.json()
 
 
-@_nexus_mcp.tool(name='nexus_similarity_search_api_rank_by_nmi_cosine_hybrid', description='Rankea un corpus de vectores contra un vector query usando scoring híbrido NMI+Cosine ponderado por alpha. Úsalo cuando el corpus completo cabe en una sola llamada (<= 10000 vectores) y no se requiere índice persistente. NO usarlo si los vectores son continuos sin interpretación distribucional y alpha=1.0 (en ese caso usa rank_by_cosine_only para evitar overhead de estimación NMI).')
-async def rank_by_nmi_cosine_hybrid(query_vector: Annotated[list[float], Field(..., description='Vector de consulta. Debe tener la misma dimensionalidad que cada vector del corpus. Acepta valores reales; si representa una distribución, debe sumar 1.0 (se valida internamente).', min_length=2, max_length=4096)], corpus_vectors: Annotated[list[list[float]], Field(..., description='Matriz de vectores candidatos [n_docs x n_dims]. Cada fila es un documento. Máximo 10000 filas; todas las filas deben tener la misma longitud que query_vector.', min_length=1, max_length=10000)], alpha: Annotated[float, Field(0.5, description='Peso del componente NMI en el score híbrido: score = alpha * NMI + (1 - alpha) * Cosine. 0.0 = solo coseno, 1.0 = solo NMI. Valores recomendados: 0.3-0.7 para corpus distribucionales mixtos.', ge=0.0, le=1.0)], top_k: Annotated[float, Field(10, description='Número de resultados más similares a devolver, ordenados por score descendente.', ge=1, le=1000)], bias_correction: Annotated[bool, Field(True, description='Aplica corrección de bias de Strehl-Ghosh para NMI normalizado en muestras pequeñas. Recomendado true cuando n_dims < 50. Añade ~15% de latencia.')], n_bins: Annotated[float, Field(10, description='Número de bins para discretización al estimar distribuciones conjuntas de vectores continuos. Ignorado si los vectores ya son distribuciones discretas (suman 1.0). Rango útil: 5-20; valores altos aumentan precisión pero requieren más muestras.', ge=2, le=50)]) -> dict[str, Any]:
-    """NMI+Cosine Hybrid Ranking"""
-    params = {"query_vector": query_vector, "corpus_vectors": corpus_vectors, "alpha": alpha, "top_k": top_k, "bias_correction": bias_correction, "n_bins": n_bins}
-    return await _nexus_mcp_call_core('POST', '/v1/similarity/rank-nmi-cosine', params)
+@_nexus_mcp.tool(name='nexus_similarity_search_api_rank_corpus_by_nmi_cosine_fusion', description='Ranks all corpus vectors against a query vector using a fused NMI+cosine score. NMI captures nonlinear statistical dependence; cosine captures geometric proximity. The composite score reduces false negatives on noisy or high-dimensional corpora where cosine alone fails. Use when you need a single ranked list from an ephemeral corpus without prior indexing. Do NOT use when corpus exceeds 50,000 vectors per call (latency will exceed SLA), when you need approximate nearest neighbors with sub-linear time, or when corpus is reused across many queries (use a persistent index instead).')
+async def rank_corpus_by_nmi_cosine_fusion(corpus_vectors: Annotated[list[list[float]], Field(..., description='Matrix of corpus item embeddings. Each row is one item vector. All rows must have the same dimensionality as query_vector. Shape: [n_items, n_dims]. Accepts float32-compatible values.', min_length=1, max_length=50000)], query_vector: Annotated[list[float], Field(..., description='Single embedding vector representing the query item. Must match dimensionality of corpus_vectors columns. Values should be finite floats; NaN or Inf will cause a 422 error.', min_length=1, max_length=8192)], top_k: Annotated[float, Field(10, description='Number of top-ranked corpus items to return. Must be <= len(corpus_vectors). Returns indices and scores in descending composite score order.', ge=1, le=1000)], nmi_weight: Annotated[float, Field(0.5, description='Weight assigned to the NMI component in the fused score. Composite = nmi_weight * nmi_score + (1 - nmi_weight) * cosine_score. Set closer to 1.0 for semantically noisy corpora; closer to 0.0 for geometrically clean embedding spaces.', ge=0.0, le=1.0)], nmi_bins: Annotated[float, Field(16, description='Number of histogram bins used when estimating the joint distribution for NMI calculation over continuous vector dimensions. Higher values increase NMI precision but raise compute time. Recommended range: 8-32 for d >= 128.', ge=4, le=64)]) -> dict[str, Any]:
+    """NMI+Cosine Fusion Ranking"""
+    params = {"corpus_vectors": corpus_vectors, "query_vector": query_vector, "top_k": top_k, "nmi_weight": nmi_weight, "nmi_bins": nmi_bins}
+    return await _nexus_mcp_call_core('POST', '/v1/similarity/rank', params)
 
-@_nexus_mcp.tool(name='nexus_similarity_search_api_rank_by_cosine_only', description='Rankea un corpus contra un query usando exclusivamente similitud coseno. Úsalo cuando los vectores son embeddings densos continuos sin componente distribucional y se requiere máxima velocidad. NO usarlo si el diferenciador NMI es necesario para el caso de uso — en ese caso usa rank_by_nmi_cosine_hybrid con alpha apropiado.')
-async def rank_by_cosine_only(query_vector: Annotated[list[float], Field(..., description='Vector de consulta de dimensionalidad arbitraria pero consistente con corpus_vectors.', min_length=2, max_length=4096)], corpus_vectors: Annotated[list[list[float]], Field(..., description='Matriz de vectores candidatos [n_docs x n_dims]. Máximo 10000 filas.', min_length=1, max_length=10000)], top_k: Annotated[float, Field(10, description='Número de resultados más similares a devolver.', ge=1, le=1000)]) -> dict[str, Any]:
-    """Pure Cosine Similarity Ranking"""
-    params = {"query_vector": query_vector, "corpus_vectors": corpus_vectors, "top_k": top_k}
-    return await _nexus_mcp_call_core('POST', '/v1/similarity/rank-cosine', params)
+@_nexus_mcp.tool(name='nexus_similarity_search_api_compute_pairwise_nmi_cosine_matrix', description='Computes the full n x n composite NMI+cosine similarity matrix for a set of vectors. Useful for clustering, deduplication, or graph construction where all pairwise relationships matter. Do NOT use for query-to-corpus ranking (use rank_corpus_by_nmi_cosine_fusion instead); do NOT use when n > 2,000 per call due to O(n^2 * d) complexity.')
+async def compute_pairwise_nmi_cosine_matrix(vectors: Annotated[list[list[float]], Field(..., description='Set of embedding vectors to compare pairwise. Shape: [n, d]. All rows must share the same dimensionality. Output matrix will be symmetric of shape [n, n].', min_length=2, max_length=2000)], nmi_weight: Annotated[float, Field(0.5, description='Weight for NMI component in composite score. Same semantics as in rank_corpus_by_nmi_cosine_fusion.', ge=0.0, le=1.0)], nmi_bins: Annotated[float, Field(16, description='Histogram bins for joint distribution estimation per vector pair. Applies uniformly to all pairs.', ge=4, le=64)]) -> dict[str, Any]:
+    """Pairwise Fusion Score Matrix"""
+    params = {"vectors": vectors, "nmi_weight": nmi_weight, "nmi_bins": nmi_bins}
+    return await _nexus_mcp_call_core('POST', '/v1/similarity/pairwise-matrix', params)
 
-@_nexus_mcp.tool(name='nexus_similarity_search_api_compute_pairwise_nmi_matrix', description='Calcula la matriz NMI normalizada (con corrección Strehl-Ghosh opcional) para todos los pares de un conjunto de vectores. Úsalo para clustering exploratorio, análisis de redundancia o construcción de grafos de similitud. NO usarlo como paso previo a rank_by_nmi_cosine_hybrid — ese endpoint ya incorpora NMI internamente y calcular la matriz completa sería redundante y más costoso.')
-async def compute_pairwise_nmi_matrix(vectors: Annotated[list[list[float]], Field(..., description='Conjunto de vectores [n x d]. La matriz resultante será [n x n]. Límite: 500 vectores (la operación es O(n^2 * d)).', min_length=2, max_length=500)], bias_correction: Annotated[bool, Field(True, description='Aplica corrección de bias de Strehl-Ghosh. Obligatorio para conjuntos con d < 30 para evitar sobreestimación sistemática de NMI.')], n_bins: Annotated[float, Field(10, description='Bins para discretización de vectores continuos en estimación de entropía conjunta.', ge=2, le=50)], return_upper_triangle_only: Annotated[bool, Field(False, description='Si true, devuelve solo el triángulo superior de la matriz (la matriz NMI es simétrica), reduciendo el payload a la mitad.')]) -> dict[str, Any]:
-    """Pairwise NMI Matrix"""
-    params = {"vectors": vectors, "bias_correction": bias_correction, "n_bins": n_bins, "return_upper_triangle_only": return_upper_triangle_only}
-    return await _nexus_mcp_call_core('POST', '/v1/similarity/pairwise-nmi-matrix', params)
+@_nexus_mcp.tool(name='nexus_similarity_search_api_decompose_nmi_cosine_scores', description='Returns the individual NMI score, cosine score, and fused composite score for each corpus item against the query, without ranking. Use when you need full score transparency to tune nmi_weight, audit model behavior, or build custom re-ranking logic on top. Do NOT use when you only need the top-k result — rank_corpus_by_nmi_cosine_fusion is more efficient for that case.')
+async def decompose_nmi_cosine_scores(corpus_vectors: Annotated[list[list[float]], Field(..., description='Corpus embedding matrix. Shape: [n_items, n_dims]. Same constraints as rank_corpus_by_nmi_cosine_fusion.', min_length=1, max_length=10000)], query_vector: Annotated[list[float], Field(..., description='Query embedding vector. Must match corpus_vectors column dimensionality.', min_length=1, max_length=8192)], nmi_bins: Annotated[float, Field(16, description='Histogram bins for NMI estimation. Affects NMI precision; cosine scores are unaffected.', ge=4, le=64)]) -> dict[str, Any]:
+    """Score Component Decomposition"""
+    params = {"corpus_vectors": corpus_vectors, "query_vector": query_vector, "nmi_bins": nmi_bins}
+    return await _nexus_mcp_call_core('POST', '/v1/similarity/decompose', params)
 
-@_nexus_mcp.tool(name='nexus_similarity_search_api_score_discrete_distribution_pair', description='Calcula el NMI normalizado entre exactamente dos distribuciones de probabilidad discretas, con corrección de bias y reporte de entropías marginales y conjunta. Úsalo para diagnóstico, validación o cuando solo se necesita comparar un par específico sin overhead de ranking. NO usarlo en bucles sobre corpus grandes — rank_by_nmi_cosine_hybrid es O(n log n) y más eficiente para ese caso.')
-async def score_discrete_distribution_pair(distribution_p: Annotated[list[float], Field(..., description='Primera distribución de probabilidad discreta. Debe sumar 1.0 (tolerancia 1e-6). Misma longitud que distribution_q.', min_length=2, max_length=4096)], distribution_q: Annotated[list[float], Field(..., description='Segunda distribución de probabilidad discreta. Debe sumar 1.0 (tolerancia 1e-6). Misma longitud que distribution_p.', min_length=2, max_length=4096)], bias_correction: Annotated[bool, Field(True, description='Aplica corrección de Strehl-Ghosh. Especialmente importante cuando el número de categorías (longitud del vector) supera las muestras efectivas implícitas en la distribución.')]) -> dict[str, Any]:
-    """NMI Score for Distribution Pair"""
-    params = {"distribution_p": distribution_p, "distribution_q": distribution_q, "bias_correction": bias_correction}
-    return await _nexus_mcp_call_core('POST', '/v1/similarity/score-distribution-pair', params)
+@_nexus_mcp.tool(name='nexus_similarity_search_api_estimate_nmi_score_between_vectors', description='Computes the normalized mutual information score between exactly two continuous embedding vectors by estimating their joint probability distribution via histogram binning. Use when you need to verify the NMI signal in isolation for a single pair, or to calibrate nmi_bins before a bulk ranking call. Do NOT use as a loop replacement for corpus ranking — calling this n times for n corpus items costs O(n) round trips vs. a single rank call.')
+async def estimate_nmi_score_between_vectors(vector_a: Annotated[list[float], Field(..., description='First embedding vector. Must be same length as vector_b. Values must be finite floats.', min_length=1, max_length=8192)], vector_b: Annotated[list[float], Field(..., description='Second embedding vector. Must be same length as vector_a.', min_length=1, max_length=8192)], nmi_bins: Annotated[float, Field(16, description='Number of bins for joint histogram estimation. Increasing bins reduces bias but increases variance for short vectors (d < 64). Default of 16 is calibrated for d >= 128.', ge=4, le=64)]) -> dict[str, Any]:
+    """NMI Score Between Two Vectors"""
+    params = {"vector_a": vector_a, "vector_b": vector_b, "nmi_bins": nmi_bins}
+    return await _nexus_mcp_call_core('POST', '/v1/similarity/nmi-pair', params)
 
-@_nexus_mcp.tool(name='nexus_similarity_search_api_calibrate_alpha_for_corpus', description='Sugiere el valor óptimo de alpha para rank_by_nmi_cosine_hybrid dado un corpus de muestra, midiendo la concordancia de ranking entre NMI puro y Cosine puro (correlación de Spearman entre órdenes). Un alpha óptimo minimiza la divergencia de rankings ponderada por la confianza estadística de NMI. Úsalo una vez antes de desplegar el ranking en producción para calibrar el hiperparámetro. NO usarlo en cada petición de ranking — el resultado es estable para corpus con distribución similar.')
-async def calibrate_alpha_for_corpus(sample_query_vectors: Annotated[list[list[float]], Field(..., description='Conjunto de vectores query representativos del caso de uso [n_queries x n_dims]. Mínimo 5 queries para que la calibración sea estadísticamente significativa.', min_length=5, max_length=200)], sample_corpus_vectors: Annotated[list[list[float]], Field(..., description='Muestra del corpus sobre el que se realizarán los rankings reales [n_docs x n_dims]. Debe ser representativa de la distribución real del corpus.', min_length=10, max_length=2000)], alpha_candidates: Annotated[list[float], Field(None, description='Valores de alpha a evaluar. Si se omite, se usa una grilla uniforme de 0.0 a 1.0 con paso 0.1. Cada valor debe estar en [0.0, 1.0].', min_length=2, max_length=20)], n_bins: Annotated[float, Field(10, description='Bins para discretización usados durante la calibración. Debe coincidir con el valor que se usará en producción.', ge=2, le=50)]) -> dict[str, Any]:
-    """Alpha Calibration via NMI-Cosine Agreement"""
-    params = {"sample_query_vectors": sample_query_vectors, "sample_corpus_vectors": sample_corpus_vectors, "alpha_candidates": alpha_candidates, "n_bins": n_bins}
-    return await _nexus_mcp_call_core('POST', '/v1/similarity/calibrate-alpha', params)
+@_nexus_mcp.tool(name='nexus_similarity_search_api_filter_corpus_by_fusion_threshold', description='Returns all corpus items whose composite NMI+cosine score against the query meets or exceeds a minimum threshold, without imposing a fixed top_k cutoff. Use when the relevant set size is unknown in advance and you want all items above a quality floor (e.g., deduplication, candidate retrieval before re-ranking). Do NOT use when you need exactly k results — use rank_corpus_by_nmi_cosine_fusion instead. Do NOT use with very low thresholds (< 0.1) on large corpora as it may return the full corpus.')
+async def filter_corpus_by_fusion_threshold(corpus_vectors: Annotated[list[list[float]], Field(..., description='Corpus embedding matrix. Shape: [n_items, n_dims]. Items are returned in descending composite score order.', min_length=1, max_length=50000)], query_vector: Annotated[list[float], Field(..., description='Query embedding vector. Must match corpus_vectors column dimensionality.', min_length=1, max_length=8192)], min_fusion_score: Annotated[float, Field(..., description='Minimum composite NMI+cosine score (inclusive) for an item to be included in the response. Composite scores are in [0.0, 1.0]. Recommended starting value: 0.5 for dense embedding spaces.', ge=0.0, le=1.0)], nmi_weight: Annotated[float, Field(0.5, description='Weight for NMI component. Must be consistent with how min_fusion_score was calibrated.', ge=0.0, le=1.0)], nmi_bins: Annotated[float, Field(16, description='Histogram bins for NMI estimation per corpus item.', ge=4, le=64)]) -> dict[str, Any]:
+    """Threshold-Based Corpus Filter"""
+    params = {"corpus_vectors": corpus_vectors, "query_vector": query_vector, "min_fusion_score": min_fusion_score, "nmi_weight": nmi_weight, "nmi_bins": nmi_bins}
+    return await _nexus_mcp_call_core('POST', '/v1/similarity/filter', params)
 
 
 # Crea el sub-app ASGI de streamable HTTP -- DEBE llamarse antes de
