@@ -1,197 +1,414 @@
 const axios = require('axios');
 
-class SimilaritySearchClient {
-  constructor({ apiKey, baseUrl = 'https://api.similarity-search.io/v1', timeout = 30000 } = {}) {
-    if (!apiKey || typeof apiKey !== 'string' || apiKey.trim() === '') {
-      throw new Error('SimilaritySearchClient requires a non-empty apiKey string');
-    }
-    this.apiKey = apiKey.trim();
-    this.baseUrl = baseUrl.replace(/\/$/, '');
-    this.http = axios.create({
-      baseURL: this.baseUrl,
-      timeout,
-      headers: {
-        'Authorization': `Bearer ${this.apiKey}`,
-        'Content-Type': 'application/json',
-        'X-SDK-Version': '1.0.0',
-        'X-SDK-Language': 'javascript'
-      }
-    });
+const SIMILARITY_SEARCH_BASE_URL = 'https://api.similaritysearch.io/v1';
+const DEFAULT_TIMEOUT_MS = 30000;
+const MAX_CORPUS_ITEMS = 10000;
+const MAX_VECTOR_DIMENSIONS = 4096;
+const MIN_CORPUS_ITEMS = 2;
 
-    this.http.interceptors.response.use(
-      (response) => response,
-      (error) => {
-        if (error.response) {
-          const { status, data } = error.response;
-          const message = (data && data.detail) ? data.detail : JSON.stringify(data);
-          const err = new SimilaritySearchAPIError(message, status, data);
-          return Promise.reject(err);
-        }
-        if (error.code === 'ECONNABORTED') {
-          return Promise.reject(new SimilaritySearchAPIError('Request timed out', 408, null));
-        }
-        return Promise.reject(new SimilaritySearchAPIError(error.message, 0, null));
-      }
-    );
-  }
-
-  async rankByHybridScore({ query, corpus, alpha = 0.5, inputType = 'dense_vectors', topK = null }) {
-    if (query === null || query === undefined) {
-      throw new TypeError('rankByHybridScore: query must be a non-null array');
-    }
-    if (!Array.isArray(query) || query.length === 0) {
-      throw new TypeError('rankByHybridScore: query must be a non-empty array');
-    }
-    if (!Array.isArray(corpus) || corpus.length === 0) {
-      throw new TypeError('rankByHybridScore: corpus must be a non-empty array of vectors or distributions');
-    }
-    if (typeof alpha !== 'number' || alpha < 0 || alpha > 1) {
-      throw new RangeError('rankByHybridScore: alpha must be a number in [0.0, 1.0]');
-    }
-    if (!['dense_vectors', 'discrete_distributions'].includes(inputType)) {
-      throw new TypeError("rankByHybridScore: inputType must be 'dense_vectors' or 'discrete_distributions'");
-    }
-    if (topK !== null && (!Number.isInteger(topK) || topK < 1)) {
-      throw new RangeError('rankByHybridScore: topK must be a positive integer or null');
-    }
-
-    const payload = { query, corpus, alpha, input_type: inputType };
-    if (topK !== null) payload.top_k = topK;
-
-    const response = await this.http.post('/rank', payload);
-    return response.data;
-  }
-
-  async scorePair({ vectorA, vectorB, alpha = 0.5, inputType = 'dense_vectors' }) {
-    if (!Array.isArray(vectorA) || vectorA.length === 0) {
-      throw new TypeError('scorePair: vectorA must be a non-empty array');
-    }
-    if (!Array.isArray(vectorB) || vectorB.length === 0) {
-      throw new TypeError('scorePair: vectorB must be a non-empty array');
-    }
-    if (vectorA.length !== vectorB.length) {
-      throw new RangeError(`scorePair: vectorA (length ${vectorA.length}) and vectorB (length ${vectorB.length}) must have equal length`);
-    }
-    if (typeof alpha !== 'number' || alpha < 0 || alpha > 1) {
-      throw new RangeError('scorePair: alpha must be a number in [0.0, 1.0]');
-    }
-    if (!['dense_vectors', 'discrete_distributions'].includes(inputType)) {
-      throw new TypeError("scorePair: inputType must be 'dense_vectors' or 'discrete_distributions'");
-    }
-
-    const payload = { vector_a: vectorA, vector_b: vectorB, alpha, input_type: inputType };
-    const response = await this.http.post('/score', payload);
-    return response.data;
-  }
-
-  async batchRank({ queries, corpus, alpha = 0.5, inputType = 'dense_vectors', topK = null }) {
-    if (!Array.isArray(queries) || queries.length === 0) {
-      throw new TypeError('batchRank: queries must be a non-empty array of query vectors');
-    }
-    if (queries.length > 50) {
-      throw new RangeError('batchRank: maximum 50 queries per batch call');
-    }
-    if (!Array.isArray(corpus) || corpus.length === 0) {
-      throw new TypeError('batchRank: corpus must be a non-empty array');
-    }
-    if (typeof alpha !== 'number' || alpha < 0 || alpha > 1) {
-      throw new RangeError('batchRank: alpha must be a number in [0.0, 1.0]');
-    }
-    if (!['dense_vectors', 'discrete_distributions'].includes(inputType)) {
-      throw new TypeError("batchRank: inputType must be 'dense_vectors' or 'discrete_distributions'");
-    }
-    if (topK !== null && (!Number.isInteger(topK) || topK < 1)) {
-      throw new RangeError('batchRank: topK must be a positive integer or null');
-    }
-
-    const payload = { queries, corpus, alpha, input_type: inputType };
-    if (topK !== null) payload.top_k = topK;
-
-    const response = await this.http.post('/batch_rank', payload);
-    return response.data;
-  }
-
-  async introspectNMIComponents({ vectorA, vectorB, inputType = 'dense_vectors' }) {
-    if (!Array.isArray(vectorA) || vectorA.length === 0) {
-      throw new TypeError('introspectNMIComponents: vectorA must be a non-empty array');
-    }
-    if (!Array.isArray(vectorB) || vectorB.length === 0) {
-      throw new TypeError('introspectNMIComponents: vectorB must be a non-empty array');
-    }
-    if (vectorA.length !== vectorB.length) {
-      throw new RangeError(`introspectNMIComponents: length mismatch — vectorA: ${vectorA.length}, vectorB: ${vectorB.length}`);
-    }
-    if (!['dense_vectors', 'discrete_distributions'].includes(inputType)) {
-      throw new TypeError("introspectNMIComponents: inputType must be 'dense_vectors' or 'discrete_distributions'");
-    }
-
-    const payload = { vector_a: vectorA, vector_b: vectorB, input_type: inputType };
-    const response = await this.http.post('/introspect', payload);
-    return response.data;
-  }
-
-  async healthCheck() {
-    const response = await this.http.get('/health');
-    return response.data;
+class SimilaritySearchAuthError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'SimilaritySearchAuthError';
   }
 }
 
-class SimilaritySearchAPIError extends Error {
+class SimilaritySearchValidationError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'SimilaritySearchValidationError';
+  }
+}
+
+class SimilaritySearchApiError extends Error {
   constructor(message, statusCode, responseBody) {
     super(message);
-    this.name = 'SimilaritySearchAPIError';
+    this.name = 'SimilaritySearchApiError';
     this.statusCode = statusCode;
     this.responseBody = responseBody;
   }
 }
 
-function createClient(options) {
-  if (!options || typeof options !== 'object') {
-    throw new TypeError('createClient: options must be an object with at least { apiKey }');
+class SimilaritySearchRateLimitError extends Error {
+  constructor(retryAfterSeconds) {
+    super(`Rate limit exceeded. Retry after ${retryAfterSeconds} seconds.`);
+    this.name = 'SimilaritySearchRateLimitError';
+    this.retryAfterSeconds = retryAfterSeconds;
   }
-  return new SimilaritySearchClient(options);
 }
 
-const _defaultClient = { _instance: null };
-
-async function mainMethod(data) {
-  if (!data || typeof data !== 'object') {
-    throw new TypeError('mainMethod: data must be a non-null object');
-  }
-
-  const apiKey = data.apiKey || process.env.SIMILARITY_SEARCH_API_KEY;
-  if (!apiKey) {
-    throw new Error(
-      'mainMethod: no apiKey provided. Pass data.apiKey or set SIMILARITY_SEARCH_API_KEY environment variable'
+function assertApiKey(apiKey) {
+  if (apiKey === null || apiKey === undefined) {
+    throw new SimilaritySearchAuthError(
+      'API key is required. Pass it as the first argument to createClient() or set the SIMILARITY_SEARCH_API_KEY environment variable.'
     );
   }
+  if (typeof apiKey !== 'string') {
+    throw new SimilaritySearchAuthError(
+      `API key must be a string, received ${typeof apiKey}.`
+    );
+  }
+  if (apiKey.trim().length === 0) {
+    throw new SimilaritySearchAuthError('API key must not be an empty string.');
+  }
+}
 
-  const client = createClient({
-    apiKey,
-    baseUrl: data.baseUrl,
-    timeout: data.timeout
+function assertVector(vector, label) {
+  if (!Array.isArray(vector)) {
+    throw new SimilaritySearchValidationError(
+      `${label} must be an array of numbers, received ${typeof vector}.`
+    );
+  }
+  if (vector.length === 0) {
+    throw new SimilaritySearchValidationError(
+      `${label} must not be an empty array.`
+    );
+  }
+  if (vector.length > MAX_VECTOR_DIMENSIONS) {
+    throw new SimilaritySearchValidationError(
+      `${label} has ${vector.length} dimensions; maximum allowed is ${MAX_VECTOR_DIMENSIONS}.`
+    );
+  }
+  for (let i = 0; i < vector.length; i++) {
+    if (typeof vector[i] !== 'number' || !isFinite(vector[i])) {
+      throw new SimilaritySearchValidationError(
+        `${label}[${i}] is not a finite number (got ${vector[i]}).`
+      );
+    }
+  }
+}
+
+function assertCorpus(corpus) {
+  if (corpus === null || corpus === undefined) {
+    throw new SimilaritySearchValidationError(
+      'corpus is required and must be a non-empty array of items.'
+    );
+  }
+  if (!Array.isArray(corpus)) {
+    throw new SimilaritySearchValidationError(
+      `corpus must be an array, received ${typeof corpus}.`
+    );
+  }
+  if (corpus.length < MIN_CORPUS_ITEMS) {
+    throw new SimilaritySearchValidationError(
+      `corpus must contain at least ${MIN_CORPUS_ITEMS} items for NMI estimation to be meaningful; received ${corpus.length}.`
+    );
+  }
+  if (corpus.length > MAX_CORPUS_ITEMS) {
+    throw new SimilaritySearchValidationError(
+      `corpus has ${corpus.length} items; maximum allowed per call is ${MAX_CORPUS_ITEMS}.`
+    );
+  }
+}
+
+function assertTopK(topK, corpusLength) {
+  if (topK === undefined || topK === null) return;
+  if (!Number.isInteger(topK) || topK < 1) {
+    throw new SimilaritySearchValidationError(
+      `top_k must be a positive integer, received ${topK}.`
+    );
+  }
+  if (topK > corpusLength) {
+    throw new SimilaritySearchValidationError(
+      `top_k (${topK}) cannot exceed corpus size (${corpusLength}).`
+    );
+  }
+}
+
+function assertNmiWeight(nmiWeight) {
+  if (nmiWeight === undefined || nmiWeight === null) return;
+  if (typeof nmiWeight !== 'number' || !isFinite(nmiWeight)) {
+    throw new SimilaritySearchValidationError(
+      `nmi_weight_override must be a finite number, received ${nmiWeight}.`
+    );
+  }
+  if (nmiWeight < 0 || nmiWeight > 1) {
+    throw new SimilaritySearchValidationError(
+      `nmi_weight_override must be between 0.0 and 1.0 inclusive, received ${nmiWeight}.`
+    );
+  }
+}
+
+function assertBandwidth(bandwidth) {
+  if (bandwidth === undefined || bandwidth === null) return;
+  if (typeof bandwidth !== 'number' || !isFinite(bandwidth) || bandwidth <= 0) {
+    throw new SimilaritySearchValidationError(
+      `kde_bandwidth must be a positive finite number, received ${bandwidth}.`
+    );
+  }
+}
+
+async function handleAxiosError(error) {
+  if (error.response) {
+    const { status, data, headers } = error.response;
+    if (status === 401 || status === 403) {
+      throw new SimilaritySearchAuthError(
+        `Authentication failed (HTTP ${status}): ${data?.detail || data?.message || 'invalid or missing API key'}.`
+      );
+    }
+    if (status === 429) {
+      const retryAfter = parseInt(headers['retry-after'] || '60', 10);
+      throw new SimilaritySearchRateLimitError(retryAfter);
+    }
+    throw new SimilaritySearchApiError(
+      `API returned HTTP ${status}: ${data?.detail || data?.message || JSON.stringify(data)}`,
+      status,
+      data
+    );
+  }
+  if (error.code === 'ECONNABORTED' || error.code === 'ETIMEDOUT') {
+    throw new SimilaritySearchApiError(
+      `Request timed out after ${DEFAULT_TIMEOUT_MS}ms. Consider reducing corpus size or vector dimensionality.`,
+      null,
+      null
+    );
+  }
+  throw new SimilaritySearchApiError(
+    `Network error: ${error.message}`,
+    null,
+    null
+  );
+}
+
+function createClient(apiKey, options = {}) {
+  if (apiKey === undefined || apiKey === null) {
+    apiKey = process.env.SIMILARITY_SEARCH_API_KEY;
+  }
+  assertApiKey(apiKey);
+
+  const baseURL = options.baseURL || SIMILARITY_SEARCH_BASE_URL;
+  const timeoutMs = options.timeoutMs || DEFAULT_TIMEOUT_MS;
+
+  if (typeof baseURL !== 'string' || baseURL.trim().length === 0) {
+    throw new SimilaritySearchValidationError('options.baseURL must be a non-empty string.');
+  }
+  if (!Number.isInteger(timeoutMs) || timeoutMs < 1) {
+    throw new SimilaritySearchValidationError('options.timeoutMs must be a positive integer.');
+  }
+
+  const httpClient = axios.create({
+    baseURL: baseURL.replace(/\/$/, ''),
+    timeout: timeoutMs,
+    headers: {
+      'Authorization': `Bearer ${apiKey}`,
+      'Content-Type': 'application/json',
+      'Accept': 'application/json',
+      'User-Agent': 'similarity-search-sdk-js/1.0.0',
+    },
   });
 
-  const operation = data.operation || 'rankByHybridScore';
-  const operationMap = {
-    rankByHybridScore: () => client.rankByHybridScore(data),
-    scorePair: () => client.scorePair(data),
-    batchRank: () => client.batchRank(data),
-    introspectNMIComponents: () => client.introspectNMIComponents(data),
-    healthCheck: () => client.healthCheck()
-  };
+  async function rankCorpusByQuerySimilarity(payload) {
+    if (payload === null || payload === undefined || typeof payload !== 'object' || Array.isArray(payload)) {
+      throw new SimilaritySearchValidationError(
+        'payload must be a non-null object with fields: corpus, query_vector, and optionally top_k, nmi_weight_override, kde_bandwidth.'
+      );
+    }
 
-  if (!operationMap[operation]) {
-    throw new TypeError(
-      `mainMethod: unknown operation '${operation}'. Valid operations: ${Object.keys(operationMap).join(', ')}`
-    );
+    const { corpus, query_vector, top_k, nmi_weight_override, kde_bandwidth } = payload;
+
+    assertCorpus(corpus);
+
+    corpus.forEach((item, idx) => {
+      if (item === null || item === undefined || typeof item !== 'object' || Array.isArray(item)) {
+        throw new SimilaritySearchValidationError(
+          `corpus[${idx}] must be an object with fields: id (string) and vector (number[]).`
+        );
+      }
+      if (typeof item.id !== 'string' || item.id.trim().length === 0) {
+        throw new SimilaritySearchValidationError(
+          `corpus[${idx}].id must be a non-empty string, received ${JSON.stringify(item.id)}.`
+        );
+      }
+      assertVector(item.vector, `corpus[${idx}].vector`);
+    });
+
+    const corpusDim = corpus[0].vector.length;
+    corpus.forEach((item, idx) => {
+      if (item.vector.length !== corpusDim) {
+        throw new SimilaritySearchValidationError(
+          `All corpus vectors must have the same dimensionality. corpus[0].vector has ${corpusDim} dimensions but corpus[${idx}].vector has ${item.vector.length}.`
+        );
+      }
+    });
+
+    assertVector(query_vector, 'query_vector');
+
+    if (query_vector.length !== corpusDim) {
+      throw new SimilaritySearchValidationError(
+        `query_vector has ${query_vector.length} dimensions but corpus vectors have ${corpusDim} dimensions. All vectors must share the same dimensionality.`
+      );
+    }
+
+    assertTopK(top_k, corpus.length);
+    assertNmiWeight(nmi_weight_override);
+    assertBandwidth(kde_bandwidth);
+
+    const body = { corpus, query_vector };
+    if (top_k !== undefined && top_k !== null) body.top_k = top_k;
+    if (nmi_weight_override !== undefined && nmi_weight_override !== null) body.nmi_weight_override = nmi_weight_override;
+    if (kde_bandwidth !== undefined && kde_bandwidth !== null) body.kde_bandwidth = kde_bandwidth;
+
+    try {
+      const response = await httpClient.post('/search', body);
+      return response.data;
+    } catch (error) {
+      if (
+        error instanceof SimilaritySearchAuthError ||
+        error instanceof SimilaritySearchValidationError ||
+        error instanceof SimilaritySearchApiError ||
+        error instanceof SimilaritySearchRateLimitError
+      ) {
+        throw error;
+      }
+      await handleAxiosError(error);
+    }
   }
 
-  return operationMap[operation]();
+  async function computeNmiCosineScores(payload) {
+    if (payload === null || payload === undefined || typeof payload !== 'object' || Array.isArray(payload)) {
+      throw new SimilaritySearchValidationError(
+        'payload must be a non-null object with fields: vector_pairs, and optionally kde_bandwidth.'
+      );
+    }
+
+    const { vector_pairs, kde_bandwidth } = payload;
+
+    if (vector_pairs === null || vector_pairs === undefined) {
+      throw new SimilaritySearchValidationError(
+        'vector_pairs is required and must be a non-empty array of {a, b} objects.'
+      );
+    }
+    if (!Array.isArray(vector_pairs)) {
+      throw new SimilaritySearchValidationError(
+        `vector_pairs must be an array, received ${typeof vector_pairs}.`
+      );
+    }
+    if (vector_pairs.length === 0) {
+      throw new SimilaritySearchValidationError(
+        'vector_pairs must not be an empty array.'
+      );
+    }
+    if (vector_pairs.length > 500) {
+      throw new SimilaritySearchValidationError(
+        `vector_pairs has ${vector_pairs.length} pairs; maximum allowed per call is 500.`
+      );
+    }
+
+    vector_pairs.forEach((pair, idx) => {
+      if (pair === null || pair === undefined || typeof pair !== 'object' || Array.isArray(pair)) {
+        throw new SimilaritySearchValidationError(
+          `vector_pairs[${idx}] must be an object with fields: a (number[]) and b (number[]).`
+        );
+      }
+      assertVector(pair.a, `vector_pairs[${idx}].a`);
+      assertVector(pair.b, `vector_pairs[${idx}].b`);
+      if (pair.a.length !== pair.b.length) {
+        throw new SimilaritySearchValidationError(
+          `vector_pairs[${idx}].a has ${pair.a.length} dimensions but vector_pairs[${idx}].b has ${pair.b.length}. Both vectors in a pair must have equal dimensionality.`
+        );
+      }
+    });
+
+    assertBandwidth(kde_bandwidth);
+
+    const body = { vector_pairs };
+    if (kde_bandwidth !== undefined && kde_bandwidth !== null) body.kde_bandwidth = kde_bandwidth;
+
+    try {
+      const response = await httpClient.post('/scores', body);
+      return response.data;
+    } catch (error) {
+      if (
+        error instanceof SimilaritySearchAuthError ||
+        error instanceof SimilaritySearchValidationError ||
+        error instanceof SimilaritySearchApiError ||
+        error instanceof SimilaritySearchRateLimitError
+      ) {
+        throw error;
+      }
+      await handleAxiosError(error);
+    }
+  }
+
+  async function resolveAdaptiveNmiWeight(payload) {
+    if (payload === null || payload === undefined || typeof payload !== 'object' || Array.isArray(payload)) {
+      throw new SimilaritySearchValidationError(
+        'payload must be a non-null object with field: corpus (array of number[]).'
+      );
+    }
+
+    const { corpus } = payload;
+
+    if (corpus === null || corpus === undefined) {
+      throw new SimilaritySearchValidationError(
+        'corpus is required and must be an array of number[] vectors.'
+      );
+    }
+    if (!Array.isArray(corpus)) {
+      throw new SimilaritySearchValidationError(
+        `corpus must be an array of number[] vectors, received ${typeof corpus}.`
+      );
+    }
+    if (corpus.length < MIN_CORPUS_ITEMS) {
+      throw new SimilaritySearchValidationError(
+        `corpus must contain at least ${MIN_CORPUS_ITEMS} vectors for inter-item variance estimation; received ${corpus.length}.`
+      );
+    }
+    if (corpus.length > MAX_CORPUS_ITEMS) {
+      throw new SimilaritySearchValidationError(
+        `corpus has ${corpus.length} vectors; maximum allowed is ${MAX_CORPUS_ITEMS}.`
+      );
+    }
+
+    corpus.forEach((vec, idx) => {
+      assertVector(vec, `corpus[${idx}]`);
+    });
+
+    const dim = corpus[0].length;
+    corpus.forEach((vec, idx) => {
+      if (vec.length !== dim) {
+        throw new SimilaritySearchValidationError(
+          `All corpus vectors must share the same dimensionality. corpus[0] has ${dim} dimensions but corpus[${idx}] has ${vec.length}.`
+        );
+      }
+    });
+
+    try {
+      const response = await httpClient.post('/weight', { corpus });
+      return response.data;
+    } catch (error) {
+      if (
+        error instanceof SimilaritySearchAuthError ||
+        error instanceof SimilaritySearchValidationError ||
+        error instanceof SimilaritySearchApiError ||
+        error instanceof SimilaritySearchRateLimitError
+      ) {
+        throw error;
+      }
+      await handleAxiosError(error);
+    }
+  }
+
+  async function mainMethod(data) {
+    if (data === null || data === undefined || typeof data !== 'object' || Array.isArray(data)) {
+      throw new SimilaritySearchValidationError(
+        'data must be a non-null object with fields: corpus (array of {id, vector}), query_vector (number[]), and optionally top_k, nmi_weight_override, kde_bandwidth.'
+      );
+    }
+    return rankCorpusByQuerySimilarity(data);
+  }
+
+  return {
+    mainMethod,
+    rankCorpusByQuerySimilarity,
+    computeNmiCosineScores,
+    resolveAdaptiveNmiWeight,
+  };
 }
 
-module.exports = mainMethod;
+module.exports = createClient;
 module.exports.createClient = createClient;
-module.exports.SimilaritySearchClient = SimilaritySearchClient;
-module.exports.SimilaritySearchAPIError = SimilaritySearchAPIError;
-module.exports.mainMethod = mainMethod;
+module.exports.SimilaritySearchAuthError = SimilaritySearchAuthError;
+module.exports.SimilaritySearchValidationError = SimilaritySearchValidationError;
+module.exports.SimilaritySearchApiError = SimilaritySearchApiError;
+module.exports.SimilaritySearchRateLimitError = SimilaritySearchRateLimitError;
