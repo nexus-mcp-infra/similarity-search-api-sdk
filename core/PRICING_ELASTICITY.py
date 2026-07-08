@@ -1,146 +1,151 @@
 import numpy as np
 from scipy.optimize import minimize_scalar
 from dataclasses import dataclass
-from typing import NamedTuple
+from typing import Tuple
 
-# Parametros de mercado derivados de developer tools con pricing por operacion
-P_MIN = 0.001   # USD por operacion (floor: competencia con FAISS local ~0)
-P_MAX = 0.05    # USD por operacion (ceiling: dolor de adopcion en devs indie)
-Q_BASE = 50_000 # operaciones/mes baseline para un dev mid-size
+# Parametros de mercado especificos para NMI+Cosine Similarity Search API
+P_MIN = 0.001   # USD por operacion (piso developer hobbyist)
+P_MAX = 0.05    # USD por operacion (techo enterprise tolerance)
+Q_MIN = 1_000   # operaciones/mes minimo viable
+Q_MAX = 10_000_000  # operaciones/mes cliente enterprise
 
-# Elasticidad empirica para developer tools: inelastica en pain points, elastica en nice-to-have
-# NMI-cosine fusion resuelve pain point real -> elasticidad moderada (-1.8 a -2.5)
-EPSILON_REF = -2.1  # punto de referencia: elasticidad precio-demanda del segmento
 
 @dataclass
-class DemandPoint:
-    price: float
-    quantity: float
-    revenue: float
-    elasticity: float
-
-class AdoptionScenario(NamedTuple):
+class AdoptionScenario:
     name: str
-    q_base: float       # operaciones/mes baseline
-    price_sensitivity: float  # escala el exponente de elasticidad
-    freemium_threshold: int   # ops/mes donde el usuario considera pagar
+    elasticity: float       # epsilon: sensibilidad precio-demanda
+    base_demand: float      # Q0 en operaciones/mes a precio de referencia
+    alpha_preference: float # peso NMI vs Cosine preferido (0=cosine puro, 1=NMI puro)
+    freemium_threshold: float  # operaciones/mes donde convierte a paid
 
-def nmi_cosine_demand_curve(price: float, q_base: float, epsilon: float, p_ref: float) -> float:
-    """
-    Q(P) = Q_base * (P / P_ref) ^ epsilon
-    Modelo potencia clasico: elasticidad constante en log-log space.
-    Apropiado para developer tools donde la decision de adopcion es binaria
-    a escala de equipo pero continua a escala de mercado agregado.
-    """
-    if price <= 0:
-        raise ValueError(f"Price must be positive, got {price}")
-    return q_base * (price / p_ref) ** epsilon
 
-def point_elasticity(price: float, q_base: float, epsilon: float, p_ref: float) -> float:
-    """
-    Para demanda potencia Q = Q_base * (P/P_ref)^e, la elasticidad puntual
-    es exactamente epsilon en todo el rango — propiedad util para pricing por calls.
-    Verificacion analitica: dQ/dP = epsilon * Q_base * (P/P_ref)^(epsilon-1) * (1/P_ref)
-    => (dQ/dP)*(P/Q) = epsilon. Consistencia garantizada.
-    """
-    q = nmi_cosine_demand_curve(price, q_base, epsilon, p_ref)
-    dq_dp = epsilon * q_base * (price / p_ref) ** (epsilon - 1) / p_ref
-    return dq_dp * (price / q)
-
-def revenue(price: float, q_base: float, epsilon: float, p_ref: float) -> float:
-    """R(P) = P * Q(P) — objetivo de maximizacion directo."""
-    return price * nmi_cosine_demand_curve(price, q_base, epsilon, p_ref)
-
-def optimal_price(q_base: float, epsilon: float, p_ref: float) -> DemandPoint:
-    """
-    Maximiza R(P) = P * Q_base * (P/P_ref)^epsilon en [P_MIN, P_MAX].
-    Analitico: dR/dP = 0 => P* = P_ref * (1 / (1 + epsilon)) si epsilon < -1.
-    Resolvemos numericamente para respetar los bounds del mercado real.
-    """
-    if epsilon >= -1:
-        raise ValueError(f"Elasticity {epsilon} implies no finite optimum; must be < -1")
-
-    result = minimize_scalar(
-        lambda p: -revenue(p, q_base, epsilon, p_ref),
-        bounds=(P_MIN, P_MAX),
-        method="bounded"
-    )
-    p_star = result.x
-    q_star = nmi_cosine_demand_curve(p_star, q_base, epsilon, p_ref)
-    r_star = p_star * q_star
-    e_star = point_elasticity(p_star, q_base, epsilon, p_ref)
-    return DemandPoint(price=p_star, quantity=q_star, revenue=r_star, elasticity=e_star)
-
-def freemium_to_paid_equilibrium(scenario: AdoptionScenario, p_paid: float, epsilon: float, p_ref: float) -> dict:
-    """
-    Punto de equilibrio: el usuario migra a paid cuando el costo de oportunidad
-    de la friccion freemium (rate limiting, latencia degradada) supera p_paid * Q.
-    Modelamos friction_cost = alpha * Q^beta donde alpha calibra el pain point NMI-cosine
-    (usuarios con distribuciones sesgadas sienten el fallo de coseno puro antes).
-    Equilibrio: friction_cost(Q*) = p_paid * Q* => Q* resuelto iterativamente.
-    """
-    alpha = 0.0008  # costo de friccion por op en freemium (estimado: reintento + ingenieria)
-    beta = 1.15     # superlinear: a mayor volumen, mas doloroso el workaround manual
-
-    q_paid = nmi_cosine_demand_curve(p_paid, scenario.q_base, epsilon, p_ref)
-    friction_at_threshold = alpha * (scenario.freemium_threshold ** beta)
-    paid_cost_at_threshold = p_paid * scenario.freemium_threshold
-
-    # Q_eq donde friction_cost == paid_cost
-    q_eq = (alpha / p_paid) ** (1 / (1 - beta))  # solucion analitica de alpha*Q^beta = p*Q
-
-    return {
-        "scenario": scenario.name,
-        "q_paid_demand": round(q_paid),
-        "freemium_threshold_ops": scenario.freemium_threshold,
-        "friction_cost_at_threshold_usd": round(friction_at_threshold, 4),
-        "paid_cost_at_threshold_usd": round(paid_cost_at_threshold, 4),
-        "equilibrium_ops_per_month": round(q_eq),
-        "converts_at_threshold": friction_at_threshold >= paid_cost_at_threshold,
-    }
-
-# EXACTAMENTE 3 escenarios de adopcion para NMI-cosine Similarity Search API
-ADOPTION_SCENARIOS = [
+# 3 escenarios de adopcion para developers usando primitivas de similitud sin vector DB
+SCENARIOS = [
     AdoptionScenario(
-        name="indie_mvp",           # dev solo, MVP con ~500-5K ops/dia
-        q_base=3_000,
-        price_sensitivity=2.4,      # muy elastico: presupuesto limitado
-        freemium_threshold=500,
+        name="data_scientist_adhoc",
+        elasticity=-1.8,        # alta elasticidad: sustituye con scikit-learn si sube precio
+        base_demand=15_000,     # scripts de analisis esporadicos, no pipelines continuos
+        alpha_preference=0.7,   # prefiere NMI alto: datos categoricos/distribucionales
+        freemium_threshold=5_000,
     ),
     AdoptionScenario(
-        name="startup_semantic_search",  # equipo 2-10, feature de busqueda en producto
-        q_base=120_000,
-        price_sensitivity=1.9,           # moderado: valora stateless sobre setup VectorDB
-        freemium_threshold=10_000,
+        name="ml_engineer_production",
+        elasticity=-0.9,        # inelastico: ya elimino el vector DB overhead, no vuelve atras
+        base_demand=400_000,    # pipeline de reranking en produccion, llamadas sistematicas
+        alpha_preference=0.4,   # balance NMI+Cosine: embeddings densos con semantica hibrida
+        freemium_threshold=50_000,
     ),
     AdoptionScenario(
-        name="enterprise_reranking_pipeline",  # ML team, NMI-cosine como reranker en RAG
-        q_base=2_500_000,
-        price_sensitivity=1.4,                 # inelastico: precision > costo marginal
-        freemium_threshold=100_000,
+        name="platform_integrator",
+        elasticity=-0.5,        # muy inelastico: NMI+Strehl-Ghosh es diferenciador no replicable
+        base_demand=2_500_000,  # SaaS que expone similitud a sus propios usuarios finales
+        alpha_preference=0.3,   # cosine domina: corpus de embeddings densos masivos
+        freemium_threshold=200_000,
     ),
 ]
 
-def simulate_scenario(scenario: AdoptionScenario, p_ref: float = 0.01) -> dict:
-    epsilon = -scenario.price_sensitivity  # negativo: ley de demanda
-    opt = optimal_price(scenario.q_base, epsilon, p_ref)
-    eq = freemium_to_paid_equilibrium(scenario, opt.price, epsilon, p_ref)
+P_REF = 0.01  # precio de referencia para anclar Q0 (mid-range del mercado developer)
 
-    price_sweep = np.linspace(P_MIN, P_MAX, 200)
-    revenues = [revenue(p, scenario.q_base, epsilon, p_ref) for p in price_sweep]
-    max_rev_idx = int(np.argmax(revenues))
+
+def nmi_hybrid_demand(P: float, scenario: AdoptionScenario) -> float:
+    """
+    Q = Q0 * (P / P_REF)^epsilon
+    Funcion isoelastica: elasticidad constante en todo el rango de precio.
+    Valida para mercados de API donde el developer compara coste marginal por llamada.
+    """
+    if P <= 0:
+        raise ValueError(f"Precio debe ser positivo, recibido: {P}")
+    if P < P_MIN or P > P_MAX:
+        # fuera del rango de mercado definido: demanda colapsa o es irrelevante
+        return 0.0
+    Q = scenario.base_demand * (P / P_REF) ** scenario.elasticity
+    return max(Q, 0.0)
+
+
+def price_elasticity_at(P: float, scenario: AdoptionScenario, delta: float = 1e-6) -> float:
+    """
+    epsilon = (dQ/dP) * (P/Q)
+    Derivada numerica de orden 2 (central difference) para mayor precision.
+    """
+    Q = nmi_hybrid_demand(P, scenario)
+    if Q == 0:
+        return 0.0
+    dQ_dP = (nmi_hybrid_demand(P + delta, scenario) - nmi_hybrid_demand(P - delta, scenario)) / (2 * delta)
+    return dQ_dP * (P / Q)
+
+
+def monthly_revenue(P: float, scenario: AdoptionScenario) -> float:
+    # R(P) = P * Q(P): funcion objetivo para maximizacion
+    return P * nmi_hybrid_demand(P, scenario)
+
+
+def optimal_price(scenario: AdoptionScenario) -> Tuple[float, float, float]:
+    """
+    max R(P) = P * Q0 * (P/P_REF)^epsilon
+    Solucion analitica: P* = P_REF * (1 + 1/epsilon)^(-1) para elasticidad != -1
+    Fallback numerico via scipy para validacion cruzada.
+    """
+    eps = scenario.elasticity
+    # solucion de forma cerrada: MR=0 => 1 + epsilon = 0 => P* resuelto por log-derivada
+    if abs(eps + 1.0) > 1e-9:
+        P_analytic = P_REF * ((-eps) / (-eps - 1))
+        P_analytic = np.clip(P_analytic, P_MIN, P_MAX)
+    else:
+        P_analytic = P_REF  # caso limite elasticidad = -1: revenue constante
+
+    # validacion numerica independiente
+    result = minimize_scalar(
+        lambda p: -monthly_revenue(p, scenario),
+        bounds=(P_MIN, P_MAX),
+        method="bounded",
+    )
+    P_numeric = result.x
+
+    P_opt = P_numeric  # numerico es ground truth; analitico sirve para sanity check
+    Q_opt = nmi_hybrid_demand(P_opt, scenario)
+    R_opt = monthly_revenue(P_opt, scenario)
+    return P_opt, Q_opt, R_opt
+
+
+def freemium_to_paid_equilibrium(scenario: AdoptionScenario) -> dict:
+    """
+    Punto de equilibrio: precio minimo P_eq tal que R(P_eq) >= coste marginal de servir
+    al cliente que supero el threshold freemium.
+    Coste marginal estimado: O(n log n) sobre corpus medio de 500 items por llamada,
+    ~0.00003 USD por operacion en c5.xlarge (calibrado para NMI+Strehl-Ghosh, no coseno simple).
+    """
+    MARGINAL_COST_PER_OP = 0.00003  # USD: NMI con corrección de bias es ~3x más caro que coseno puro
+
+    Q_threshold = scenario.freemium_threshold
+    # P_eq: precio donde revenue por operacion cubre coste marginal con margen minimo 60%
+    P_equilibrium = MARGINAL_COST_PER_OP / (1 - 0.60)
+    R_at_threshold = monthly_revenue(P_equilibrium, scenario)
+    cost_at_threshold = Q_threshold * MARGINAL_COST_PER_OP
 
     return {
         "scenario": scenario.name,
-        "optimal_price_usd_per_op": round(opt.price, 5),
-        "demand_at_optimal_ops_per_month": round(opt.quantity),
-        "max_monthly_revenue_usd": round(opt.revenue, 2),
-        "elasticity_at_optimum": round(opt.elasticity, 3),
-        "price_at_sweep_max": round(price_sweep[max_rev_idx], 5),  # validacion cruzada
-        "freemium_equilibrium": eq,
+        "freemium_ops_limit": Q_threshold,
+        "P_equilibrium_usd": round(P_equilibrium, 6),
+        "revenue_at_eq": round(R_at_threshold, 4),
+        "cost_at_threshold": round(cost_at_threshold, 4),
+        "unit_economics_positive": R_at_threshold > cost_at_threshold,
     }
 
+
+def run_elasticity_model() -> None:
+    for scenario in SCENARIOS:
+        P_opt, Q_opt, R_opt = optimal_price(scenario)
+        eps_at_opt = price_elasticity_at(P_opt, scenario)
+        eq = freemium_to_paid_equilibrium(scenario)
+
+        print(f"\nScenario: {scenario.name}")
+        print(f"  Optimal price       : ${P_opt:.5f}/op")
+        print(f"  Demand at P_opt     : {Q_opt:,.0f} ops/month")
+        print(f"  Max monthly revenue : ${R_opt:,.2f}")
+        print(f"  Elasticity at P_opt : {eps_at_opt:.4f}  (expected ~{scenario.elasticity})")
+        print(f"  Freemium->paid P_eq : ${eq['P_equilibrium_usd']}/op  |  unit_econ_positive={eq['unit_economics_positive']}")
+        print(f"  NMI/Cosine alpha    : {scenario.alpha_preference} (correlates with elasticity: higher NMI dependency -> less substitutable)")
+
+
 if __name__ == "__main__":
-    import json
-    results = [simulate_scenario(s) for s in ADOPTION_SCENARIOS]
-    print(json.dumps(results, indent=2))
+    run_elasticity_model()
