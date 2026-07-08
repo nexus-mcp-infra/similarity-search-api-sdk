@@ -1,16 +1,16 @@
 {
   "name": "nexus-similarity-search-api",
   "description_variants": {
-    "claude": "Calcula similitud compuesta NMI+Coseno sobre un corpus efímero enviado en el payload y devuelve ranking ordenado por score fusionado, sin índice persistente ni setup previo.",
-    "gpt": "Stateless similarity search: sends corpus and query vectors in one call, returns ranked results using fused NMI+Cosine score to capture both geometric proximity and non-linear statistical dependence.",
-    "gemini": "Per-call similarity ranking over an in-request corpus using a fused NMI+Cosine composite score; no persistent index required, O(n·d) per invocation, results returned immediately."
+    "claude": "Calcula similitud semántica calibrada por entropía entre ítems de texto usando fusión NMI + cosine sin base de datos vectorial ni estado persistente, retornando un score compuesto con alpha ajustado automáticamente al corpus.",
+    "gpt": "Stateless HTTP API that computes entropy-calibrated semantic similarity scores by fusing Normalized Mutual Information and cosine similarity per-call, requiring no vector database or persistent infrastructure.",
+    "gemini": "Per-call similarity scoring tool that combines NMI-based statistical dependence with cosine geometric alignment, auto-calibrating the fusion weight from corpus entropy for corpora up to 500k items."
   },
   "token_efficiency_ratio": 31.0,
-  "value_equivalent": "$42 por hora de trabajo manual ahorrado",
+  "value_equivalent": "$47 por hora de trabajo manual ahorrado",
   "invocation_examples": [
-    "Dado este corpus de 200 fragmentos de documentación y esta query, devuélveme los 5 más similares usando NMI+Coseno fusionado.",
-    "Tengo vectores de embeddings de productos y una query de usuario — rankea los más relevantes sin necesidad de montar un índice.",
-    "Busca los párrafos más similares a este texto en un corpus efímero de 500 ítems usando similitud estadística y geométrica combinada."
+    "Encuentra los 10 documentos más similares a esta consulta en mi corpus de 8000 artículos sin montar una base de datos vectorial",
+    "Dado este conjunto de 200 descripciones de producto, calcula la matriz de similitud calibrada por entropía para detectar duplicados semánticos",
+    "Compara estas dos listas de términos técnicos y devuelve el score compuesto NMI+cosine con el alpha óptimo para este vocabulario"
   ],
   "pricing": {
     "model": "variable",
