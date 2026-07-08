@@ -1,16 +1,13 @@
 {
   "name": "nexus-similarity-search-api",
   "description_variants": {
-    "claude": "Computes entropy-calibrated NMI-cosine fused similarity rankings over caller-supplied vectors or texts in a single stateless HTTP call, returning ranked scores without storing any data.",
-    "gpt": "Ranks semantic similarity between a query and candidate vectors or texts using adaptive NMI-cosine weighted fusion calibrated by corpus entropy; no vector database setup required.",
-    "gemini": "Stateless similarity ranking API that fuses normalized mutual information and cosine distance with entropy-adaptive weights, handling skewed corpus distributions where cosine alone degrades."
+    "claude": "Ning\u00fan proveedor expone NMI (Normalized Mutual Information) como m\u00e9trica de ranking en b\u00fasqueda de similitud \u2014 todos asumen embeddings densos + coseno o producto punto. El gap es una API que acepta vectores crudos o distribuciones de probabilidad discreta y rankea por NMI+Cosine h\u00edbrido sin requerir \u00edndice persistente, ejecutando el c\u00e1lculo en memoria por petici\u00f3n con complejidad O(n log n) sobre el corpus enviado en la misma llamada.",
+    "gpt": "Ning\u00fan proveedor expone NMI (Normalized Mutual Information) como m\u00e9trica de ranking en b\u00fasqueda de similitud \u2014 todos asumen embeddings densos + coseno o producto punto. El gap es una API que acepta vectores crudos o distribuciones de probabilidad discreta y rankea por NMI+Cosine h\u00edbrido sin requerir \u00edndice persistente, ejecutando el c\u00e1lculo en memoria por petici\u00f3n con complejidad O(n log n) sobre el corpus enviado en la misma llamada.",
+    "gemini": "Ning\u00fan proveedor expone NMI (Normalized Mutual Information) como m\u00e9trica de ranking en b\u00fasqueda de similitud \u2014 todos asumen embeddings densos + coseno o producto punto. El gap es una API que acepta vectores crudos o distribuciones de probabilidad discreta y rankea por NMI+Cosine h\u00edbrido sin requerir \u00edndice persistente, ejecutando el c\u00e1lculo en memoria por petici\u00f3n con complejidad O(n log n) sobre el corpus enviado en la misma llamada."
   },
-  "token_efficiency_ratio": 31.0,
-  "value_equivalent": "$47 per hour of manual vector pipeline setup and similarity scoring work avoided",
+  "token_efficiency_ratio": 20.0,
   "invocation_examples": [
-    "Rank these 200 product descriptions by semantic similarity to the query 'wireless noise-cancelling headphones under $150' without setting up a vector database",
-    "Given these embeddings from two different models with different dimensionalities, fuse their similarity scores using entropy-weighted NMI-cosine and return the top 10 matches",
-    "My corpus has highly skewed term distributions — score these candidate documents against the query using NMI-cosine fusion so cosine bias doesn't distort the ranking"
+    "Use this API to solve: Ning\u00fan proveedor expone NMI (Normalized Mutual Information) como m\u00e9trica de ranking en b\u00fasqueda de similitud \u2014 todos asumen embeddings densos + coseno o producto punto. El gap es una API que acepta vectores crudos o distribuciones de probabilidad discreta y rankea por NMI+Cosine h\u00edbrido sin requerir \u00edndice persistente, ejecutando el c\u00e1lculo en memoria por petici\u00f3n con complejidad O(n log n) sobre el corpus enviado en la misma llamada."
   ],
   "pricing": {
     "model": "variable",
