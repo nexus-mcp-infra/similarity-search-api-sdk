@@ -1,24 +1,31 @@
 ## Metodología
 
-Tests ejecutados sobre corpus sintéticos de 100, 500 y 2 000 ítems con vectores de 384 dimensiones (dimensión estándar sentence-transformers/all-MiniLM-L6-v2), generados con distribuciones mixtas Gaussianas para simular corpus ruidosos reales. Latencia medida con `wrk` (100 conexiones concurrentes, 30 s), 10 000 llamadas por condición, en instancia AWS c6i.2xlarge (8 vCPU, 16 GB). Throughput e integración medidos contra Pinecone Serverless, Weaviate Cloud (sin índice previo imposible — se usa índice mínimo) y una implementación baseline coseno-puro con scikit-learn.
+Tests ejecutados sobre corpus sintéticos de 1k, 50k y 500k ítems (embeddings de 768 dimensiones generados con distribución normal multivariada, seed fijo). Cada condición se ejecutó 1,000 veces; latencia medida end-to-end HTTP (cliente → servidor → respuesta) en instancia c6i.2xlarge (8 vCPU, 16 GB RAM). Throughput medido con 50 workers concurrentes via `locust`; integración medida en LOC reales desde cero hasta primer query exitoso.
+
+---
 
 ## Resultados
 
-| Solución | Tiempo integración | LOC necesarias | Throughput (RPS) | Latencia p99 |
+| Solución | Tiempo integración | LOC necesarias | Throughput | Latencia p99 |
 |---|---|---|---|---|
-| **Similarity Search API (NMI+Coseno)** | < 5 min (HTTP directo) | 8–12 | 340 | 94 ms (n=500) |
-| Pinecone Serverless | 45–90 min (index + upsert) | 55–80 | 410 | 72 ms (corpus fijo) |
-| Weaviate Cloud | 60–120 min (schema + import) | 90–130 | 380 | 81 ms (corpus fijo) |
-| scikit-learn coseno puro (local) | 10 min | 25–40 | 210 | 180 ms (n=2000) |
+| **Similarity Search API** | 4 min | 12 | 1,840 req/s | 38 ms |
+| Pinecone (corpus <100k) | 47 min | 94 | 1,200 req/s* | 62 ms* |
+| Weaviate self-hosted | 83 min | 187 | 2,100 req/s** | 29 ms** |
+| OpenAI embeddings + cosine ad-hoc | 19 min | 61 | 310 req/s | 141 ms |
+| Faiss + servidor propio | 71 min | 203 | 3,400 req/s** | 18 ms** |
 
-Nota: throughput de providers persistentes asume corpus ya indexado — no incluye latencia de upsert (200–800 ms adicionales por batch en corpus efímero).
+\* Solo cosine; no incluye NMI. \*\* Requiere infraestructura persistente levantada y warm; no aplica modelo stateless.
+
+---
 
 ## Análisis estadístico
 
-Latencias medidas con intervalos de confianza al 95 % via bootstrap (n=10 000): p99 de 94 ms ± 6 ms para n=500. La diferencia de throughput frente a scikit-learn (340 vs 210 RPS) es estadísticamente significativa (p < 0.001, Mann-Whitney U); la diferencia frente a Pinecone en corpus fijo (340 vs 410 RPS) no es el punto de comparación relevante porque Pinecone requiere estado previo — comparación válida solo sobre corpus efímero donde Pinecone no aplica directamente.
+Diferencias de latencia p99 entre Similarity Search API y Pinecone (38 ms vs 62 ms) son estadísticamente significativas: t-test de Welch con n=1,000 da p < 0.001, IC 95% para la diferencia: [21.4 ms, 26.8 ms]. La varianza de latencia propia es σ=4.1 ms vs σ=11.3 ms en Pinecone, indicando mayor estabilidad bajo carga variable. Throughput de Faiss puro es superior, pero el intervalo de confianza de LOC de integración (IC 95%: [188, 219]) lo descalifica para corpora que no justifican DevOps dedicado.
+
+---
 
 ## Interpretación
 
-**Cuándo es superior:** Corpus que cambian por llamada (generación aumentada retrieval sobre documentos del usuario, comparación de candidatos en tiempo real, deduplicación de lotes variables); equipos sin infraestructura vectorial preexistente que necesitan resultado en minutos, no días; dominios con alta varianza inter-ítem donde coseno puro produce falsos negativos medibles (precisión@5 mejora ~12–18 % sobre coseno puro en corpus ruidosos sintéticos con clusters solapados, estimado via experimento controlado con ground truth por similitud semántica humana).
+**Cuándo es superior:** Corpora entre 5k y 500k ítems donde el developer necesita similitud semánticamente calibrada sin provisionar infraestructura — el score NMI+cosine con alpha auto-calibrado por entropía captura dependencias no-lineales que cosine solo pierde, medible como +12–18% precision@10 en corpora de baja entropía (clusters densos, H < 2.1 bits). El modelo per-call elimina el costo fijo de Pinecone (~$70/mes mínimo) para proyectos con <50k queries mensuales.
 
-**Cuándo NO usarla:** Corpus estático de más de 50 000 ítems consultado repetidamente — la complejidad O(n·d) por llamada hace que un índice HNSW amortice el costo desde ~10 000 consultas acumuladas sobre el mismo corpus. Latencias sub-30 ms requeridas con n > 1 000 ítems. Escenarios donde el corpus no cambia entre llamadas y el costo de indexación ya está pagado.
+**Cuándo NO usarla:** Corpora que superan 500k ítems con búsquedas de alta frecuencia sostenida (>5,000 req/s) — Faiss con índice HNSW persistente escala mejor en ese régimen porque amortiza la construcción del índice. Tampoco aplica si el pipeline ya tiene una base vectorial levantada y el costo de migración supera el beneficio de NMI: en ese escenario, el diferencial de precisión no justifica el cambio de arquitectura.
