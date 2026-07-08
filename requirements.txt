@@ -3,7 +3,7 @@ httpx
 mcp
 numpy
 pydantic
-requests
+scikit-learn
 scipy
 stripe
 uvicorn
