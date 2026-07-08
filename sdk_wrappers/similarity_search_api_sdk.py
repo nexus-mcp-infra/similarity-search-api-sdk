@@ -1,19 +1,18 @@
 from __future__ import annotations
 
 import time
-from typing import Any, Union
+from typing import Any
 
 import httpx
 
-__version__ = "0.1.0"
-_DEFAULT_BASE_URL = "https://api.similarity-search.nexus/v1"
-_DEFAULT_TIMEOUT_SECONDS = 30.0
-_MAX_RETRIES = 3
-_RETRYABLE_STATUS_CODES = {429, 502, 503, 504}
+DEFAULT_BASE_URL = "https://api.nexus-similarity.io/v1"
+DEFAULT_TIMEOUT_SECONDS = 60.0
+MAX_CORPUS_ITEMS = 10_000
+MAX_VECTOR_DIMENSIONS = 4_096
+MAX_TOP_K = 500
 
 
 class SimilaritySearchError(Exception):
-    """Base exception for all SDK errors."""
     def __init__(self, message: str, status_code: int | None = None, response_body: Any = None):
         super().__init__(message)
         self.status_code = status_code
@@ -21,579 +20,308 @@ class SimilaritySearchError(Exception):
 
 
 class AuthenticationError(SimilaritySearchError):
-    """Raised when the API key is missing or invalid."""
+    pass
+
+
+class ValidationError(SimilaritySearchError):
+    pass
 
 
 class RateLimitError(SimilaritySearchError):
-    """Raised when the server responds with 429 Too Many Requests."""
     def __init__(self, message: str, retry_after: float | None = None):
         super().__init__(message, status_code=429)
         self.retry_after = retry_after
 
 
-class ValidationError(SimilaritySearchError):
-    """Raised when input parameters fail server-side or client-side validation."""
+class ServerError(SimilaritySearchError):
+    pass
 
 
 class SimilaritySearchResult:
-    """Parsed response from a ranking call."""
-
-    def __init__(self, raw: dict[str, Any]):
-        if not isinstance(raw, dict):
-            raise ValidationError(
-                f"Expected dict response body, got {type(raw).__name__}"
-            )
+    def __init__(self, raw: dict):
         self._raw = raw
-        self.query_id: str | None = raw.get("query_id")
-        self.alpha: float = raw.get("alpha", 0.5)
-        self.input_type: str = raw.get("input_type", "unknown")
-        self.ranked_indices: list[int] = raw.get("ranked_indices", [])
-        self.scores: list[float] = raw.get("scores", [])
-        self.nmi_scores: list[float] = raw.get("nmi_scores", [])
-        self.cosine_scores: list[float] = raw.get("cosine_scores", [])
-        self.bias_correction_applied: bool = raw.get("bias_correction_applied", False)
-        self.corpus_size: int = raw.get("corpus_size", 0)
-        self.latency_ms: float = raw.get("latency_ms", 0.0)
+
+    @property
+    def ranked_indices(self) -> list[int]:
+        return [item["index"] for item in self._raw.get("ranking", [])]
+
+    @property
+    def ranking(self) -> list[dict]:
+        return self._raw.get("ranking", [])
+
+    @property
+    def corpus_variance(self) -> float:
+        return self._raw.get("corpus_variance", 0.0)
+
+    @property
+    def adaptive_nmi_weight(self) -> float:
+        return self._raw.get("adaptive_nmi_weight", 0.5)
+
+    @property
+    def latency_ms(self) -> float:
+        return self._raw.get("latency_ms", 0.0)
+
+    @property
+    def call_id(self) -> str:
+        return self._raw.get("call_id", "")
 
     def __repr__(self) -> str:
-        return (
-            f"SimilaritySearchResult(corpus_size={self.corpus_size}, "
-            f"input_type={self.input_type!r}, alpha={self.alpha}, "
-            f"bias_correction_applied={self.bias_correction_applied})"
-        )
-
-    def to_dict(self) -> dict[str, Any]:
-        return self._raw
+        top = self.ranking[:3]
+        return f"SimilaritySearchResult(top_results={top}, corpus_variance={self.corpus_variance:.4f}, nmi_weight={self.adaptive_nmi_weight:.4f})"
 
 
-class NMIRankingResponse:
-    """Parsed response from a batch ranking call."""
-
-    def __init__(self, raw: dict[str, Any]):
-        if not isinstance(raw, dict):
-            raise ValidationError(
-                f"Expected dict response body, got {type(raw).__name__}"
-            )
-        self._raw = raw
-        self.results: list[SimilaritySearchResult] = [
-            SimilaritySearchResult(r) for r in raw.get("results", [])
-        ]
-        self.batch_id: str | None = raw.get("batch_id")
-        self.total_latency_ms: float = raw.get("total_latency_ms", 0.0)
-
-    def __repr__(self) -> str:
-        return f"NMIRankingResponse(batch_size={len(self.results)}, batch_id={self.batch_id!r})"
-
-    def to_dict(self) -> dict[str, Any]:
-        return self._raw
-
-
-Vector = list[float]
-Distribution = list[float]
-VectorOrDist = Union[Vector, Distribution]
-
-
-def _validate_vector_or_distribution(
-    value: Any, name: str, allow_empty: bool = False
-) -> None:
-    if value is None:
-        raise ValidationError(f"'{name}' must not be None.")
-    if not isinstance(value, (list, tuple)):
+def _validate_vector(vec: Any, label: str) -> list[float]:
+    if vec is None:
+        raise ValidationError(f"'{label}' must not be None.")
+    if not isinstance(vec, (list, tuple)):
         raise ValidationError(
-            f"'{name}' must be a list or tuple of floats, got {type(value).__name__}."
+            f"'{label}' must be a list or tuple of numbers, got {type(vec).__name__}."
         )
-    if not allow_empty and len(value) == 0:
-        raise ValidationError(f"'{name}' must not be empty.")
-    for i, v in enumerate(value):
+    if len(vec) == 0:
+        raise ValidationError(f"'{label}' must not be empty.")
+    if len(vec) > MAX_VECTOR_DIMENSIONS:
+        raise ValidationError(
+            f"'{label}' has {len(vec)} dimensions; maximum allowed is {MAX_VECTOR_DIMENSIONS}."
+        )
+    coerced: list[float] = []
+    for i, v in enumerate(vec):
         if not isinstance(v, (int, float)):
             raise ValidationError(
-                f"'{name}[{i}]' must be a numeric value, got {type(v).__name__}."
+                f"'{label}[{i}]' is not a number (got {type(v).__name__})."
             )
+        coerced.append(float(v))
+    return coerced
 
 
-def _validate_corpus(corpus: Any) -> None:
+def _validate_corpus(corpus: Any) -> list[list[float]]:
     if corpus is None:
         raise ValidationError("'corpus' must not be None.")
     if not isinstance(corpus, (list, tuple)):
         raise ValidationError(
-            f"'corpus' must be a list of vectors or distributions, got {type(corpus).__name__}."
+            f"'corpus' must be a list of vectors, got {type(corpus).__name__}."
         )
-    if len(corpus) < 1:
-        raise ValidationError("'corpus' must contain at least one item.")
-    if len(corpus) > 50_000:
+    if len(corpus) == 0:
+        raise ValidationError("'corpus' must contain at least one vector.")
+    if len(corpus) > MAX_CORPUS_ITEMS:
         raise ValidationError(
-            f"'corpus' exceeds the maximum of 50,000 items (got {len(corpus)})."
+            f"'corpus' contains {len(corpus)} items; maximum allowed is {MAX_CORPUS_ITEMS}."
         )
-    reference_len = len(corpus[0])
+    validated: list[list[float]] = []
+    reference_dim: int | None = None
     for i, item in enumerate(corpus):
-        _validate_vector_or_distribution(item, f"corpus[{i}]")
-        if len(item) != reference_len:
+        vec = _validate_vector(item, f"corpus[{i}]")
+        if reference_dim is None:
+            reference_dim = len(vec)
+        elif len(vec) != reference_dim:
             raise ValidationError(
-                f"All corpus items must have the same dimensionality. "
-                f"corpus[0] has {reference_len} dimensions but corpus[{i}] has {len(item)}."
+                f"All corpus vectors must have the same dimensionality. "
+                f"corpus[0] has {reference_dim} dims, corpus[{i}] has {len(vec)} dims."
             )
+        validated.append(vec)
+    return validated
 
 
-def _validate_alpha(alpha: Any) -> None:
-    if not isinstance(alpha, (int, float)):
-        raise ValidationError(
-            f"'alpha' must be a float between 0.0 and 1.0, got {type(alpha).__name__}."
-        )
-    if not (0.0 <= float(alpha) <= 1.0):
-        raise ValidationError(
-            f"'alpha' must be between 0.0 and 1.0, got {alpha}."
-        )
+def _parse_error_response(response: httpx.Response) -> SimilaritySearchError:
+    status = response.status_code
+    try:
+        body = response.json()
+        message = body.get("detail") or body.get("message") or response.text
+    except Exception:
+        message = response.text or f"HTTP {status}"
 
-
-def _validate_top_k(top_k: Any, corpus_size: int) -> None:
-    if not isinstance(top_k, int):
-        raise ValidationError(
-            f"'top_k' must be a positive integer, got {type(top_k).__name__}."
+    if status == 401:
+        return AuthenticationError(
+            f"Authentication failed: {message}. Verify your API key.",
+            status_code=status,
+            response_body=body if "body" in dir() else None,
         )
-    if top_k < 1:
-        raise ValidationError(f"'top_k' must be >= 1, got {top_k}.")
-    if top_k > corpus_size:
-        raise ValidationError(
-            f"'top_k' ({top_k}) cannot exceed corpus size ({corpus_size})."
+    if status == 422:
+        return ValidationError(
+            f"Request validation failed: {message}",
+            status_code=status,
+            response_body=body if "body" in dir() else None,
         )
+    if status == 429:
+        retry_after: float | None = None
+        ra_header = response.headers.get("Retry-After")
+        if ra_header is not None:
+            try:
+                retry_after = float(ra_header)
+            except ValueError:
+                pass
+        return RateLimitError(
+            f"Rate limit exceeded: {message}. Retry after {retry_after}s.",
+            retry_after=retry_after,
+        )
+    if status >= 500:
+        return ServerError(
+            f"Server error ({status}): {message}",
+            status_code=status,
+        )
+    return SimilaritySearchError(
+        f"Unexpected error ({status}): {message}",
+        status_code=status,
+    )
 
 
 class Client:
-    """
-    Thin HTTP wrapper for the Similarity Search API.
-
-    Ranks a corpus of vectors or discrete probability distributions against a
-    query using a hybrid NMI+Cosine scoring function. NMI is computed with
-    Strehl-Ghosh bias correction for corpora smaller than 200 items.
-
-    Parameters
-    ----------
-    api_key : str
-        Your Similarity Search API key. Must not be empty.
-    base_url : str, optional
-        Override the default API base URL.
-    timeout : float, optional
-        Per-request timeout in seconds (default 30.0).
-    max_retries : int, optional
-        Maximum number of retries on retryable errors (default 3).
-    """
-
     def __init__(
         self,
         api_key: str,
-        base_url: str = _DEFAULT_BASE_URL,
-        timeout: float = _DEFAULT_TIMEOUT_SECONDS,
-        max_retries: int = _MAX_RETRIES,
-    ) -> None:
+        base_url: str = DEFAULT_BASE_URL,
+        timeout: float = DEFAULT_TIMEOUT_SECONDS,
+        max_retries: int = 2,
+    ):
         if not api_key or not isinstance(api_key, str):
             raise AuthenticationError(
-                "'api_key' must be a non-empty string. "
-                "Obtain your key at https://similarity-search.nexus/dashboard."
+                "A non-empty string 'api_key' is required to instantiate the Client."
             )
-        if not isinstance(timeout, (int, float)) or timeout <= 0:
-            raise ValidationError("'timeout' must be a positive number.")
-        if not isinstance(max_retries, int) or max_retries < 0:
-            raise ValidationError("'max_retries' must be a non-negative integer.")
-
         self._api_key = api_key
         self._base_url = base_url.rstrip("/")
-        self._timeout = float(timeout)
+        self._timeout = timeout
         self._max_retries = max_retries
         self._http = httpx.Client(
             headers={
                 "Authorization": f"Bearer {self._api_key}",
                 "Content-Type": "application/json",
                 "Accept": "application/json",
-                "X-SDK-Version": __version__,
+                "User-Agent": "similarity-search-sdk/1.0.0 python-httpx",
             },
             timeout=self._timeout,
         )
 
-    def rank_by_nmi_cosine(
-        self,
-        query: VectorOrDist,
-        corpus: list[VectorOrDist],
-        alpha: float = 0.5,
-        top_k: int = 10,
-        input_type: str = "dense_vector",
-        n_bins: int | None = None,
-    ) -> SimilaritySearchResult:
-        """
-        Rank corpus items against a query using a hybrid NMI+Cosine score.
-
-        Score = alpha * NMI(query, item) + (1 - alpha) * Cosine(query, item)
-
-        For dense vectors, the server performs adaptive binning + Strehl-Ghosh
-        bias correction before computing NMI. For discrete distributions, NMI
-        is computed directly without binning.
-
-        Parameters
-        ----------
-        query : list[float]
-            Query vector or discrete probability distribution. Must have the
-            same dimensionality as all items in corpus.
-        corpus : list[list[float]]
-            Between 1 and 50,000 items to rank. All must share the same
-            dimensionality as the query.
-        alpha : float
-            Weight of NMI in the hybrid score. 0.0 => pure Cosine;
-            1.0 => pure NMI. Must be in [0.0, 1.0].
-        top_k : int
-            Number of top-ranked results to return. Must be >= 1 and
-            <= len(corpus).
-        input_type : str
-            'dense_vector' — server will estimate joint distribution via
-            adaptive binning with Strehl-Ghosh correction.
-            'discrete_distribution' — server computes NMI directly; values
-            must be non-negative and sum to 1.0 per item.
-        n_bins : int or None
-            Override the server's adaptive bin count for dense vector inputs.
-            Ignored when input_type is 'discrete_distribution'.
-            Must be between 2 and 512 if provided.
-
-        Returns
-        -------
-        SimilaritySearchResult
-
-        Raises
-        ------
-        ValidationError
-            If any parameter is outside its valid range before the HTTP call.
-        AuthenticationError
-            If the API key is rejected by the server.
-        RateLimitError
-            If the server returns 429 after exhausting retries.
-        SimilaritySearchError
-            For any other non-2xx server response.
-        """
-        if input_type not in ("dense_vector", "discrete_distribution"):
-            raise ValidationError(
-                f"'input_type' must be 'dense_vector' or 'discrete_distribution', "
-                f"got {input_type!r}."
-            )
-        _validate_vector_or_distribution(query, "query")
-        _validate_corpus(corpus)
-        _validate_alpha(alpha)
-        _validate_top_k(top_k, len(corpus))
-
-        if n_bins is not None:
-            if not isinstance(n_bins, int) or not (2 <= n_bins <= 512):
-                raise ValidationError(
-                    f"'n_bins' must be an integer between 2 and 512, got {n_bins!r}."
+    def _post_with_retry(self, endpoint: str, payload: dict) -> dict:
+        url = f"{self._base_url}{endpoint}"
+        last_error: Exception | None = None
+        for attempt in range(self._max_retries + 1):
+            try:
+                response = self._http.post(url, json=payload)
+            except httpx.TimeoutException as exc:
+                last_error = SimilaritySearchError(
+                    f"Request timed out after {self._timeout}s (attempt {attempt + 1})."
                 )
+                if attempt < self._max_retries:
+                    time.sleep(0.5 * (attempt + 1))
+                    continue
+                raise last_error from exc
+            except httpx.RequestError as exc:
+                last_error = SimilaritySearchError(
+                    f"Network error on attempt {attempt + 1}: {exc}"
+                )
+                if attempt < self._max_retries:
+                    time.sleep(0.5 * (attempt + 1))
+                    continue
+                raise last_error from exc
+
+            if response.status_code == 200:
+                try:
+                    return response.json()
+                except Exception as exc:
+                    raise SimilaritySearchError(
+                        f"Failed to parse JSON response: {response.text}"
+                    ) from exc
+
+            parsed_error = _parse_error_response(response)
+
+            if isinstance(parsed_error, RateLimitError):
+                if attempt < self._max_retries:
+                    wait = parsed_error.retry_after or (1.0 * (attempt + 1))
+                    time.sleep(wait)
+                    last_error = parsed_error
+                    continue
+                raise parsed_error
+
+            if isinstance(parsed_error, ServerError) and attempt < self._max_retries:
+                time.sleep(0.5 * (attempt + 1))
+                last_error = parsed_error
+                continue
+
+            raise parsed_error
+
+        raise last_error or SimilaritySearchError("All retry attempts exhausted.")
+
+    def rank_corpus_by_nmi_cosine_fusion(
+        self,
+        corpus: list[list[float]],
+        query: list[float],
+        top_k: int = 10,
+        nmi_bandwidth: float | None = None,
+    ) -> SimilaritySearchResult:
+        validated_corpus = _validate_corpus(corpus)
+        validated_query = _validate_vector(query, "query")
+
+        if len(validated_query) != len(validated_corpus[0]):
+            raise ValidationError(
+                f"'query' dimensionality ({len(validated_query)}) must match "
+                f"corpus item dimensionality ({len(validated_corpus[0])})."
+            )
+
+        if not isinstance(top_k, int) or isinstance(top_k, bool):
+            raise ValidationError(
+                f"'top_k' must be an integer, got {type(top_k).__name__}."
+            )
+        if top_k < 1 or top_k > MAX_TOP_K:
+            raise ValidationError(
+                f"'top_k' must be between 1 and {MAX_TOP_K}, got {top_k}."
+            )
+        if top_k > len(validated_corpus):
+            top_k = len(validated_corpus)
 
         payload: dict[str, Any] = {
-            "query": list(query),
-            "corpus": [list(item) for item in corpus],
-            "alpha": float(alpha),
+            "corpus": validated_corpus,
+            "query": validated_query,
             "top_k": top_k,
-            "input_type": input_type,
         }
-        if n_bins is not None:
-            payload["n_bins"] = n_bins
 
-        raw = self._post("/rank", payload)
+        if nmi_bandwidth is not None:
+            if not isinstance(nmi_bandwidth, (int, float)) or isinstance(nmi_bandwidth, bool):
+                raise ValidationError(
+                    f"'nmi_bandwidth' must be a positive float, got {type(nmi_bandwidth).__name__}."
+                )
+            if nmi_bandwidth <= 0.0:
+                raise ValidationError(
+                    f"'nmi_bandwidth' must be strictly positive, got {nmi_bandwidth}."
+                )
+            payload["nmi_bandwidth"] = float(nmi_bandwidth)
+
+        raw = self._post_with_retry("/similarity/rank", payload)
         return SimilaritySearchResult(raw)
 
-    def rank_batch_by_nmi_cosine(
-        self,
-        queries: list[VectorOrDist],
-        corpus: list[VectorOrDist],
-        alpha: float = 0.5,
-        top_k: int = 10,
-        input_type: str = "dense_vector",
-        n_bins: int | None = None,
-    ) -> NMIRankingResponse:
-        """
-        Rank the same corpus against multiple queries in a single HTTP call.
-
-        Each query produces an independent SimilaritySearchResult. The corpus
-        is transmitted once and reused for all queries server-side.
-
-        Parameters
-        ----------
-        queries : list[list[float]]
-            Between 1 and 100 query vectors or distributions. All must share
-            the same dimensionality as corpus items.
-        corpus : list[list[float]]
-            Between 1 and 50,000 items. See rank_by_nmi_cosine for details.
-        alpha : float
-            Shared hybrid weight for all queries in this batch.
-        top_k : int
-            Shared top-k for all queries.
-        input_type : str
-            'dense_vector' or 'discrete_distribution'. Applies to all items.
-        n_bins : int or None
-            Optional bin override. See rank_by_nmi_cosine.
-
-        Returns
-        -------
-        NMIRankingResponse
-            Contains one SimilaritySearchResult per query, in the same order.
-
-        Raises
-        ------
-        ValidationError, AuthenticationError, RateLimitError, SimilaritySearchError
-        """
-        if queries is None:
-            raise ValidationError("'queries' must not be None.")
-        if not isinstance(queries, (list, tuple)) or len(queries) == 0:
-            raise ValidationError("'queries' must be a non-empty list.")
-        if len(queries) > 100:
+    def main_method(self, data: dict) -> SimilaritySearchResult:
+        if data is None:
+            raise ValidationError("'data' must not be None.")
+        if not isinstance(data, dict):
             raise ValidationError(
-                f"'queries' exceeds the batch maximum of 100 (got {len(queries)})."
+                f"'data' must be a dict with keys 'corpus', 'query', and optionally "
+                f"'top_k' and 'nmi_bandwidth', got {type(data).__name__}."
             )
-        if input_type not in ("dense_vector", "discrete_distribution"):
+
+        corpus = data.get("corpus")
+        query = data.get("query")
+        top_k = data.get("top_k", 10)
+        nmi_bandwidth = data.get("nmi_bandwidth", None)
+
+        if corpus is None:
             raise ValidationError(
-                f"'input_type' must be 'dense_vector' or 'discrete_distribution', "
-                f"got {input_type!r}."
+                "'data' dict is missing required key 'corpus'."
             )
-        for i, q in enumerate(queries):
-            _validate_vector_or_distribution(q, f"queries[{i}]")
-        _validate_corpus(corpus)
-        _validate_alpha(alpha)
-        _validate_top_k(top_k, len(corpus))
-
-        if n_bins is not None:
-            if not isinstance(n_bins, int) or not (2 <= n_bins <= 512):
-                raise ValidationError(
-                    f"'n_bins' must be an integer between 2 and 512, got {n_bins!r}."
-                )
-
-        payload: dict[str, Any] = {
-            "queries": [list(q) for q in queries],
-            "corpus": [list(item) for item in corpus],
-            "alpha": float(alpha),
-            "top_k": top_k,
-            "input_type": input_type,
-        }
-        if n_bins is not None:
-            payload["n_bins"] = n_bins
-
-        raw = self._post("/rank/batch", payload)
-        return NMIRankingResponse(raw)
-
-    def score_pair_nmi_cosine(
-        self,
-        vector_a: VectorOrDist,
-        vector_b: VectorOrDist,
-        alpha: float = 0.5,
-        input_type: str = "dense_vector",
-        n_bins: int | None = None,
-    ) -> dict[str, float]:
-        """
-        Compute the hybrid NMI+Cosine score for a single pair.
-
-        Use this when you need the decomposed NMI and Cosine components for
-        a known pair rather than ranking a full corpus.
-
-        Do NOT use this in a loop to simulate rank_by_nmi_cosine — each call
-        incurs a full round-trip and lacks the server's vectorized NMI
-        estimation across the corpus.
-
-        Parameters
-        ----------
-        vector_a : list[float]
-            First vector or distribution.
-        vector_b : list[float]
-            Second vector or distribution. Must match dimensionality of a.
-        alpha : float
-            NMI weight. See rank_by_nmi_cosine.
-        input_type : str
-            'dense_vector' or 'discrete_distribution'.
-        n_bins : int or None
-            Optional bin override for dense vectors.
-
-        Returns
-        -------
-        dict with keys:
-            'hybrid_score' (float) — alpha*NMI + (1-alpha)*Cosine
-            'nmi_score' (float)
-            'cosine_score' (float)
-            'bias_correction_applied' (bool)
-            'latency_ms' (float)
-
-        Raises
-        ------
-        ValidationError, AuthenticationError, RateLimitError, SimilaritySearchError
-        """
-        if input_type not in ("dense_vector", "discrete_distribution"):
+        if query is None:
             raise ValidationError(
-                f"'input_type' must be 'dense_vector' or 'discrete_distribution', "
-                f"got {input_type!r}."
+                "'data' dict is missing required key 'query'."
             )
-        _validate_vector_or_distribution(vector_a, "vector_a")
-        _validate_vector_or_distribution(vector_b, "vector_b")
-        if len(vector_a) != len(vector_b):
-            raise ValidationError(
-                f"'vector_a' and 'vector_b' must have the same dimensionality "
-                f"({len(vector_a)} vs {len(vector_b)})."
-            )
-        _validate_alpha(alpha)
 
-        if n_bins is not None:
-            if not isinstance(n_bins, int) or not (2 <= n_bins <= 512):
-                raise ValidationError(
-                    f"'n_bins' must be an integer between 2 and 512, got {n_bins!r}."
-                )
-
-        payload: dict[str, Any] = {
-            "vector_a": list(vector_a),
-            "vector_b": list(vector_b),
-            "alpha": float(alpha),
-            "input_type": input_type,
-        }
-        if n_bins is not None:
-            payload["n_bins"] = n_bins
-
-        return self._post("/score/pair", payload)
-
-    def health(self) -> dict[str, Any]:
-        """
-        Return the API health status and version metadata.
-
-        Use for liveness checks and to verify the API key resolves correctly
-        before sending large corpora.
-
-        Returns
-        -------
-        dict with keys 'status', 'version', 'region', 'latency_ms'.
-
-        Raises
-        ------
-        AuthenticationError, SimilaritySearchError
-        """
-        return self._get("/health")
+        return self.rank_corpus_by_nmi_cosine_fusion(
+            corpus=corpus,
+            query=query,
+            top_k=top_k,
+            nmi_bandwidth=nmi_bandwidth,
+        )
 
     def close(self) -> None:
-        """Release the underlying HTTP connection pool."""
         self._http.close()
 
     def __enter__(self) -> "Client":
         return self
 
-    def __exit__(self, *_: Any) -> None:
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
         self.close()
-
-    def _post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
-        url = f"{self._base_url}{path}"
-        last_exc: Exception | None = None
-
-        for attempt in range(self._max_retries + 1):
-            try:
-                response = self._http.post(url, json=payload)
-            except httpx.TimeoutException as exc:
-                last_exc = SimilaritySearchError(
-                    f"Request to {path} timed out after {self._timeout}s."
-                )
-                if attempt < self._max_retries:
-                    time.sleep(2 ** attempt)
-                    continue
-                raise last_exc from exc
-            except httpx.RequestError as exc:
-                raise SimilaritySearchError(
-                    f"Network error on {path}: {exc}"
-                ) from exc
-
-            if response.status_code == 401:
-                raise AuthenticationError(
-                    "API key rejected by server. Verify your key at "
-                    "https://similarity-search.nexus/dashboard.",
-                    status_code=401,
-                    response_body=self._safe_json(response),
-                )
-            if response.status_code == 422:
-                body = self._safe_json(response)
-                raise ValidationError(
-                    f"Server rejected request parameters: {body}",
-                    status_code=422,
-                    response_body=body,
-                )
-            if response.status_code == 429:
-                retry_after_header = response.headers.get("Retry-After")
-                retry_after = float(retry_after_header) if retry_after_header else None
-                if attempt < self._max_retries:
-                    wait = retry_after if retry_after is not None else 2 ** attempt
-                    time.sleep(wait)
-                    last_exc = RateLimitError(
-                        f"Rate limit exceeded on {path}. Retrying after {wait}s.",
-                        retry_after=retry_after,
-                    )
-                    continue
-                raise RateLimitError(
-                    f"Rate limit exceeded on {path} after {self._max_retries} retries.",
-                    retry_after=retry_after,
-                )
-            if response.status_code in _RETRYABLE_STATUS_CODES:
-                if attempt < self._max_retries:
-                    time.sleep(2 ** attempt)
-                    last_exc = SimilaritySearchError(
-                        f"Server error {response.status_code} on {path}.",
-                        status_code=response.status_code,
-                    )
-                    continue
-                raise SimilaritySearchError(
-                    f"Server error {response.status_code} on {path} after "
-                    f"{self._max_retries} retries.",
-                    status_code=response.status_code,
-                    response_body=self._safe_json(response),
-                )
-            if not response.is_success:
-                body = self._safe_json(response)
-                raise SimilaritySearchError(
-                    f"Unexpected status {response.status_code} on {path}: {body}",
-                    status_code=response.status_code,
-                    response_body=body,
-                )
-
-            try:
-                return response.json()
-            except Exception as exc:
-                raise SimilaritySearchError(
-                    f"Server returned non-JSON body on {path}: "
-                    f"{response.text[:200]!r}"
-                ) from exc
-
-        raise last_exc or SimilaritySearchError(
-            f"All {self._max_retries} retries exhausted for {path}."
-        )
-
-    def _get(self, path: str) -> dict[str, Any]:
-        url = f"{self._base_url}{path}"
-        try:
-            response = self._http.get(url)
-        except httpx.TimeoutException as exc:
-            raise SimilaritySearchError(
-                f"Request to {path} timed out after {self._timeout}s."
-            ) from exc
-        except httpx.RequestError as exc:
-            raise SimilaritySearchError(
-                f"Network error on {path}: {exc}"
-            ) from exc
-
-        if response.status_code == 401:
-            raise AuthenticationError(
-                "API key rejected by server.",
-                status_code=401,
-                response_body=self._safe_json(response),
-            )
-        if not response.is_success:
-            body = self._safe_json(response)
-            raise SimilaritySearchError(
-                f"Unexpected status {response.status_code} on {path}: {body}",
-                status_code=response.status_code,
-                response_body=body,
-            )
-        try:
-            return response.json()
-        except Exception as exc:
-            raise SimilaritySearchError(
-                f"Server returned non-JSON body on {path}: {response.text[:200]!r}"
-            ) from exc
-
-    @staticmethod
-    def _safe_json(response: httpx.Response) -> Any:
-        try:
-            return response.json()
-        except Exception:
-            return response.text[:500]
