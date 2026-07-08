@@ -1,39 +1,34 @@
-# Análisis de Complejidad Computacional — Similarity Search API (NMI+Cosine Hybrid)
-
----
+# Análisis de Complejidad Computacional — Similarity Search API (NMI+Coseno, Stateless)
 
 ## Endpoints Públicos
 
-### `POST /search` — Búsqueda híbrida sobre corpus en memoria
+### `POST /similarity/rank`
+**Temporal:** O(n·d + n²·k) donde n = ítems del corpus, d = dimensión vectorial, k = puntos KDE por par. El término dominante es n² cuando el corpus crece: NMI requiere estimar p(x,y) para cada par query-ítem vía KDE gaussiano sobre d dimensiones. **Espacial:** O(n·d) para almacenar el corpus en memoria durante la llamada.
 
-**Complejidad temporal:** O(n · d + n · b²) donde n = tamaño del corpus, d = dimensión del vector, b = número de bins adaptativos. El término dominante es la estimación de distribución conjunta por binning: para cada par (query, candidato) en modo denso, el histograma 2D tiene coste O(d) para construirse y O(b²) para normalizarse y calcular la entropía conjunta H(X,Y). La fusión lineal alpha·NMI + (1-alpha)·Cosine es O(d) y no cambia el orden.
+- **Mejor caso:** n pequeño (≤50 ítems), d bajo (≤128): el kernel evaluation domina menos que el overhead HTTP — efectivamente O(n·d).
+- **Promedio:** n≈500, d≈384 (embeddings típicos): la estimación KDE por par lleva el costo real a O(n·d·k) con k≈100 puntos de integración numérica.
+- **Peor caso:** n=2000, d=1536 (embeddings GPT-4): la evaluación KDE por par se vuelve O(n²·d) — cuello de botella claro.
 
-**Casos:** Mejor O(n·d) cuando `input_type=discrete` (NMI directo sin binning). Promedio O(n·d·b) con b ≈ √d para bins adaptativos. Peor O(n·d²) si b crece proporcional a d en vectores de alta dimensión sin cap explícito.
-
-**Cuello de botella:** La construcción del histograma 2D con corrección Strehl-Ghosh — `H_corrected = H(X,Y) - (b²-1)/(2n·ln2)` — itera sobre todos los bins incluso vacíos. Para n < 200 la corrección es crítica pero el coste de normalizar la distribución conjunta domina sobre el producto punto.
-
----
-
-### `POST /rank` — Re-ranking de resultados precomputados por NMI
-
-**Complejidad temporal:** O(k · b²) donde k = número de candidatos a re-rankear (k ≤ n). El re-ranking no reconstruye distribuciones desde cero si los vectores ya vienen normalizados: el coste se reduce al cálculo de entropía marginal H(X), H(Y) y conjunta H(X,Y) sobre el histograma ya binneado.
-
-**Casos:** Mejor O(k·d) para distribuciones discretas nativas pasadas como input. Promedio/peor O(k·b²) idéntico al endpoint `/search` pero acotado por k << n en el caso de uso típico (re-rank top-50 sobre corpus de 10k).
-
-**Cuello de botella:** Sincronización en el paso de re-normalización cuando alpha != 0.5 — el peso asimétrico obliga a recalcular ambas ramas del scoring antes de fusionar, duplicando efectivamente las operaciones de entropía.
+**Cuello de botella:** Estimación KDE conjunta par-a-par. No es vectorizable trivialmente porque cada par (query, ítem_i) define una distribución conjunta diferente en espacio continuo.
 
 ---
 
-### `POST /validate-distribution` — Verificación de inputs discretos
+### `POST /similarity/batch`
+**Temporal:** O(Q·n·d + Q·n²·k) con Q = número de queries en el batch. El batch amortiza el parsing y validación del corpus (O(n·d) una vez), pero la fase NMI escala linealmente con Q. **Espacial:** O(n·d + Q·n) — corpus cargado una vez, matriz de scores Q×n en RAM.
 
-**Complejidad temporal:** O(v) donde v = longitud del vector de probabilidades. Validación que la distribución suma 1.0 dentro de tolerancia float64, que no existen probabilidades negativas, y que el soporte no es trivial (entropía > 0). Espacial O(1) — no requiere copia del input.
+- **Mejor caso:** Q·n·d << Q·n²·k, i.e., corpus pequeño: el coseno domina y el batch es eficiente — O(Q·n·d).
+- **Promedio:** Ganancia real de batch es ~40% sobre Q llamadas independientes por amortizar KDE bandwidth selection.
+- **Peor caso:** Q=50, n=1000: memoria de scores 50×1000×float32 ≈ 200 KB, manejable; el cuello es CPU en KDE, no RAM.
 
-**Casos:** Mejor/promedio/peor todos O(v) — el scan es lineal e incondicional.
-
-**Cuello de botella:** Ninguno estructural; el riesgo real es propagación silenciosa de distribuciones degeneradas si este endpoint se omite en el flujo, produciendo NMI = 0 o NaN downstream.
+**Cuello de botella:** Selección de bandwidth óptimo (regla de Silverman: O(n·d)) se repite por query si la distribución del corpus varía — optimizable cacheando el bandwidth dentro del batch.
 
 ---
 
-## Saturación y Escalabilidad
+### `GET /similarity/health` + `POST /similarity/validate`
+**Temporal:** O(1) y O(n·d) respectivamente — validate solo verifica dimensionalidad y tipos, sin KDE. **Espacial:** O(n·d) transitorio para validate. Sin casos límite relevantes; no son cuellos de botella.
 
-Con corpus n = 500, d = 768 (embeddings BERT estándar) y b = 28 (√d redondeado), cada llamada a `/search` ejecuta aproximadamente 500 · 28² ≈ 392,000 operaciones de histograma. En CPython 3.11 con NumPy vectorizado, el throughput estimado es **~40–80 req/s por worker single-core** antes de saturar CPU. Para escalar más allá: (1) cap de bins a b ≤ 20 independientemente de d — el impacto en precisión NMI es < 2% para n > 100 según la cota de bias Strehl-Ghosh; (2) paralelizar la construcción de histogramas por batch via `numpy.histogramdd` sobre matriz (n, 2, d) en lugar de loop explícito; (3) desplegar múltiples workers stateless detrás de un load balancer — el diseño sin índice persistente es intrínsecamente horizontal.
+---
+
+## Saturación y Estrategia de Escala
+
+Con corpus de n=500, d=384, un worker Python single-thread procesa ~8–12 req/s antes de saturar CPU en KDE (medición estimada sobre NumPy+SciPy en 4 vCPU). El punto de saturación del servicio completo con 4 workers Uvicorn es **~35–45 req/s** para ese perfil de corpus. Para escalar más allá: (1) precalcular y cachear el bandwidth de Silverman por hash de corpus (elimina O(n·d) redundante por llamada), (2) vectorizar la evaluación KDE usando `scipy.stats.gaussian_kde` con evaluación batch en lugar de loop par-a-par, reduciendo el término n²·k a n·k mediante broadcasting, y (3) añadir un threshold de corpus-size para degradar a coseno puro cuando n·d supera un límite configurable, con NMI aplicado solo al top-K candidatos por coseno — convirtiendo O(n²·k) en O(n·d + K²·k) con K<<n.
