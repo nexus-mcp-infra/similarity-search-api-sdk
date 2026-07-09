@@ -398,9 +398,17 @@ _nexus_mcp = _NexusFastMCP(
     host="0.0.0.0",
     transport_security=TransportSecuritySettings(
         enable_dns_rebinding_protection=True,
+        # --- PATCH fix_mcp_dns_rebinding_bare_host ---
+        # Railway (como cualquier proxy HTTPS estandar) manda el Host
+        # header SIN puerto explicito -- "dominio:*" nunca matchea eso,
+        # solo matchea "dominio:443". Se agrega tambien el dominio
+        # pelado para cubrir ambos casos (bug real confirmado en
+        # produccion 2026-07-09: primer fix desplegado, /mcp seguia
+        # devolviendo 421 tras el redeploy).
         allowed_hosts=[
             "localhost:*",
             "127.0.0.1:*",
+            _nexus_railway_domain,
             _nexus_railway_domain + ":*",
         ],
         allowed_origins=[
