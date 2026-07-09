@@ -488,6 +488,22 @@ async def _nexus_mcp_shutdown():
     await _nexus_mcp_stack.aclose()
 
 
+
+
+# --- NEXUS_DEBUG_HOST endpoint (diagnostico temporal, remover despues) ---
+from fastapi import Request as _NexusDebugRequest
+
+@app.get("/_nexus_debug_host")
+async def _nexus_debug_host(request: _NexusDebugRequest):
+    return {
+        "railway_public_domain_env": os.getenv("RAILWAY_PUBLIC_DOMAIN"),
+        "host_header": request.headers.get("host"),
+        "all_railway_env_vars": {
+            k: v for k, v in os.environ.items() if k.startswith("RAILWAY_")
+        },
+    }
+
+
 app.mount("/", _nexus_mcp_asgi_app)
 
 # --- NEXUS: reporte de uso real a Stripe (inyectado por forge_output_saver_v6) ---
