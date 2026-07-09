@@ -376,12 +376,40 @@ def liveness_probe() -> dict:
 
 from typing import Annotated, Any, Literal
 from contextlib import AsyncExitStack as _NexusMcpExitStack
-
+import os
 import httpx
 from pydantic import Field
 from mcp.server.fastmcp import FastMCP as _NexusFastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 
-_nexus_mcp = _NexusFastMCP('nexus-similarity-search-api', stateless_http=True)
+# --- NEXUS: PATCH fix_mcp_dns_rebinding_host_deployed_outputs ---
+# FastMCP() sin host/transport_security explicito activa proteccion
+# anti DNS-rebinding con allowlist localhost-only por default del SDK,
+# rechazando con 421 "Invalid Host header" cualquier request real
+# contra el dominio publico de Railway (bug real confirmado en
+# produccion 2026-07-09 probando /mcp contra el deploy real). Se pasa
+# transport_security explicito leyendo RAILWAY_PUBLIC_DOMAIN en
+# runtime -- Railway lo inyecta automaticamente en cada servicio.
+_nexus_railway_domain = os.getenv("RAILWAY_PUBLIC_DOMAIN", "*")
+
+_nexus_mcp = _NexusFastMCP(
+    'nexus-similarity-search-api',
+    stateless_http=True,
+    host="0.0.0.0",
+    transport_security=TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=[
+            "localhost:*",
+            "127.0.0.1:*",
+            _nexus_railway_domain + ":*",
+        ],
+        allowed_origins=[
+            "http://localhost:*",
+            "http://127.0.0.1:*",
+            "https://" + _nexus_railway_domain,
+        ],
+    ),
+)
 
 
 async def _nexus_mcp_call_core(method: str, path: str, params: dict) -> Any:
