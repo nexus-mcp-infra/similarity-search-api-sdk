@@ -490,19 +490,9 @@ async def _nexus_mcp_shutdown():
 
 
 
-# --- NEXUS_DEBUG_HOST endpoint (diagnostico temporal, remover despues) ---
-from fastapi import Request as _NexusDebugRequest
-
-@app.get("/_nexus_debug_host")
-async def _nexus_debug_host(request: _NexusDebugRequest):
-    return {
-        "railway_public_domain_env": os.getenv("RAILWAY_PUBLIC_DOMAIN"),
-        "host_header": request.headers.get("host"),
-        "all_railway_env_vars": {
-            k: v for k, v in os.environ.items() if k.startswith("RAILWAY_")
-        },
-    }
-
+# PATCH remove_nexus_debug_host_endpoint: /_nexus_debug_host removido.
+# Exponia todas las variables RAILWAY_* sin auth en un endpoint publico
+# -- fuga de informacion real, no solo cruft de diagnostico temporal.
 
 app.mount("/", _nexus_mcp_asgi_app)
 
