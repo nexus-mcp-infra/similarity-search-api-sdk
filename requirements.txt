@@ -7,3 +7,4 @@ scikit-learn
 scipy
 stripe
 uvicorn
+x402[fastapi,evm]

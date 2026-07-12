@@ -17,44 +17,6 @@ app = FastAPI(
     version="1.0.0",
 )
 
-# --- NEXUS: x402 (pago por llamada en USDC, Base Sepolia testnet) ---
-from x402.http import FacilitatorConfig, HTTPFacilitatorClient, PaymentOption
-from x402.http.middleware.fastapi import PaymentMiddlewareASGI
-from x402.http.types import RouteConfig
-from x402.mechanisms.evm.exact import ExactEvmServerScheme
-from x402.schemas import Network
-from x402.server import x402ResourceServer
-
-_NEXUS_X402_EVM_ADDRESS = "0x70e9f8057bb50e31b6ee06958bcbbe7de9daa98f"
-_NEXUS_X402_NETWORK: Network = "eip155:84532"  # Base Sepolia (testnet) -- cambiar a eip155:8453 + facilitator mainnet para produccion
-_NEXUS_X402_PRICE = "$0.01"
-
-_nexus_x402_facilitator = HTTPFacilitatorClient(
-    FacilitatorConfig(url="https://x402.org/facilitator")
-)
-_nexus_x402_server = x402ResourceServer(_nexus_x402_facilitator)
-_nexus_x402_server.register(_NEXUS_X402_NETWORK, ExactEvmServerScheme())
-
-_NEXUS_X402_ROUTES: dict[str, RouteConfig] = {
-    "POST /similarity/search": RouteConfig(
-        accepts=[PaymentOption(scheme="exact", pay_to=_NEXUS_X402_EVM_ADDRESS, price=_NEXUS_X402_PRICE, network=_NEXUS_X402_NETWORK)],
-        mime_type="application/json",
-        description="Stateless NMI+cosine fusion similarity search over an inline corpus",
-    ),
-    "POST /similarity/calibrate-alpha/v1": RouteConfig(
-        accepts=[PaymentOption(scheme="exact", pay_to=_NEXUS_X402_EVM_ADDRESS, price=_NEXUS_X402_PRICE, network=_NEXUS_X402_NETWORK)],
-        mime_type="application/json",
-        description="Entropy-calibrated alpha for a corpus, sin correr la busqueda completa",
-    ),
-    "POST /similarity/batch-score": RouteConfig(
-        accepts=[PaymentOption(scheme="exact", pay_to=_NEXUS_X402_EVM_ADDRESS, price=_NEXUS_X402_PRICE, network=_NEXUS_X402_NETWORK)],
-        mime_type="application/json",
-        description="Scoring de hasta 10000 pares de vectores con alpha fijo",
-    ),
-}
-
-app.add_middleware(PaymentMiddlewareASGI, routes=_NEXUS_X402_ROUTES, server=_nexus_x402_server)
-
 API_KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=True)
 _VALID_API_KEY = os.environ.get("SIMILARITY_API_KEY", "")
 
@@ -536,7 +498,7 @@ app.mount("/", _nexus_mcp_asgi_app)
 
 # --- NEXUS: reporte de uso real a Stripe (inyectado por forge_output_saver_v6) ---
 # --- HOTFIX: excluir paths de monitoreo/sistema del billing (ver Fase 0.5) ---
-_NEXUS_BILLING_EXCLUDED_PATHS = {"/health", "/", "/docs", "/openapi.json", "/redoc", "/favicon.ico", "/similarity/search", "/similarity/calibrate-alpha/v1", "/similarity/batch-score"}  # x402 cubre estas 3 -- Stripe no debe cobrarlas de nuevo
+_NEXUS_BILLING_EXCLUDED_PATHS = {"/health", "/", "/docs", "/openapi.json", "/redoc", "/favicon.ico"}
 @app.middleware("http")
 async def _nexus_usage_middleware(request, call_next):
     response = await call_next(request)
