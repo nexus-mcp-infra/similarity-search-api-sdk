@@ -1,168 +1,110 @@
-# Similarity Search API
+﻿# Similarity Search API
 
-Stateless semantic similarity over HTTP — no vector database, no infrastructure, no setup.
+Stateless similarity search over pre-computed vectors — NMI (normalized mutual information) + cosine fusion, with an entropy-calibrated blending weight computed per request. No vector database, no index to maintain, no infrastructure to run.
 
----
-
-## Install
-
-```bash
-pip install similarity-search-sdk
-```
+Available both as a plain HTTP API and as an MCP server (5 tools) for AI agents.
 
 ---
 
-## Quickstart
+## Important: this operates on vectors, not raw text
 
-```python
-from similarity_search import SimilarityClient
-
-client = SimilarityClient(api_key="sk_test_xxxxxxxxxxxxxxxx")
-results = client.search(query="neural network optimization", corpus=my_documents, top_k=5)
-print(results[0].score, results[0].text)
-```
+This API does **not** embed text for you. `query` and `corpus` entries are pre-computed numeric vectors (e.g. from your own embedding model). If you need text-to-vector embedding first, run that upstream and pass the resulting vectors here.
 
 ---
 
-## Why not build it yourself?
+## Base URL
+https://similarity-search-api-production.up.railway.app
 
-**The honest answer:** you can. You can wire up cosine similarity in 10 lines of NumPy. What you cannot wire up in a weekend is the part that makes it accurate.
+## Authentication
 
-Every similarity API you've seen — Pinecone, Weaviate, pgvector — solves a storage problem. This solves a **measurement problem**.
+All business endpoints require an `X-API-Key` header:
+X-API-Key: <your key>
 
-### What the incumbents miss
+`/health` requires no authentication.
 
-Cosine similarity measures geometric angle between embedding vectors. It's fast, it's differentiable, and it's wrong in a specific, predictable way: it treats all dimensions as equally informative. In a corpus of 50,000 product descriptions, most embedding dimensions carry near-zero discriminative signal. Cosine penalizes you for that noise and you pay for it in precision.
+## Pricing
 
-Normalized Mutual Information (NMI) captures statistical dependence between items without assuming linearity or geometric structure. It sees cluster density that cosine misses. But NMI alone doesn't generalize across semantically sparse corpora — it over-weights coincidental co-occurrence.
+Two ways to pay, same endpoints:
 
-The fix is composing them. The score this API returns is:
-
-```
-score = alpha * cosine(q, d) + (1 - alpha) * NMI_normalized(q, d)
-```
-
-Where `alpha` is not a parameter you tune. It's computed per-request from the marginal entropy of your corpus:
-
-```
-alpha = H(corpus) / (H(corpus) + H_max)
-```
-
-`H(corpus)` is the Shannon entropy of the term distribution across your submitted documents, calculated via `src/math/information` at request time — specifically `H(X)`, `H(Y)`, and the joint `H(X,Y)` needed to derive NMI. The complexity is O(n log n) on corpus size, which is why this runs as a stateless call rather than a precomputed index.
-
-**What this means in practice:**
-
-- High-entropy corpus (semantically dispersed documents, many topics) -> `alpha` approaches 1.0 -> cosine dominates, because geometric spread is the real signal
-- Low-entropy corpus (dense cluster, narrow domain) -> `alpha` drops toward 0.5 -> NMI dominates, because mutual information between co-occurring terms reveals structure that cosine flattens
-
-You don't configure this. You don't know your corpus entropy ahead of time. The API measures it on every call and calibrates automatically.
+- **x402 (pay-per-call, USDC on Base)** — currently on **Base Sepolia testnet**, $0.01/call, no account or API key required beyond the x402 payment flow itself. A request without payment gets `402 Payment Required` with the payment details in the `payment-required` response header.
+- **Stripe (metered billing)** — for callers provisioned with an API key and a Stripe customer on the account.
 
 ---
 
-## What you skip
+## Endpoints
 
-| Without this API | With this API |
-|---|---|
-| Spin up Pinecone, configure index dimensions, manage upserts, pay for idle replicas | One HTTP POST with your documents and query |
-| Implement NMI from scratch, debug joint entropy estimation, handle zero-probability terms | Handled inside every request |
-| Tune a weighting parameter between geometric and information-theoretic metrics per domain | Alpha computed automatically from your corpus entropy |
-| Maintain a persistent vector store for a corpus that changes weekly | Stateless — send the corpus every time, or cache it yourself |
-
-The setup cost for a managed vector database makes sense at 10M+ documents with a dedicated ML team. Below 500k items and without a dedicated infrastructure function, you are paying for complexity you don't need.
-
----
-
-## API surface
-
-```
-POST /v1/search          # Query a corpus, returns ranked results with composite scores
-POST /v1/score           # Score a single (query, document) pair — returns alpha, cosine, NMI components
-POST /v1/entropy         # Compute H(corpus) — useful for debugging calibration behavior
-GET  /v1/health          # Liveness check
-```
-
-Four endpoints. No state. No index. No SDK required — curl works.
-
----
-
-## curl example
-
-```bash
-curl https://api.similarity-search.io/v1/search \
-  -H "Authorization: Bearer sk_test_xxxxxxxxxxxxxxxx" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "query": "transformer attention mechanism",
-    "corpus": ["Self-attention in NLP...", "Convolutional filters for images...", "..."],
-    "top_k": 3
-  }'
-```
+### `POST /similarity/search`
+Rank a corpus against a query vector using the composite score.
 
 ```json
 {
-  "results": [
-    { "index": 0, "score": 0.912, "cosine": 0.887, "nmi": 0.961, "alpha": 0.731 },
-    { "index": 2, "score": 0.741, "cosine": 0.803, "nmi": 0.634, "alpha": 0.731 }
+  "query": { "id": "q1", "vector": [0.12, -0.4, 0.91, "..."] },
+  "corpus": [
+    { "id": "doc1", "vector": [0.10, -0.35, 0.88, "..."] },
+    { "id": "doc2", "vector": [0.55, 0.02, -0.14, "..."] }
   ],
-  "corpus_entropy": 3.847,
-  "alpha": 0.731,
-  "latency_ms": 43
+  "top_k": 10,
+  "nmi_bins": 10,
+  "alpha_override": null
 }
 ```
 
-The response returns `alpha` and both component scores so you can audit exactly why a document ranked where it did.
+All vectors in `query` and `corpus` must share the same dimensionality (2-4096 dims). `top_k` up to 1000. `alpha_override` (optional) pins the cosine/NMI blend weight instead of calibrating it from corpus entropy.
+
+Response:
+```json
+{
+  "results": [
+    { "id": "doc1", "composite_score": 0.91, "cosine_similarity": 0.89, "nmi_score": 0.94, "rank": 1 }
+  ],
+  "calibrated_alpha": 0.73,
+  "corpus_entropy": 3.85,
+  "query_id": "q1",
+  "corpus_size": 2,
+  "latency_ms": 43,
+  "request_fingerprint": "..."
+}
+```
+
+### `POST /similarity/calibrate-alpha/v1`
+Compute the entropy-calibrated alpha for a corpus without running a full search - useful for inspecting/debugging calibration behavior before committing to a search call.
+
+### `POST /similarity/batch-score`
+Score up to 10,000 `(vector_a, vector_b)` pairs with a fixed `alpha` - no corpus/entropy overhead.
+
+```json
+{
+  "pairs": [[[0.1, 0.2], [0.15, 0.19]]],
+  "alpha": 0.5,
+  "nmi_bins": 10
+}
+```
+
+### `GET /health`
+Liveness probe. No auth required. Not billed (excluded from both Stripe and x402).
+
+> Note: `POST /similarity/calibrate-alpha` (without `/v1`) is a deprecated alias kept for backward compatibility - use `/similarity/calibrate-alpha/v1`.
+
+---
+
+## MCP tools
+
+Connect an MCP-compatible client (Claude, Cursor, etc.) to the streamable HTTP endpoint at:
+https://similarity-search-api-production.up.railway.app/mcp
+
+Exposes 5 tools: `rank_items_by_nmi_cosine_fusion`, `estimate_corpus_entropy_profile`, `score_pair_nmi_cosine`, `find_outlier_vectors_by_nmi_deficit`, `calibrate_alpha_from_query_entropy`.
+
+---
+
+## The scoring method
+composite_score = alpha * cosine(query, doc) + (1 - alpha) * NMI_normalized(query, doc)
+
+`alpha` is calibrated per-request from the Shannon entropy of the submitted corpus (unless you pass `alpha_override`) - high-entropy (dispersed) corpora lean toward cosine; low-entropy (dense/narrow) corpora lean toward NMI, which captures statistical dependence that cosine's geometric angle misses.
 
 ---
 
 ## Limits
 
 - Corpus size: up to 500,000 items per request
-- Document length: up to 8,192 tokens per item
-- Query length: up to 512 tokens
-- Latency: O(n log n) on corpus size — benchmark in `/v1/health` response includes current node throughput
-
----
-
-## Authentication
-
-All requests require a Bearer token in the `Authorization` header. Keys are scoped to an account and rate-limited per tier. No key is embedded in the SDK by default — pass it explicitly or via the `SIMILARITY_SEARCH_API_KEY` environment variable.
-
-```python
-import os
-from similarity_search import SimilarityClient
-
-client = SimilarityClient(api_key=os.environ["SIMILARITY_SEARCH_API_KEY"])
-```
-
----
-
-## Language support
-
-| Language | Package |
-|---|---|
-| Python 3.9+ | `pip install similarity-search-sdk` |
-| Node.js 18+ | `npm install @similarity-search/sdk` |
-| HTTP (any) | REST — no SDK needed |
-
----
-
-## Status and support
-
-- Status page: status.similarity-search.io
-- API reference: docs.similarity-search.io
-- Support: support@similarity-search.io
-
----
-
-## Pricing
-
-| Calls / month | Price per call |
-|---|---|
-| 0 - 100 | Free |
-| 101 - 10,000 | $0.0025 |
-| 10,001 - 100,000 | $0.0018 |
-| 100,001 - 1,000,000 | $0.0012 |
-| 1,000,001 - 10,000,000 | $0.0008 |
-| 10,000,001+ | $0.0005 |
-
-No base fee. No storage fee. No minimum commitment. You pay for computation, not for parking vectors you queried once.
+- Vector dimensionality: 2-4,096
+- `batch-score` pairs: up to 10,000 per request
