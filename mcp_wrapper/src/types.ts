@@ -1,5 +1,9 @@
 /**
- * Type definitions — shared across tools and the core client.
+ * Type definitions -- shared across tools and the core client.
+ *
+ * --- NEXUS PATCH mcp_tool_grounding_similarity_search ---
+ * Only RankEmbeddingsByNmiCosineInput survives grounding; see tools.ts
+ * and schemas.ts for context.
  */
 
 export interface CoreErrorBody {
@@ -26,40 +30,7 @@ export interface RankEmbeddingsByNmiCosineInput {
   query_vector: number[];
   corpus_vectors: number[][];
   corpus_ids: string[];
-  discretization_bins?: number | undefined;
-  bootstrap_iterations?: number | undefined;
   top_k?: number | undefined;
-  alpha?: number | undefined;
-  filter_insignificant?: boolean | undefined;
-  nmi_cosine_weight?: number | undefined;
-}
-
-export interface EstimatePairwiseNmiMatrixInput {
-  vectors: number[][];
-  vector_ids: string[];
-  discretization_bins?: number | undefined;
-  bootstrap_iterations?: number | undefined;
-  alpha?: number | undefined;
-}
-
-export interface ScoreCandidatePairSignificanceInput {
-  vector_a: number[];
-  vector_b: number[];
-  discretization_bins?: number | undefined;
-  bootstrap_iterations?: number | undefined;
-  nmi_cosine_weight?: number | undefined;
-}
-
-export interface DetectEmbeddingDimensionRedundancyInput {
-  sample_vectors: number[][];
-  redundancy_nmi_threshold?: number | undefined;
-  discretization_bins?: number | undefined;
-  alpha?: number | undefined;
-}
-
-export interface CalibrateNmiCosineWeightForCorpusInput {
-  triplets: number[][];
-  weight_search_grid_size?: number | undefined;
-  discretization_bins?: number | undefined;
-  bootstrap_iterations?: number | undefined;
+  nmi_bins?: number | undefined;
+  alpha_override?: number | undefined;
 }

@@ -39,11 +39,16 @@ export async function callCore<TResponse>(
     const timeout = setTimeout(() => controller.abort(), CORE_TIMEOUT_MS);
 
     try {
+      // --- NEXUS PATCH mcp_tool_grounding_similarity_search ---
+      // The core service authenticates with APIKeyHeader("X-API-Key")
+      // (see core/similarity_search_api_api.py, _require_api_key), not a
+      // Bearer token -- sending "authorization: Bearer" got a 401 even
+      // once the route path itself was fixed.
       const res = await request(url, {
         method,
         headers: {
           "content-type": "application/json",
-          ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {}),
+          ...(apiKey ? { "x-api-key": apiKey } : {}),
         },
         body: body !== undefined ? JSON.stringify(body) : undefined,
         signal: controller.signal,
