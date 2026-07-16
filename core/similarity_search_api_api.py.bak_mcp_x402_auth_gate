@@ -469,57 +469,30 @@ _nexus_mcp = _NexusFastMCP(
 # de Stripe para tratar estas 3 rutas como internas.
 
 
-# --- NEXUS PATCH mcp_x402_auth_gate_similarity_search ---
-# patch_mcp_tool_grounding_similarity_search_inprocess.py made these 3 tools
-# call the business-logic functions directly to dodge the 402 from the old
-# ASGI-transport internal call -- but that direct call also skipped
-# _require_api_key() (only evaluated by FastAPI's own DI, never by a plain
-# Python call) AND the x402 PaymentMiddlewareASGI (registered via
-# app.add_middleware(), filtered by path in _NEXUS_X402_ROUTES -- the
-# FastMCP mount at "/" was never in that list). Net effect: these 3 paid,
-# API-key-gated operations became free and unauthenticated over MCP while
-# staying gated over REST. Fixed here with the same two checks the REST
-# routes already enforce, applied explicitly instead of via FastAPI DI:
-#   - auth: _require_api_key() is a plain function, not FastAPI-DI-only --
-#     called directly with an explicit `api_key` tool parameter (must come
-#     from the caller, matching X-API-Key; passing the server's own
-#     _VALID_API_KEY back to itself would authenticate nothing).
-#   - payment: x402's own MCP integration (x402.mcp.create_payment_wrapper,
-#     installed as part of this asset's x402 dependency) wraps the FastMCP
-#     tool handler with the SAME _nexus_x402_server/PaymentOption/price the
-#     REST routes use -- not a hand-rolled reimplementation. Verification
-#     runs before the handler; settlement only runs if the handler returns
-#     without raising, so a bad api_key aborts before any charge lands.
+# --- NEXUS PATCH mcp_tool_grounding_similarity_search_inprocess ---
+# Originally had 5 tools calling _nexus_mcp_call_core() over an ASGI-transport
+# HTTP hop; 2 (find_outlier_vectors_by_nmi_deficit,
+# calibrate_alpha_from_query_entropy) described operations with no real
+# implementation anywhere in this API -- no centroid-based outlier detection
+# exists, and calibration is per-corpus only, ignoring any query vector --
+# and were removed. The 3 remaining now call their real business-logic
+# functions DIRECTLY instead of going through the HTTP layer: the 3 real
+# routes (/similarity/search, /similarity/calibrate-alpha/v1,
+# /similarity/batch-score) are wrapped by x402 payment middleware, so an
+# in-process ASGI call to them -- even with a valid X-API-Key -- gets 402
+# Payment Required instead of a real response. Calling
+# search_corpus_by_calibrated_similarity(), inspect_corpus_entropy_and_alpha()
+# and score_vector_pairs_with_fixed_alpha() directly skips ASGI/HTTP/x402
+# entirely, the same way the Stripe billing middleware already treats these
+# 3 routes as internal by excluding them from its own meter. Numeric bounds
+# (n_bins, top_k) corrected to match the real constraints, and two
+# descriptions corrected to stop promising behavior the real logic doesn't
+# have (no per-dimension entropy breakdown, no per-pair alpha
+# auto-calibration).
 
-from x402.mcp import create_payment_wrapper as _nexus_mcp_x402_wrapper_factory
-from x402.schemas.config import ResourceConfig as _NexusX402ResourceConfig
-
-# create_payment_wrapper() necesita PaymentRequirements (asset + amount ya
-# resueltos), no PaymentOption (price string sin resolver) -- son tipos
-# distintos en el SDK. En vez de derivar a mano el asset USDC/decimales, se
-# reusa el mismo camino que ya usa la libreria puertas adentro para las
-# rutas REST (ver x402.http.x402_http_server._build_payment_requirements_from_options):
-# ResourceConfig(misma price/network/pay_to que el PaymentOption de REST) ->
-# server.build_payment_requirements(). Requiere que el server este
-# inicializado (fetch de "supported" contra el facilitator); se garantiza
-# una sola vez sin duplicar la llamada si algo mas ya lo inicializo antes.
-if not getattr(_nexus_x402_server, "_initialized", False):
-    _nexus_x402_server.initialize()
-
-_NEXUS_MCP_X402_RESOURCE_CONFIG = _NexusX402ResourceConfig(
-    scheme="exact",
-    pay_to=_NEXUS_X402_EVM_ADDRESS,
-    price=_NEXUS_X402_PRICE,
-    network=_NEXUS_X402_NETWORK,
-)
-_NEXUS_MCP_X402_ACCEPTS = _nexus_x402_server.build_payment_requirements(_NEXUS_MCP_X402_RESOURCE_CONFIG)
-_nexus_mcp_x402_wrapper = _nexus_mcp_x402_wrapper_factory(_nexus_x402_server, accepts=_NEXUS_MCP_X402_ACCEPTS)
-
-@_nexus_mcp.tool(name='nexus_similarity_search_api_rank_items_by_nmi_cosine_fusion', description="Ranks a corpus of items against a query vector using a calibrated fusion score (alpha * cosine + (1-alpha) * NMI_normalizado), where alpha is auto-derived from the corpus's marginal entropy unless overridden. Results are identified by their 0-indexed position in corpus_vectors (this tool does not accept explicit item IDs). Use this when you need semantically-calibrated similarity over a stateless corpus of up to 500k items without a vector database. Do NOT use for purely geometric nearest-neighbor search where NMI overhead is unnecessary, nor for corpora larger than 500k items per call. Requires a valid api_key (same as X-API-Key) and an x402 payment.")
-@_nexus_mcp_x402_wrapper
-async def rank_items_by_nmi_cosine_fusion(query_vector: Annotated[list[float], Field(..., description='Dense numeric vector representing the query item. Must have the same dimensionality as all corpus_vectors entries.', min_length=2, max_length=4096)], corpus_vectors: Annotated[list[list[float]], Field(..., description='List of dense numeric vectors forming the corpus to rank against. Each inner array must match query_vector dimensionality. Maximum 500000 entries.', min_length=1, max_length=500000)], top_k: Annotated[float, Field(10, description='Number of top-ranked results to return, ordered by descending fusion score. Capped at 1000 by the core service regardless of corpus size.', ge=1, le=1000)], alpha_override: Annotated[float, Field(None, description='Fixed alpha weight for cosine component in [0.0, 1.0]. If omitted, alpha is auto-calibrated from corpus entropy. Set to 1.0 to use pure cosine; 0.0 for pure NMI.', ge=0.0, le=1.0)], n_bins: Annotated[float, Field(16, description='Number of histogram bins used to discretize continuous dimensions when estimating NMI. Must be between 3 and 50.', ge=3, le=50)], api_key: Annotated[str, Field(..., description='API key required for this paid operation -- same secret configured as X-API-Key on the REST endpoints (SIMILARITY_API_KEY). Payment (x402) alone is not sufficient; both gates must pass.')]) -> dict[str, Any]:
+@_nexus_mcp.tool(name='nexus_similarity_search_api_rank_items_by_nmi_cosine_fusion', description="Ranks a corpus of items against a query vector using a calibrated fusion score (alpha * cosine + (1-alpha) * NMI_normalizado), where alpha is auto-derived from the corpus's marginal entropy unless overridden. Results are identified by their 0-indexed position in corpus_vectors (this tool does not accept explicit item IDs). Use this when you need semantically-calibrated similarity over a stateless corpus of up to 500k items without a vector database. Do NOT use for purely geometric nearest-neighbor search where NMI overhead is unnecessary, nor for corpora larger than 500k items per call.")
+async def rank_items_by_nmi_cosine_fusion(query_vector: Annotated[list[float], Field(..., description='Dense numeric vector representing the query item. Must have the same dimensionality as all corpus_vectors entries.', min_length=2, max_length=4096)], corpus_vectors: Annotated[list[list[float]], Field(..., description='List of dense numeric vectors forming the corpus to rank against. Each inner array must match query_vector dimensionality. Maximum 500000 entries.', min_length=1, max_length=500000)], top_k: Annotated[float, Field(10, description='Number of top-ranked results to return, ordered by descending fusion score. Capped at 1000 by the core service regardless of corpus size.', ge=1, le=1000)], alpha_override: Annotated[float, Field(None, description='Fixed alpha weight for cosine component in [0.0, 1.0]. If omitted, alpha is auto-calibrated from corpus entropy. Set to 1.0 to use pure cosine; 0.0 for pure NMI.', ge=0.0, le=1.0)], n_bins: Annotated[float, Field(16, description='Number of histogram bins used to discretize continuous dimensions when estimating NMI. Must be between 3 and 50.', ge=3, le=50)]) -> dict[str, Any]:
     """NMI-Cosine Fused Similarity Ranking"""
-    _require_api_key(key=api_key)
     corpus_ids = [str(i) for i in range(len(corpus_vectors))]
     request_obj = SimilaritySearchRequest(
         query=CorpusVector(id="query", vector=query_vector),
@@ -531,11 +504,9 @@ async def rank_items_by_nmi_cosine_fusion(query_vector: Annotated[list[float], F
     response = search_corpus_by_calibrated_similarity(request_obj, _key=_VALID_API_KEY)
     return response.model_dump()
 
-@_nexus_mcp.tool(name='nexus_similarity_search_api_estimate_corpus_entropy_profile', description="Computes the aggregate entropy-calibrated alpha for a corpus without running a full search -- useful to inspect before committing to a large rank_items_by_nmi_cosine_fusion call. Returns a single aggregate corpus_entropy value, NOT a per-dimension breakdown -- the real logic only exposes the mean marginal entropy across dimensions, not H(X_d) per individual dimension. Do NOT use expecting per-dimension granularity. Requires a valid api_key (same as X-API-Key) and an x402 payment.")
-@_nexus_mcp_x402_wrapper
-async def estimate_corpus_entropy_profile(corpus_vectors: Annotated[list[list[float]], Field(..., description='List of dense numeric vectors for which to compute the aggregate entropy and calibrated alpha. Each inner array must be the same length. Maximum 500000 entries.', min_length=1, max_length=500000)], n_bins: Annotated[float, Field(16, description='Number of histogram bins for entropy discretization. Must be between 3 and 50; should match the n_bins used in rank_items_by_nmi_cosine_fusion for the profile to be consistent.', ge=3, le=50)], api_key: Annotated[str, Field(..., description='API key required for this paid operation -- same secret configured as X-API-Key on the REST endpoints (SIMILARITY_API_KEY). Payment (x402) alone is not sufficient; both gates must pass.')]) -> dict[str, Any]:
+@_nexus_mcp.tool(name='nexus_similarity_search_api_estimate_corpus_entropy_profile', description="Computes the aggregate entropy-calibrated alpha for a corpus without running a full search -- useful to inspect before committing to a large rank_items_by_nmi_cosine_fusion call. Returns a single aggregate corpus_entropy value, NOT a per-dimension breakdown -- the real logic only exposes the mean marginal entropy across dimensions, not H(X_d) per individual dimension. Do NOT use expecting per-dimension granularity.")
+async def estimate_corpus_entropy_profile(corpus_vectors: Annotated[list[list[float]], Field(..., description='List of dense numeric vectors for which to compute the aggregate entropy and calibrated alpha. Each inner array must be the same length. Maximum 500000 entries.', min_length=1, max_length=500000)], n_bins: Annotated[float, Field(16, description='Number of histogram bins for entropy discretization. Must be between 3 and 50; should match the n_bins used in rank_items_by_nmi_cosine_fusion for the profile to be consistent.', ge=3, le=50)]) -> dict[str, Any]:
     """Corpus Entropy and Calibrated Alpha Estimator"""
-    _require_api_key(key=api_key)
     corpus_ids = [str(i) for i in range(len(corpus_vectors))]
     request_obj = AlphaCalibrateRequest(
         corpus=[CorpusVector(id=cid, vector=vec) for cid, vec in zip(corpus_ids, corpus_vectors)],
@@ -544,11 +515,9 @@ async def estimate_corpus_entropy_profile(corpus_vectors: Annotated[list[list[fl
     response = inspect_corpus_entropy_and_alpha(request_obj, _key=_VALID_API_KEY)
     return response.model_dump()
 
-@_nexus_mcp.tool(name='nexus_similarity_search_api_score_pair_nmi_cosine', description="Computes the NMI-cosine fusion score for exactly one (query, target) vector pair at a fixed alpha. Use for explainability, debugging, or unit-level validation of fusion scores before running full corpus ranking. Unlike corpus-level ranking, alpha is NOT auto-calibrated for a single pair -- the real logic requires a fixed alpha (default 0.5); pass alpha explicitly for a specific blend. Do NOT use in a loop to score many pairs; batch them into rank_items_by_nmi_cosine_fusion instead. Requires a valid api_key (same as X-API-Key) and an x402 payment.")
-@_nexus_mcp_x402_wrapper
-async def score_pair_nmi_cosine(vector_a: Annotated[list[float], Field(..., description='First dense numeric vector of the pair. Must have the same dimensionality as vector_b.', min_length=2, max_length=4096)], vector_b: Annotated[list[float], Field(..., description='Second dense numeric vector of the pair. Must have the same dimensionality as vector_a.', min_length=2, max_length=4096)], n_bins: Annotated[float, Field(16, description='Histogram bins for NMI discretization. Must be between 3 and 50.', ge=3, le=50)], alpha: Annotated[float, Field(0.5, description='Fixed alpha weight for the cosine component in [0.0, 1.0], applied as-is -- not auto-calibrated. Default 0.5 matches the core service default.', ge=0.0, le=1.0)], api_key: Annotated[str, Field(..., description='API key required for this paid operation -- same secret configured as X-API-Key on the REST endpoints (SIMILARITY_API_KEY). Payment (x402) alone is not sufficient; both gates must pass.')]) -> dict[str, Any]:
+@_nexus_mcp.tool(name='nexus_similarity_search_api_score_pair_nmi_cosine', description="Computes the NMI-cosine fusion score for exactly one (query, target) vector pair at a fixed alpha. Use for explainability, debugging, or unit-level validation of fusion scores before running full corpus ranking. Unlike corpus-level ranking, alpha is NOT auto-calibrated for a single pair -- the real logic requires a fixed alpha (default 0.5); pass alpha explicitly for a specific blend. Do NOT use in a loop to score many pairs; batch them into rank_items_by_nmi_cosine_fusion instead.")
+async def score_pair_nmi_cosine(vector_a: Annotated[list[float], Field(..., description='First dense numeric vector of the pair. Must have the same dimensionality as vector_b.', min_length=2, max_length=4096)], vector_b: Annotated[list[float], Field(..., description='Second dense numeric vector of the pair. Must have the same dimensionality as vector_a.', min_length=2, max_length=4096)], n_bins: Annotated[float, Field(16, description='Histogram bins for NMI discretization. Must be between 3 and 50.', ge=3, le=50)], alpha: Annotated[float, Field(0.5, description='Fixed alpha weight for the cosine component in [0.0, 1.0], applied as-is -- not auto-calibrated. Default 0.5 matches the core service default.', ge=0.0, le=1.0)]) -> dict[str, Any]:
     """Single-Pair NMI-Cosine Scorer"""
-    _require_api_key(key=api_key)
     request_obj = BatchScoreRequest(pairs=[(vector_a, vector_b)], alpha=alpha, nmi_bins=int(n_bins))
     response = score_vector_pairs_with_fixed_alpha(request_obj, _key=_VALID_API_KEY)
     return response.model_dump()
