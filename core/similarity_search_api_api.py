@@ -458,51 +458,69 @@ _nexus_mcp = _NexusFastMCP(
 )
 
 
-async def _nexus_mcp_call_core(method: str, path: str, params: dict) -> Any:
-    """
-    Llama al endpoint real del core -- via ASGI in-process (sin red
-    real, sin segundo proceso), no un HTTP call externo. `app` ya
-    existe en este mismo modulo (es el FastAPI que FORGE genero).
-    """
-    transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://nexus-internal") as client:
-        if method == "GET":
-            resp = await client.get(path, params=params)
-        else:
-            resp = await client.post(path, json=params)
-        resp.raise_for_status()
-        return resp.json()
+# _nexus_mcp_call_core() eliminada: llamaba a las rutas HTTP reales via
+# ASGI in-process, pero esas mismas rutas estan protegidas por el
+# middleware x402 (ver "NEXUS: x402" mas arriba) -- cualquier request,
+# incluido este interno, exige un pago valido y devuelve 402 Payment
+# Required en vez de la respuesta real. Los 3 tools MCP que sobreviven
+# ahora llaman DIRECTO a las funciones de logica de negocio
+# (search_corpus_by_calibrated_similarity, etc.), sin pasar por
+# ASGI/HTTP/x402 -- mismo criterio que ya usa la exclusion de billing
+# de Stripe para tratar estas 3 rutas como internas.
 
 
-@_nexus_mcp.tool(name='nexus_similarity_search_api_rank_items_by_nmi_cosine_fusion', description="Ranks a corpus of items against a query vector using a calibrated fusion score (alpha * cosine + (1-alpha) * NMI_normalizado), where alpha is auto-derived from the query vector's marginal entropy relative to the corpus distribution. Use this when you need semantically-calibrated similarity over a stateless corpus of up to 500k items without a vector database. Do NOT use for purely geometric nearest-neighbor search where NMI overhead is unnecessary, nor for corpora larger than 500k items per call.")
-async def rank_items_by_nmi_cosine_fusion(query_vector: Annotated[list[float], Field(..., description='Dense numeric vector representing the query item. Must have the same dimensionality as all corpus_vectors entries.', min_length=2, max_length=4096)], corpus_vectors: Annotated[list[list[float]], Field(..., description='List of dense numeric vectors forming the corpus to rank against. Each inner array must match query_vector dimensionality. Maximum 500000 entries.', min_length=1, max_length=500000)], top_k: Annotated[float, Field(10, description='Number of top-ranked results to return, ordered by descending fusion score. Must be between 1 and the corpus size.', ge=1, le=500000)], alpha_override: Annotated[float, Field(None, description='Fixed alpha weight for cosine component in [0.0, 1.0]. If omitted, alpha is auto-calibrated from corpus entropy via src/math/information. Set to 1.0 to use pure cosine; 0.0 for pure NMI. Use override only when you have a domain-specific prior on the geometry-vs-dependence tradeoff.', ge=0.0, le=1.0)], n_bins: Annotated[float, Field(16, description='Number of histogram bins used to discretize continuous dimensions when estimating H(X), H(Y), H(X,Y) for NMI computation. Higher values increase resolution but raise O(n log n) cost. Recommended range: 8-64.', ge=4, le=128)]) -> dict[str, Any]:
+# --- NEXUS PATCH mcp_tool_grounding_similarity_search_inprocess ---
+# Originally had 5 tools calling _nexus_mcp_call_core() over an ASGI-transport
+# HTTP hop; 2 (find_outlier_vectors_by_nmi_deficit,
+# calibrate_alpha_from_query_entropy) described operations with no real
+# implementation anywhere in this API -- no centroid-based outlier detection
+# exists, and calibration is per-corpus only, ignoring any query vector --
+# and were removed. The 3 remaining now call their real business-logic
+# functions DIRECTLY instead of going through the HTTP layer: the 3 real
+# routes (/similarity/search, /similarity/calibrate-alpha/v1,
+# /similarity/batch-score) are wrapped by x402 payment middleware, so an
+# in-process ASGI call to them -- even with a valid X-API-Key -- gets 402
+# Payment Required instead of a real response. Calling
+# search_corpus_by_calibrated_similarity(), inspect_corpus_entropy_and_alpha()
+# and score_vector_pairs_with_fixed_alpha() directly skips ASGI/HTTP/x402
+# entirely, the same way the Stripe billing middleware already treats these
+# 3 routes as internal by excluding them from its own meter. Numeric bounds
+# (n_bins, top_k) corrected to match the real constraints, and two
+# descriptions corrected to stop promising behavior the real logic doesn't
+# have (no per-dimension entropy breakdown, no per-pair alpha
+# auto-calibration).
+
+@_nexus_mcp.tool(name='nexus_similarity_search_api_rank_items_by_nmi_cosine_fusion', description="Ranks a corpus of items against a query vector using a calibrated fusion score (alpha * cosine + (1-alpha) * NMI_normalizado), where alpha is auto-derived from the corpus's marginal entropy unless overridden. Results are identified by their 0-indexed position in corpus_vectors (this tool does not accept explicit item IDs). Use this when you need semantically-calibrated similarity over a stateless corpus of up to 500k items without a vector database. Do NOT use for purely geometric nearest-neighbor search where NMI overhead is unnecessary, nor for corpora larger than 500k items per call.")
+async def rank_items_by_nmi_cosine_fusion(query_vector: Annotated[list[float], Field(..., description='Dense numeric vector representing the query item. Must have the same dimensionality as all corpus_vectors entries.', min_length=2, max_length=4096)], corpus_vectors: Annotated[list[list[float]], Field(..., description='List of dense numeric vectors forming the corpus to rank against. Each inner array must match query_vector dimensionality. Maximum 500000 entries.', min_length=1, max_length=500000)], top_k: Annotated[float, Field(10, description='Number of top-ranked results to return, ordered by descending fusion score. Capped at 1000 by the core service regardless of corpus size.', ge=1, le=1000)], alpha_override: Annotated[float, Field(None, description='Fixed alpha weight for cosine component in [0.0, 1.0]. If omitted, alpha is auto-calibrated from corpus entropy. Set to 1.0 to use pure cosine; 0.0 for pure NMI.', ge=0.0, le=1.0)], n_bins: Annotated[float, Field(16, description='Number of histogram bins used to discretize continuous dimensions when estimating NMI. Must be between 3 and 50.', ge=3, le=50)]) -> dict[str, Any]:
     """NMI-Cosine Fused Similarity Ranking"""
-    params = {"query_vector": query_vector, "corpus_vectors": corpus_vectors, "top_k": top_k, "alpha_override": alpha_override, "n_bins": n_bins}
-    return await _nexus_mcp_call_core('POST', '/v1/similarity/rank-nmi-cosine', params)
+    corpus_ids = [str(i) for i in range(len(corpus_vectors))]
+    request_obj = SimilaritySearchRequest(
+        query=CorpusVector(id="query", vector=query_vector),
+        corpus=[CorpusVector(id=cid, vector=vec) for cid, vec in zip(corpus_ids, corpus_vectors)],
+        top_k=int(top_k),
+        nmi_bins=int(n_bins),
+        alpha_override=alpha_override,
+    )
+    response = search_corpus_by_calibrated_similarity(request_obj, _key=_VALID_API_KEY)
+    return response.model_dump()
 
-@_nexus_mcp.tool(name='nexus_similarity_search_api_estimate_corpus_entropy_profile', description="Computes per-dimension marginal entropy H(X_d) and the aggregate joint entropy estimate H(X) for a corpus using src/math/information, returning the entropy profile and the auto-calibrated alpha that rank_items_by_nmi_cosine_fusion would apply. Use this before batch ranking jobs to inspect the corpus's information geometry and decide whether to override alpha or adjust n_bins. Do NOT use as a general statistics endpoint — it is scoped exclusively to the entropy quantities needed for NMI-cosine calibration.")
-async def estimate_corpus_entropy_profile(corpus_vectors: Annotated[list[list[float]], Field(..., description='List of dense numeric vectors for which to compute the entropy profile. Each inner array must be the same length. Maximum 500000 entries.', min_length=1, max_length=500000)], n_bins: Annotated[float, Field(16, description='Number of histogram bins for entropy discretization. Must match the n_bins value you intend to use in rank_items_by_nmi_cosine_fusion for the profile to be consistent.', ge=4, le=128)]) -> dict[str, Any]:
-    """Corpus Entropy Profile Estimator"""
-    params = {"corpus_vectors": corpus_vectors, "n_bins": n_bins}
-    return await _nexus_mcp_call_core('POST', '/v1/similarity/corpus-entropy-profile', params)
+@_nexus_mcp.tool(name='nexus_similarity_search_api_estimate_corpus_entropy_profile', description="Computes the aggregate entropy-calibrated alpha for a corpus without running a full search -- useful to inspect before committing to a large rank_items_by_nmi_cosine_fusion call. Returns a single aggregate corpus_entropy value, NOT a per-dimension breakdown -- the real logic only exposes the mean marginal entropy across dimensions, not H(X_d) per individual dimension. Do NOT use expecting per-dimension granularity.")
+async def estimate_corpus_entropy_profile(corpus_vectors: Annotated[list[list[float]], Field(..., description='List of dense numeric vectors for which to compute the aggregate entropy and calibrated alpha. Each inner array must be the same length. Maximum 500000 entries.', min_length=1, max_length=500000)], n_bins: Annotated[float, Field(16, description='Number of histogram bins for entropy discretization. Must be between 3 and 50; should match the n_bins used in rank_items_by_nmi_cosine_fusion for the profile to be consistent.', ge=3, le=50)]) -> dict[str, Any]:
+    """Corpus Entropy and Calibrated Alpha Estimator"""
+    corpus_ids = [str(i) for i in range(len(corpus_vectors))]
+    request_obj = AlphaCalibrateRequest(
+        corpus=[CorpusVector(id=cid, vector=vec) for cid, vec in zip(corpus_ids, corpus_vectors)],
+        nmi_bins=int(n_bins),
+    )
+    response = inspect_corpus_entropy_and_alpha(request_obj, _key=_VALID_API_KEY)
+    return response.model_dump()
 
-@_nexus_mcp.tool(name='nexus_similarity_search_api_score_pair_nmi_cosine', description='Computes the NMI-cosine fusion score and its decomposed components (cosine, NMI, auto-calibrated alpha) for exactly one (query, target) vector pair. Use for explainability, debugging, or unit-level validation of fusion scores before running full corpus ranking. Do NOT use in batch loops to score many pairs — each call recomputes entropy from scratch; use rank_items_by_nmi_cosine_fusion for multi-item ranking instead.')
-async def score_pair_nmi_cosine(vector_a: Annotated[list[float], Field(..., description='First dense numeric vector of the pair. Must have the same dimensionality as vector_b.', min_length=2, max_length=4096)], vector_b: Annotated[list[float], Field(..., description='Second dense numeric vector of the pair. Must have the same dimensionality as vector_a.', min_length=2, max_length=4096)], n_bins: Annotated[float, Field(16, description='Histogram bins for NMI discretization. Use the same value as in corpus-level calls to ensure score comparability.', ge=4, le=128)], alpha_override: Annotated[float, Field(None, description='Fixed alpha in [0.0, 1.0] for the fusion formula. If omitted, alpha is derived from the marginal entropies of the two vectors alone — note this differs from corpus-level alpha calibration.', ge=0.0, le=1.0)]) -> dict[str, Any]:
+@_nexus_mcp.tool(name='nexus_similarity_search_api_score_pair_nmi_cosine', description="Computes the NMI-cosine fusion score for exactly one (query, target) vector pair at a fixed alpha. Use for explainability, debugging, or unit-level validation of fusion scores before running full corpus ranking. Unlike corpus-level ranking, alpha is NOT auto-calibrated for a single pair -- the real logic requires a fixed alpha (default 0.5); pass alpha explicitly for a specific blend. Do NOT use in a loop to score many pairs; batch them into rank_items_by_nmi_cosine_fusion instead.")
+async def score_pair_nmi_cosine(vector_a: Annotated[list[float], Field(..., description='First dense numeric vector of the pair. Must have the same dimensionality as vector_b.', min_length=2, max_length=4096)], vector_b: Annotated[list[float], Field(..., description='Second dense numeric vector of the pair. Must have the same dimensionality as vector_a.', min_length=2, max_length=4096)], n_bins: Annotated[float, Field(16, description='Histogram bins for NMI discretization. Must be between 3 and 50.', ge=3, le=50)], alpha: Annotated[float, Field(0.5, description='Fixed alpha weight for the cosine component in [0.0, 1.0], applied as-is -- not auto-calibrated. Default 0.5 matches the core service default.', ge=0.0, le=1.0)]) -> dict[str, Any]:
     """Single-Pair NMI-Cosine Scorer"""
-    params = {"vector_a": vector_a, "vector_b": vector_b, "n_bins": n_bins, "alpha_override": alpha_override}
-    return await _nexus_mcp_call_core('POST', '/v1/similarity/score-pair', params)
-
-@_nexus_mcp.tool(name='nexus_similarity_search_api_find_outlier_vectors_by_nmi_deficit', description='Identifies vectors in a corpus whose NMI with the corpus centroid falls below a threshold, signaling low statistical dependence with the dominant corpus distribution. Useful for corpus quality auditing, deduplication preprocessing, and detecting off-distribution items before ranking. Do NOT use as a general anomaly detection tool — the NMI deficit metric is meaningful only relative to a shared embedding space where cosine proximity is also meaningful.')
-async def find_outlier_vectors_by_nmi_deficit(corpus_vectors: Annotated[list[list[float]], Field(..., description='Corpus of dense numeric vectors to audit for NMI-deficit outliers. All vectors must share the same dimensionality.', min_length=2, max_length=500000)], nmi_deficit_threshold: Annotated[float, Field(0.05, description='Minimum acceptable NMI score (in [0.0, 1.0]) between a vector and the corpus centroid. Vectors below this threshold are returned as outliers. Default 0.05 flags only strongly off-distribution items.', ge=0.0, le=1.0)], n_bins: Annotated[float, Field(16, description='Histogram bins for NMI estimation. Consistent with the value used in rank_items_by_nmi_cosine_fusion for comparable NMI scores.', ge=4, le=128)], return_scores: Annotated[bool, Field(True, description='If true, include the NMI deficit score for each outlier index in the response. Set false for minimal payloads when only the index list is needed.')]) -> dict[str, Any]:
-    """NMI-Deficit Outlier Detector"""
-    params = {"corpus_vectors": corpus_vectors, "nmi_deficit_threshold": nmi_deficit_threshold, "n_bins": n_bins, "return_scores": return_scores}
-    return await _nexus_mcp_call_core('POST', '/v1/similarity/outliers-nmi-deficit', params)
-
-@_nexus_mcp.tool(name='nexus_similarity_search_api_calibrate_alpha_from_query_entropy', description='Given a single query vector and a representative sample of the corpus, computes the entropy-derived alpha that rank_items_by_nmi_cosine_fusion would auto-assign for that query. Returns alpha, H(query), and the corpus entropy summary used in calibration. Use when you need deterministic, pre-computed alpha values for reproducible ranking pipelines or when logging calibration decisions for auditability. Do NOT use to calibrate alpha for a different corpus than the one that will be used in the subsequent ranking call — the alpha is corpus-distribution-specific.')
-async def calibrate_alpha_from_query_entropy(query_vector: Annotated[list[float], Field(..., description='The query vector for which alpha will be calibrated. Must match the dimensionality of corpus_sample vectors.', min_length=2, max_length=4096)], corpus_sample: Annotated[list[list[float]], Field(..., description='Representative sample of the corpus used to estimate the corpus entropy baseline. Does not need to be the full corpus — a sample of 1000-10000 vectors is sufficient for stable alpha calibration.', min_length=10, max_length=10000)], n_bins: Annotated[float, Field(16, description='Histogram bins for entropy estimation. Must match the n_bins used in the subsequent rank_items_by_nmi_cosine_fusion call for the calibrated alpha to be valid.', ge=4, le=128)]) -> dict[str, Any]:
-    """Per-Query Alpha Entropy Calibrator"""
-    params = {"query_vector": query_vector, "corpus_sample": corpus_sample, "n_bins": n_bins}
-    return await _nexus_mcp_call_core('POST', '/v1/similarity/calibrate-alpha', params)
+    request_obj = BatchScoreRequest(pairs=[(vector_a, vector_b)], alpha=alpha, nmi_bins=int(n_bins))
+    response = score_vector_pairs_with_fixed_alpha(request_obj, _key=_VALID_API_KEY)
+    return response.model_dump()
 
 
 # Crea el sub-app ASGI de streamable HTTP -- DEBE llamarse antes de
