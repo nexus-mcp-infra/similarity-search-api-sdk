@@ -1,0 +1,272 @@
+openapi: 3.1.0
+info:
+  title: Calibrated Similarity Search API
+  description: >-
+    Stateless NMI + cosine fusion similarity search with entropy-driven alpha
+    calibration. Generado del código fuente real deployado
+    (nexus-mcp-infra/similarity-search-api-sdk, core/similarity_search_api_api.py,
+    fetcheado 2026-07-17, commit 82292ebc1). Las 3 rutas core requieren pago x402
+    (USDC, Base Sepolia testnet, $0.01/call) además de X-API-Key. Esta API también
+    expone un servidor MCP en /mcp con 3 tools equivalentes (mismos 2 gates,
+    aplicados a mano) — no representable en OpenAPI, ver AGENTS.md sección MCP.
+  version: "1.0.0"
+servers:
+  - url: https://similarity-search-api-production.up.railway.app
+security:
+  - ApiKeyAuth: []
+paths:
+  /similarity/search:
+    post:
+      summary: Stateless NMI+cosine fusion search over an inline corpus
+      operationId: searchCorpusByCalibratedSimilarity
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SimilaritySearchRequest'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimilaritySearchResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '402':
+          $ref: '#/components/responses/PaymentRequired'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+        '503':
+          $ref: '#/components/responses/AuthNotConfigured'
+  /similarity/calibrate-alpha/v1:
+    post:
+      summary: Inspect entropy-calibrated alpha for a corpus before committing to a search
+      operationId: inspectCorpusEntropyAndAlpha
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AlphaCalibrateRequest'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AlphaCalibrationResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '402':
+          $ref: '#/components/responses/PaymentRequired'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+        '503':
+          $ref: '#/components/responses/AuthNotConfigured'
+  /similarity/batch-score:
+    post:
+      summary: Score up to 10,000 vector pairs with a fixed alpha — no corpus overhead
+      operationId: scoreVectorPairsWithFixedAlpha
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BatchScoreRequest'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BatchScoreResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '402':
+          $ref: '#/components/responses/PaymentRequired'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+        '503':
+          $ref: '#/components/responses/AuthNotConfigured'
+  /health:
+    get:
+      summary: Liveness probe — no auth required
+      operationId: livenessProbe
+      security: []
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ok
+                  version:
+                    type: string
+                    example: "1.0.0"
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+  responses:
+    Unauthorized:
+      description: API key inválida o ausente
+    PaymentRequired:
+      description: Falta pago x402 válido (USDC, Base Sepolia testnet) para esta ruta
+    ValidationError:
+      description: >-
+        Validación de request fallida (ej. dimensión de query no coincide con
+        corpus, vector con NaN/Inf, o norma cero)
+    AuthNotConfigured:
+      description: El servidor no tiene SIMILARITY_API_KEY configurada
+  schemas:
+    CorpusVector:
+      type: object
+      required: [id, vector]
+      properties:
+        id:
+          type: string
+          minLength: 1
+          maxLength: 256
+        vector:
+          type: array
+          items:
+            type: number
+          minItems: 2
+          maxItems: 4096
+          description: Debe ser finito (sin NaN/Inf) y de norma no nula.
+    SimilaritySearchRequest:
+      type: object
+      required: [query, corpus]
+      properties:
+        query:
+          $ref: '#/components/schemas/CorpusVector'
+        corpus:
+          type: array
+          items:
+            $ref: '#/components/schemas/CorpusVector'
+          minItems: 1
+          maxItems: 500000
+        top_k:
+          type: integer
+          default: 10
+          minimum: 1
+          maximum: 1000
+        nmi_bins:
+          type: integer
+          default: 10
+          minimum: 3
+          maximum: 50
+        alpha_override:
+          type: [number, "null"]
+          minimum: 0.0
+          maximum: 1.0
+          description: >-
+            Pin alpha manually [0,1]. If None, entropy-calibrated alpha is used.
+    SimilarityResult:
+      type: object
+      properties:
+        id:
+          type: string
+        composite_score:
+          type: number
+        cosine_similarity:
+          type: number
+        nmi_score:
+          type: number
+        rank:
+          type: integer
+    SimilaritySearchResponse:
+      type: object
+      properties:
+        results:
+          type: array
+          items:
+            $ref: '#/components/schemas/SimilarityResult'
+        calibrated_alpha:
+          type: number
+        corpus_entropy:
+          type: number
+        query_id:
+          type: string
+        corpus_size:
+          type: integer
+        latency_ms:
+          type: number
+        request_fingerprint:
+          type: string
+    AlphaCalibrateRequest:
+      type: object
+      required: [corpus]
+      properties:
+        corpus:
+          type: array
+          items:
+            $ref: '#/components/schemas/CorpusVector'
+          minItems: 1
+          maxItems: 500000
+        nmi_bins:
+          type: integer
+          default: 10
+          minimum: 3
+          maximum: 50
+    AlphaCalibrationResponse:
+      type: object
+      properties:
+        calibrated_alpha:
+          type: number
+        corpus_entropy:
+          type: number
+        corpus_size:
+          type: integer
+        vector_dim:
+          type: integer
+        latency_ms:
+          type: number
+    BatchScoreRequest:
+      type: object
+      required: [pairs]
+      properties:
+        pairs:
+          type: array
+          minItems: 1
+          maxItems: 10000
+          items:
+            type: array
+            minItems: 2
+            maxItems: 2
+            items:
+              type: array
+              items:
+                type: number
+          description: Lista de pares [vector_a, vector_b]; ambos vectores del par deben tener igual dimensión.
+        alpha:
+          type: number
+          default: 0.5
+          minimum: 0.0
+          maximum: 1.0
+        nmi_bins:
+          type: integer
+          default: 10
+          minimum: 3
+          maximum: 50
+    BatchScoreResponse:
+      type: object
+      properties:
+        scores:
+          type: array
+          items:
+            type: number
+        alpha_used:
+          type: number
+        pair_count:
+          type: integer
+        latency_ms:
+          type: number
