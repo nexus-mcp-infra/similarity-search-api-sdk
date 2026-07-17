@@ -585,7 +585,16 @@ app.mount("/", _nexus_mcp_asgi_app)
 
 # --- NEXUS: reporte de uso real a Stripe (inyectado por forge_output_saver_v6) ---
 # --- HOTFIX: excluir paths de monitoreo/sistema del billing (ver Fase 0.5) ---
-_NEXUS_BILLING_EXCLUDED_PATHS = {"/health", "/", "/docs", "/openapi.json", "/redoc", "/favicon.ico", "/similarity/search", "/similarity/calibrate-alpha/v1", "/similarity/batch-score"}  # x402 cubre estas 3 -- Stripe no debe cobrarlas de nuevo
+# --- NEXUS PATCH stripe_mcp_billing_exclusion ---
+# /mcp agregado como entrada explicita: el sub-app FastMCP montado en "/"
+# es Starlette puro (no FastAPI), nunca setea scope["route"] -- este
+# middleware compara contra request.url.path, que para cualquier request a
+# /mcp vale literalmente "/mcp" (el "/" ya presente en el set solo cubre la
+# URL raiz, no subrutas del mount). Sin esto, trafico de protocolo MCP
+# (initialize, tools/list -- ninguno pasa por gate de auth/pago) se
+# facturaba igual que una operacion de negocio real. Confirmado en Railway:
+# STRIPE_CUSTOMER_ID/STRIPE_EVENT_NAME/STRIPE_SECRET_KEY reales, modo test.
+_NEXUS_BILLING_EXCLUDED_PATHS = {"/health", "/", "/docs", "/openapi.json", "/redoc", "/favicon.ico", "/mcp", "/similarity/search", "/similarity/calibrate-alpha/v1", "/similarity/batch-score"}  # x402 cubre estas 3 -- Stripe no debe cobrarlas de nuevo
 @app.middleware("http")
 async def _nexus_usage_middleware(request, call_next):
     response = await call_next(request)
