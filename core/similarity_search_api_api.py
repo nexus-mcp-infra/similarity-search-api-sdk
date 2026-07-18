@@ -399,9 +399,11 @@ def score_vector_pairs_with_fixed_alpha(
     )
 
 
+# --- NEXUS PATCH health_openapi_security_override ---
 @app.get(
     "/health",
     summary="Liveness probe — no auth required",
+    openapi_extra={"security": []},
 )
 def liveness_probe() -> dict:
     return {"status": "ok", "version": "1.0.0"}
