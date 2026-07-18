@@ -1,11 +1,9 @@
 import httpx
-import time
 from typing import Any
 
-SIMILARITY_SEARCH_BASE_URL = "https://api.similaritysearch.nexus/v1"
-SIMILARITY_SEARCH_DEFAULT_TIMEOUT = 30.0
-SIMILARITY_SEARCH_MAX_RETRIES = 3
-SIMILARITY_SEARCH_RETRY_BACKOFF = 1.5
+SIMILARITY_SEARCH_API_BASE_URL = "https://api.similaritysearch.io/v1"
+DEFAULT_TIMEOUT_SECONDS = 30.0
+MAX_BATCH_SIZE = 500
 
 
 class SimilaritySearchAuthError(Exception):
@@ -16,229 +14,222 @@ class SimilaritySearchValidationError(Exception):
     pass
 
 
-class SimilaritySearchRateLimitError(Exception):
-    pass
-
-
 class SimilaritySearchAPIError(Exception):
-    def __init__(self, message: str, status_code: int | None = None, response_body: str | None = None):
-        super().__init__(message)
+    def __init__(self, status_code: int, message: str):
         self.status_code = status_code
-        self.response_body = response_body
+        super().__init__(f"API error {status_code}: {message}")
 
 
-def _validate_corpus_items(items: list[Any], param_name: str) -> None:
-    if not isinstance(items, list):
-        raise SimilaritySearchValidationError(
-            f"'{param_name}' must be a list, got {type(items).__name__}"
-        )
-    if len(items) == 0:
-        raise SimilaritySearchValidationError(
-            f"'{param_name}' must contain at least one item"
-        )
-    if len(items) > 500_000:
-        raise SimilaritySearchValidationError(
-            f"'{param_name}' exceeds the 500,000-item corpus limit (got {len(items)})"
-        )
-
-
-def _validate_top_k(top_k: int) -> None:
-    if not isinstance(top_k, int):
-        raise SimilaritySearchValidationError(
-            f"'top_k' must be an int, got {type(top_k).__name__}"
-        )
-    if top_k < 1 or top_k > 1000:
-        raise SimilaritySearchValidationError(
-            f"'top_k' must be between 1 and 1000 (got {top_k})"
-        )
-
-
-def _validate_alpha_override(alpha: float | None) -> None:
-    if alpha is None:
-        return
-    if not isinstance(alpha, (int, float)):
-        raise SimilaritySearchValidationError(
-            f"'alpha_override' must be a float between 0.0 and 1.0, got {type(alpha).__name__}"
-        )
-    if not (0.0 <= float(alpha) <= 1.0):
-        raise SimilaritySearchValidationError(
-            f"'alpha_override' must be between 0.0 and 1.0 (got {alpha})"
-        )
+class SimilaritySearchRateLimitError(SimilaritySearchAPIError):
+    pass
 
 
 class Client:
     def __init__(
         self,
         api_key: str,
-        base_url: str = SIMILARITY_SEARCH_BASE_URL,
-        timeout: float = SIMILARITY_SEARCH_DEFAULT_TIMEOUT,
-        max_retries: int = SIMILARITY_SEARCH_MAX_RETRIES,
+        base_url: str = SIMILARITY_SEARCH_API_BASE_URL,
+        timeout: float = DEFAULT_TIMEOUT_SECONDS,
     ):
         if not api_key or not isinstance(api_key, str):
             raise SimilaritySearchAuthError(
-                "A non-empty 'api_key' string is required to initialize the Client"
+                "api_key must be a non-empty string. "
+                "Obtain one at https://api.similaritysearch.io/keys"
             )
         self._api_key = api_key
         self._base_url = base_url.rstrip("/")
-        self._timeout = timeout
-        self._max_retries = max_retries
         self._http = httpx.Client(
             headers={
                 "Authorization": f"Bearer {self._api_key}",
                 "Content-Type": "application/json",
                 "Accept": "application/json",
-                "User-Agent": "similarity-search-sdk-python/1.0.0",
             },
-            timeout=self._timeout,
+            timeout=timeout,
         )
 
-    def _post_with_retry(self, endpoint: str, payload: dict[str, Any]) -> dict[str, Any]:
-        url = f"{self._base_url}{endpoint}"
-        last_exception: Exception | None = None
-
-        for attempt in range(self._max_retries):
-            try:
-                response = self._http.post(url, json=payload)
-            except httpx.TimeoutException as exc:
-                last_exception = SimilaritySearchAPIError(
-                    f"Request to {endpoint} timed out after {self._timeout}s (attempt {attempt + 1}/{self._max_retries})"
-                )
-                time.sleep(SIMILARITY_SEARCH_RETRY_BACKOFF ** attempt)
-                continue
-            except httpx.RequestError as exc:
-                raise SimilaritySearchAPIError(
-                    f"Network error reaching {endpoint}: {exc}"
-                ) from exc
-
-            if response.status_code == 401:
-                raise SimilaritySearchAuthError(
-                    "Invalid or expired API key. Verify the key passed to Client(api_key=...)"
-                )
-            if response.status_code == 422:
-                raise SimilaritySearchValidationError(
-                    f"Server rejected the request payload: {response.text}"
-                )
-            if response.status_code == 429:
-                retry_after = response.headers.get("Retry-After", "unknown")
-                raise SimilaritySearchRateLimitError(
-                    f"Rate limit exceeded. Retry after {retry_after}s. "
-                    "Consider batching requests or upgrading your plan."
-                )
-            if response.status_code >= 500:
-                last_exception = SimilaritySearchAPIError(
-                    f"Server error {response.status_code} on {endpoint} (attempt {attempt + 1}/{self._max_retries}): {response.text}",
-                    status_code=response.status_code,
-                    response_body=response.text,
-                )
-                time.sleep(SIMILARITY_SEARCH_RETRY_BACKOFF ** attempt)
-                continue
-            if not response.is_success:
-                raise SimilaritySearchAPIError(
-                    f"Unexpected status {response.status_code} from {endpoint}: {response.text}",
-                    status_code=response.status_code,
-                    response_body=response.text,
-                )
-
-            try:
-                return response.json()
-            except Exception as exc:
-                raise SimilaritySearchAPIError(
-                    f"Could not parse JSON response from {endpoint}: {response.text}"
-                ) from exc
-
-        raise last_exception or SimilaritySearchAPIError(
-            f"All {self._max_retries} attempts to {endpoint} failed"
-        )
-
-    def main_method(
-        self,
-        data: dict[str, Any],
-    ) -> dict[str, Any]:
-        if not isinstance(data, dict):
-            raise SimilaritySearchValidationError(
-                f"'data' must be a dict, got {type(data).__name__}. "
-                "Use search(), rank_corpus_by_nmi_cosine_fusion(), or compute_calibrated_alpha() for typed calls."
+    def _raise_for_status(self, response: httpx.Response) -> None:
+        if response.status_code == 401:
+            raise SimilaritySearchAuthError(
+                "Invalid or expired api_key. Check your credentials."
             )
-        return self._post_with_retry("/search", data)
+        if response.status_code == 422:
+            try:
+                detail = response.json().get("detail", response.text)
+            except Exception:
+                detail = response.text
+            raise SimilaritySearchValidationError(
+                f"Request payload rejected by the API: {detail}"
+            )
+        if response.status_code == 429:
+            retry_after = response.headers.get("Retry-After", "unknown")
+            raise SimilaritySearchRateLimitError(
+                response.status_code,
+                f"Rate limit exceeded. Retry after {retry_after} seconds.",
+            )
+        if response.status_code >= 500:
+            raise SimilaritySearchAPIError(
+                response.status_code,
+                f"Server error: {response.text[:200]}",
+            )
+        if response.status_code >= 400:
+            try:
+                detail = response.json().get("detail", response.text)
+            except Exception:
+                detail = response.text
+            raise SimilaritySearchAPIError(response.status_code, str(detail))
 
-    def search(
+    def _post(self, path: str, payload: dict) -> dict:
+        url = f"{self._base_url}{path}"
+        response = self._http.post(url, json=payload)
+        self._raise_for_status(response)
+        return response.json()
+
+    def hybrid_similarity_score(
         self,
-        query: str | list[float],
-        corpus: list[str | list[float]],
+        query: dict[str, Any],
+        corpus: list[dict[str, Any]],
         top_k: int = 10,
-        alpha_override: float | None = None,
-    ) -> dict[str, Any]:
-        if query is None:
-            raise SimilaritySearchValidationError("'query' must not be None")
-        if not isinstance(query, (str, list)):
+        categorical_features: list[str] | None = None,
+        continuous_features: list[str] | None = None,
+    ) -> dict:
+        if not query or not isinstance(query, dict):
             raise SimilaritySearchValidationError(
-                f"'query' must be a string or a list of floats, got {type(query).__name__}"
+                "query must be a non-empty dict mapping feature names to values."
             )
-        if isinstance(query, str) and len(query.strip()) == 0:
-            raise SimilaritySearchValidationError("'query' string must not be empty or whitespace")
-        _validate_corpus_items(corpus, "corpus")
-        _validate_top_k(top_k)
-        _validate_alpha_override(alpha_override)
+        if not corpus or not isinstance(corpus, list):
+            raise SimilaritySearchValidationError(
+                "corpus must be a non-empty list of dicts."
+            )
+        if len(corpus) > MAX_BATCH_SIZE:
+            raise SimilaritySearchValidationError(
+                f"corpus exceeds the maximum allowed size of {MAX_BATCH_SIZE} items. "
+                "Split into smaller batches."
+            )
+        if not all(isinstance(item, dict) for item in corpus):
+            raise SimilaritySearchValidationError(
+                "Every item in corpus must be a dict with the same schema as query."
+            )
+        if not isinstance(top_k, int) or top_k < 1:
+            raise SimilaritySearchValidationError(
+                "top_k must be a positive integer."
+            )
+        if top_k > len(corpus):
+            top_k = len(corpus)
 
         payload: dict[str, Any] = {
             "query": query,
             "corpus": corpus,
             "top_k": top_k,
         }
-        if alpha_override is not None:
-            payload["alpha_override"] = float(alpha_override)
-
-        return self._post_with_retry("/search", payload)
-
-    def rank_corpus_by_nmi_cosine_fusion(
-        self,
-        query: str | list[float],
-        corpus: list[str | list[float]],
-        top_k: int = 10,
-        alpha_override: float | None = None,
-    ) -> list[dict[str, Any]]:
-        response = self.search(
-            query=query,
-            corpus=corpus,
-            top_k=top_k,
-            alpha_override=alpha_override,
-        )
-        results = response.get("results")
-        if not isinstance(results, list):
-            raise SimilaritySearchAPIError(
-                f"Unexpected response shape from /search: missing 'results' list. Got keys: {list(response.keys())}"
-            )
-        return results
-
-    def compute_calibrated_alpha(
-        self,
-        corpus: list[str | list[float]],
-    ) -> dict[str, Any]:
-        _validate_corpus_items(corpus, "corpus")
-        return self._post_with_retry("/alpha", {"corpus": corpus})
-
-    def score_pair(
-        self,
-        item_a: str | list[float],
-        item_b: str | list[float],
-        alpha_override: float | None = None,
-    ) -> dict[str, Any]:
-        if item_a is None or item_b is None:
-            raise SimilaritySearchValidationError("'item_a' and 'item_b' must not be None")
-        for name, item in (("item_a", item_a), ("item_b", item_b)):
-            if not isinstance(item, (str, list)):
+        if categorical_features is not None:
+            if not isinstance(categorical_features, list) or not all(
+                isinstance(f, str) for f in categorical_features
+            ):
                 raise SimilaritySearchValidationError(
-                    f"'{name}' must be a string or a list of floats, got {type(item).__name__}"
+                    "categorical_features must be a list of feature name strings."
                 )
-            if isinstance(item, str) and len(item.strip()) == 0:
-                raise SimilaritySearchValidationError(f"'{name}' string must not be empty or whitespace")
-        _validate_alpha_override(alpha_override)
+            payload["categorical_features"] = categorical_features
+        if continuous_features is not None:
+            if not isinstance(continuous_features, list) or not all(
+                isinstance(f, str) for f in continuous_features
+            ):
+                raise SimilaritySearchValidationError(
+                    "continuous_features must be a list of feature name strings."
+                )
+            payload["continuous_features"] = continuous_features
 
-        payload: dict[str, Any] = {"item_a": item_a, "item_b": item_b}
-        if alpha_override is not None:
-            payload["alpha_override"] = float(alpha_override)
+        return self._post("/hybrid-score", payload)
 
-        return self._post_with_retry("/score", payload)
+    def batch_pairwise_hybrid_score(
+        self,
+        pairs: list[tuple[dict[str, Any], dict[str, Any]]],
+        categorical_features: list[str] | None = None,
+        continuous_features: list[str] | None = None,
+    ) -> dict:
+        if not pairs or not isinstance(pairs, list):
+            raise SimilaritySearchValidationError(
+                "pairs must be a non-empty list of (query, candidate) dict tuples."
+            )
+        if len(pairs) > MAX_BATCH_SIZE:
+            raise SimilaritySearchValidationError(
+                f"pairs exceeds the maximum allowed size of {MAX_BATCH_SIZE}. "
+                "Split into smaller batches."
+            )
+        serialized_pairs = []
+        for i, pair in enumerate(pairs):
+            if (
+                not isinstance(pair, (tuple, list))
+                or len(pair) != 2
+                or not isinstance(pair[0], dict)
+                or not isinstance(pair[1], dict)
+            ):
+                raise SimilaritySearchValidationError(
+                    f"pairs[{i}] must be a 2-element tuple of dicts (query, candidate)."
+                )
+            if not pair[0] or not pair[1]:
+                raise SimilaritySearchValidationError(
+                    f"pairs[{i}] contains an empty dict. Both query and candidate must "
+                    "have at least one feature."
+                )
+            serialized_pairs.append({"query": pair[0], "candidate": pair[1]})
+
+        payload: dict[str, Any] = {"pairs": serialized_pairs}
+        if categorical_features is not None:
+            if not isinstance(categorical_features, list) or not all(
+                isinstance(f, str) for f in categorical_features
+            ):
+                raise SimilaritySearchValidationError(
+                    "categorical_features must be a list of feature name strings."
+                )
+            payload["categorical_features"] = categorical_features
+        if continuous_features is not None:
+            if not isinstance(continuous_features, list) or not all(
+                isinstance(f, str) for f in continuous_features
+            ):
+                raise SimilaritySearchValidationError(
+                    "continuous_features must be a list of feature name strings."
+                )
+            payload["continuous_features"] = continuous_features
+
+        return self._post("/batch-pairwise-score", payload)
+
+    def detect_feature_schema(self, sample: list[dict[str, Any]]) -> dict:
+        if not sample or not isinstance(sample, list):
+            raise SimilaritySearchValidationError(
+                "sample must be a non-empty list of dicts representing corpus rows."
+            )
+        if len(sample) > MAX_BATCH_SIZE:
+            raise SimilaritySearchValidationError(
+                f"sample size exceeds {MAX_BATCH_SIZE}. Provide a representative subset."
+            )
+        if not all(isinstance(row, dict) for row in sample):
+            raise SimilaritySearchValidationError(
+                "Every item in sample must be a dict."
+            )
+        return self._post("/detect-schema", {"sample": sample})
+
+    def main_method(
+        self,
+        data: dict[str, Any],
+    ) -> dict:
+        if not data or not isinstance(data, dict):
+            raise SimilaritySearchValidationError(
+                "data must be a non-empty dict with keys 'query', 'corpus', "
+                "and optionally 'top_k', 'categorical_features', 'continuous_features'."
+            )
+        missing = [k for k in ("query", "corpus") if k not in data]
+        if missing:
+            raise SimilaritySearchValidationError(
+                f"data is missing required keys: {missing}. "
+                "Expected at minimum: 'query' (dict) and 'corpus' (list of dicts)."
+            )
+        return self.hybrid_similarity_score(
+            query=data["query"],
+            corpus=data["corpus"],
+            top_k=data.get("top_k", 10),
+            categorical_features=data.get("categorical_features"),
+            continuous_features=data.get("continuous_features"),
+        )
 
     def close(self) -> None:
         self._http.close()
@@ -246,5 +237,5 @@ class Client:
     def __enter__(self) -> "Client":
         return self
 
-    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+    def __exit__(self, *args: Any) -> None:
         self.close()
