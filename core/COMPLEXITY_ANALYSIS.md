@@ -1,18 +1,31 @@
-# Análisis de Complejidad Computacional — Similarity Search API
+# Análisis de Complejidad Computacional — Hybrid Similarity Search API
 
 ## Endpoints Públicos
 
-### `POST /similarity/score` — Score par a par
-**Temporal:** O(d + n log n) donde `d` = dimensiones del embedding (cosine en O(d)) y `n` = tamaño del vocabulario de tokens para cálculo de H(X), H(Y), H(X,Y) vía histograma discretizado. **Espacial:** O(n) para tablas de frecuencia conjunta. Mejor caso: embeddings pre-normalizados con vocabulario reducido (n < 1k), O(d). Promedio: O(d + n log n) con n ≈ 5k–20k tokens únicos. Peor caso: corpus denso con n → 50k tokens y d = 1536, donde el cálculo de entropía conjunta domina por factor ~8x sobre cosine. **Cuello de botella:** construcción de la distribución conjunta P(X,Y) para H(X,Y) — requiere doble iteración sobre tokens co-ocurrentes; no paralelizable trivialmente en CPU single-core.
+### `POST /score` — Score híbrido NMI + Cosine para un par de items
 
-### `POST /similarity/batch` — Score sobre corpus completo (hasta 500k ítems)
-**Temporal:** O(N · (d + n log n)) donde N = número de ítems del corpus. Sin índice persistente, cada request recomputa cosine y NMI para cada ítem contra la query — complejidad lineal en N, no sublineal. **Espacial:** O(N · d) para materializar embeddings en memoria por request, más O(n) auxiliar para entropía. Mejor caso: N < 1k, ejecuta en < 50ms. Promedio: N ≈ 50k, ~800ms–1.2s. Peor caso: N = 500k con d = 1536, ~12–18s sin optimización vectorizada — inaceptable sin numpy batching. **Cuello de botella:** ausencia de índice invierte la ventaja stateless en penalización de latencia a N > 100k; el cálculo de alpha por entropía marginal del corpus completo añade O(N · n) adicional sobre el ya costoso paso de scoring.
+**Complejidad temporal:** O(F_cat · N_cat + F_cont · d) donde F_cat es el número de features categóricas, N_cat el número de categorías únicas por feature, y d la dimensión del espacio continuo. El cálculo de NMI requiere construir la tabla de contingencia por feature (O(N_cat²) en el peor caso con cardinalidad máxima), mientras que Cosine opera en O(d). **Mejor caso:** features continuas puras, degrada a O(d) puro. **Peor caso:** features categóricas de alta cardinalidad con N_cat >> d, donde la entropía conjunta domina. **Cuello de botella:** construcción de la tabla de contingencia por feature categórica — no vectorizable con BLAS, rompe el pipeline de operaciones matriciales.
 
-### `GET /similarity/calibrate` — Calibración de alpha por entropía del corpus
-**Temporal:** O(N · n log n) para calcular H(corpus) como entropía marginal agregada sobre todos los ítems — suma de entropías individuales ponderadas. **Espacial:** O(n) — solo acumula distribución de frecuencia global, no almacena corpus. Mejor caso: corpus homogéneo donde entropías individuales convergen rápido (baja varianza), O(N · n). Peor caso: corpus semánticamente disperso con n_max por ítem, requiere recalcular tabla de frecuencias por ítem sin reutilización entre llamadas. **Cuello de botella:** H_max requiere conocer el soporte completo del vocabulario; si el corpus llega fragmentado en múltiples requests, la estimación de H_max es aproximada y degrada la calibración de alpha.
+**Complejidad espacial:** O(F_cat · N_cat²) para las tablas de contingencia + O(d) para los vectores continuos. Stateless: ninguna estructura persiste entre llamadas.
 
 ---
 
-## Saturación y Escalado
+### `POST /batch_score` — Score híbrido sobre corpus de hasta N items contra una query
 
-Con un servidor FastAPI de 4 workers en una instancia c5.xlarge (4 vCPU), el punto de saturación estimado es **~35–50 req/s para `/similarity/score`** (N=1, d=768) y **~2–4 req/s para `/similarity/batch`** con N=50k. El cuello de botella no es I/O sino CPU en el cálculo de entropía conjunta. La estrategia de escala prioritaria es vectorizar la construcción de P(X,Y) con `numpy.histogramdd` sobre batches de pares, precalcular y cachear H(corpus) con TTL por hash de corpus cuando el cliente envía el mismo dataset en requests sucesivos, y exponer `calibrate` como llamada separada para que el cliente amortice su costo O(N · n log n) una sola vez por corpus estable.
+**Complejidad temporal:** O(N · (F_cat · N_cat + F_cont · d)) — lineal en el tamaño del corpus. La detección automática de tipos y calibración de pesos w_cat, w_cont se ejecuta una vez sobre el corpus completo en O(N · F) y se reutiliza para todos los pares; sin este memoizado interno por request, el coste sería O(N² · F). **Mejor caso:** corpus homogéneo continuo, O(N · d). **Promedio:** datasets mixtos reales, O(N · 500 · 50) para F_cat=10, N_cat=50, d=384. **Peor caso:** corpus de N=500 items con features categóricas de cardinalidad 200+, donde el coste de NMI escala cuadráticamente en N_cat. **Cuello de botella:** la calibración de pesos w sobre el corpus completo — es el único paso no paralelizable dentro del request porque requiere estadísticas globales del corpus antes de puntuar cada par.
+
+**Complejidad espacial:** O(N · F) para materializar el corpus en memoria + O(F_cat · N_cat²) para las tablas de contingencia — el caso límite real es ~50 MB para N=500, F=50, N_cat=100.
+
+---
+
+### `POST /detect_feature_types` — Inferencia automática de tipos y pesos w
+
+**Complejidad temporal:** O(N · F) — un pase lineal sobre el corpus para calcular entropía por columna y ratio continuo/categórico. Sin caso patológico conocido dado que no hay estructuras cuadráticas. **Cuello de botella:** I/O de deserialización JSON del corpus, no el cálculo estadístico.
+
+**Complejidad espacial:** O(F) — solo acumula contadores por columna.
+
+---
+
+## Punto de Saturación y Estrategia de Escala
+
+Con un corpus de N=500 y F=30 features mixtas, el coste dominante por request es ~12–40 ms de CPU pura (tabla de contingencia NMI), lo que sitúa el punto de saturación en **25–80 req/s por instancia single-core** antes de que la cola de Uvicorn empiece a crecer. Para escalar más allá: (1) paralelizar el cálculo de NMI por feature categórica con `concurrent.futures.ProcessPoolExecutor` dado que cada tabla de contingencia es independiente, reduciendo el cuello de botella a O(max_F_cat · N_cat) en vez de O(sum); (2) cachear los vectores de pesos w_cat/w_cont por hash del esquema de features detectado — en pipelines de CI donde el schema es estable, esto convierte `batch_score` en O(N · d) efectivo desde la segunda llamada.
