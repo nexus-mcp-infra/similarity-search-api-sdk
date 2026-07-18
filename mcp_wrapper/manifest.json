@@ -1,16 +1,16 @@
 {
   "name": "nexus-similarity-search-api",
   "description_variants": {
-    "claude": "Calcula similitud semántica calibrada por entropía entre ítems de texto usando fusión NMI + cosine sin base de datos vectorial ni estado persistente, retornando un score compuesto con alpha ajustado automáticamente al corpus.",
-    "gpt": "Stateless HTTP API that computes entropy-calibrated semantic similarity scores by fusing Normalized Mutual Information and cosine similarity per-call, requiring no vector database or persistent infrastructure.",
-    "gemini": "Per-call similarity scoring tool that combines NMI-based statistical dependence with cosine geometric alignment, auto-calibrating the fusion weight from corpus entropy for corpora up to 500k items."
+    "claude": "Calcula un score de similitud híbrido NMI+Cosine estadísticamente coherente para datasets mixtos (texto + categórico) en una sola llamada stateless, sin infraestructura de índice persistente.",
+    "gpt": "Unified similarity scorer that fuses Normalized Mutual Information for categorical features and Cosine similarity for continuous features into a single weighted hybrid score per call, no vector DB required.",
+    "gemini": "Stateless hybrid similarity API combining NMI (categorical) and Cosine (continuous) into one mathematically grounded score for mixed-feature datasets, callable per-operation without persistent index setup."
   },
   "token_efficiency_ratio": 31.0,
-  "value_equivalent": "$47 por hora de trabajo manual ahorrado",
+  "value_equivalent": "$38 por hora de trabajo manual ahorrado",
   "invocation_examples": [
-    "Encuentra los 10 documentos más similares a esta consulta en mi corpus de 8000 artículos sin montar una base de datos vectorial",
-    "Dado este conjunto de 200 descripciones de producto, calcula la matriz de similitud calibrada por entropía para detectar duplicados semánticos",
-    "Compara estas dos listas de términos técnicos y devuelve el score compuesto NMI+cosine con el alpha óptimo para este vocabulario"
+    "Dado este catálogo de productos con campos de texto y categorías, encuentra los 5 más similares a este ítem sin montar una base de datos vectorial",
+    "Compara estos dos perfiles de usuario con features mixtas (edad, ciudad, historial de texto) y dame un score de similitud unificado",
+    "Rankea estos candidatos respecto a esta descripción de puesto combinando similitud semántica del CV con coincidencia categórica de skills y ubicación"
   ],
   "pricing": {
     "model": "variable",
