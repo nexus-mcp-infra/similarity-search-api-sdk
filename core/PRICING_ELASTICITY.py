@@ -1,169 +1,144 @@
 import numpy as np
 from scipy.optimize import minimize_scalar
 from dataclasses import dataclass
-from typing import NamedTuple
+from typing import Tuple
 
-# Parametros de mercado especificos para Similarity Search API stateless
-P_MIN = 0.001   # USD por operacion (floor: debajo no cubre infra)
-P_MAX = 0.05    # USD por operacion (ceiling: developer abandona y monta sklearn)
-Q_MIN = 1_000   # operaciones/mes por cliente (long tail)
-Q_MAX = 10_000_000  # operaciones/mes por cliente (plataformas)
+# src/math/information: entropia marginal calibra alpha en cada request
+# H(X) = -sum(p * log2(p)), base natural para NMI normalizado
+def corpus_entropy(token_freq: np.ndarray) -> float:
+    p = token_freq / token_freq.sum()
+    p = p[p > 0]
+    return float(-np.sum(p * np.log2(p)))
 
-# Elasticidad empirica para developer tools de infraestructura API-first
-# Rango [-2.1, -1.4]: mas elastico que SaaS B2B (-0.8) porque el developer
-# tiene alternativa DIY real (sklearn+scipy), menos que commodity puro (-3.0)
-EPSILON_BASE = -1.7  # punto medio empirico, validado en benchmarks de RapidAPI/Stripe
-
-# Escala de demanda: calibrada para Q_ref operaciones a P_ref
-P_REF = 0.005   # precio de referencia (mid-market actual para vector search)
-Q_REF = 500_000  # operaciones/mes por cliente en P_REF (mediana segmento mid)
-
+# alpha = H(corpus) / (H(corpus) + H_max): mayor entropia -> mayor peso cosine
+def calibrate_alpha(h_corpus: float, h_max: float) -> float:
+    if h_max <= 0:
+        raise ValueError(f"h_max debe ser > 0, recibido: {h_max}")
+    return h_corpus / (h_corpus + h_max)
 
 @dataclass
-class DemandPoint:
-    price: float
-    quantity: float
-    revenue: float
-    elasticity: float
+class SimilaritySearchDemandParams:
+    # Willingness-to-pay range: $0.001-$0.05 por operacion
+    wtp_min: float = 0.001
+    wtp_max: float = 0.050
+    # Volumen mensual por cliente: 1K-10M operaciones
+    vol_min: float = 1_000
+    vol_max: float = 10_000_000
+    # Elasticidad empirica developer tools: tipicamente -1.2 a -2.5
+    base_elasticity: float = -1.8
+    # Tamano del mercado: desarrolladores con corpus 10k-500k items
+    market_size_clients: int = 8_500
 
+@dataclass
+class AdoptionScenario:
+    name: str
+    corpus_size: int          # items en el corpus
+    ops_per_month: float      # operaciones/mes por cliente
+    price_sensitivity: float  # multiplicador sobre elasticidad base
+    freemium_ops_free: int    # operaciones gratis en tier freemium
+    conversion_rate: float    # fraccion que convierte a paid
 
-class AdoptionScenario(NamedTuple):
-    label: str
-    epsilon: float      # elasticidad propia del segmento
-    q_ref_scale: float  # multiplicador sobre Q_REF
-    freemium_ops: int   # operaciones gratuitas/mes antes de conversion
-
-
-def demand_quantity(price: float, epsilon: float, q_ref_scale: float = 1.0) -> float:
-    """
-    Q(P) = Q_ref * (P / P_ref)^epsilon
-    Forma potencia: unica funcion de demanda con elasticidad constante en log-log.
-    Garantiza Q > 0 para todo P > 0, sin discontinuidades en el rango de interes.
-    """
+def demand_curve(price: float, params: SimilaritySearchDemandParams, sensitivity: float) -> float:
+    # Q(P) = Q_ref * (P / P_ref)^epsilon: ley de potencia sobre precio
     if price <= 0:
-        raise ValueError(f"Price must be positive, got {price}")
-    q_ref = Q_REF * q_ref_scale
-    return q_ref * (price / P_REF) ** epsilon
+        raise ValueError(f"price debe ser > 0, recibido: {price}")
+    p_ref = (params.wtp_min + params.wtp_max) / 2.0   # $0.0255 precio de referencia
+    q_ref = np.sqrt(params.vol_min * params.vol_max)   # media geometrica: ~100k ops
+    epsilon = params.base_elasticity * sensitivity
+    return float(q_ref * (price / p_ref) ** epsilon)
 
+def price_elasticity(price: float, params: SimilaritySearchDemandParams, sensitivity: float) -> float:
+    # epsilon = (dQ/dP) * (P/Q): analitico desde demanda potencia -> igual al exponente
+    epsilon = params.base_elasticity * sensitivity
+    return epsilon  # para curva potencia, elasticidad es constante = exponente
 
-def point_elasticity(price: float, epsilon: float) -> float:
-    # Con demanda potencia, elasticidad es constante = epsilon (propiedad algebraica)
-    return epsilon
+def revenue(price: float, params: SimilaritySearchDemandParams, sensitivity: float) -> float:
+    # R(P) = P * Q(P) * N_clientes: revenue total del mercado
+    q = demand_curve(price, params, sensitivity)
+    return price * q * params.market_size_clients
 
-
-def revenue(price: float, epsilon: float, q_ref_scale: float = 1.0) -> float:
-    return price * demand_quantity(price, epsilon, q_ref_scale)
-
-
-def optimal_price(epsilon: float, q_ref_scale: float = 1.0) -> DemandPoint:
-    """
-    max R(P) = P * Q(P) en [P_MIN, P_MAX]
-    Con elasticidad constante, el maximo analitico es P* -> infinito si |epsilon| < 1,
-    pero el mercado impone P_MAX como barrera conductual (DIY becomes cheaper).
-    Usamos optimizacion numerica para respetar los bounds del mercado real.
-    """
+def optimal_price(params: SimilaritySearchDemandParams, sensitivity: float) -> Tuple[float, float, float]:
+    # max R(P) en [wtp_min, wtp_max] via Brent: sin supuesto de forma analitica
     result = minimize_scalar(
-        lambda p: -revenue(p, epsilon, q_ref_scale),
-        bounds=(P_MIN, P_MAX),
+        lambda p: -revenue(p, params, sensitivity),
+        bounds=(params.wtp_min, params.wtp_max),
         method="bounded"
     )
-    p_star = result.x
-    q_star = demand_quantity(p_star, epsilon, q_ref_scale)
-    return DemandPoint(
-        price=p_star,
-        quantity=q_star,
-        revenue=p_star * q_star,
-        elasticity=point_elasticity(p_star, epsilon)
-    )
+    p_star = float(result.x)
+    q_star = demand_curve(p_star, params, sensitivity)
+    r_star = revenue(p_star, params, sensitivity)
+    return p_star, q_star, r_star
 
+def freemium_conversion_threshold(scenario: AdoptionScenario, params: SimilaritySearchDemandParams) -> float:
+    # Punto de equilibrio: revenue_paid >= costo_oportunidad de ops gratuitas
+    # P_breakeven tal que P * (Q - Q_free) = 0 -> P_breakeven donde conversion se sostiene
+    # Derivado de: conversion_rate * ops_per_month * P = freemium_ops_free * P_marginal_cost
+    # P_marginal_cost estimado: O(n log n) compute ~ $0.0003 por op en 500k items
+    marginal_cost_per_op = 3e-4
+    numerator = scenario.freemium_ops_free * marginal_cost_per_op
+    denominator = scenario.conversion_rate * (scenario.ops_per_month - scenario.freemium_ops_free)
+    if denominator <= 0:
+        raise ValueError("ops_per_month debe superar freemium_ops_free para calcular breakeven")
+    return float(numerator / denominator)
 
-def freemium_conversion_threshold(
-    scenario: AdoptionScenario,
-    cost_per_op_usd: float = 0.0003  # costo marginal infra (GPU serverless p99)
-) -> dict:
-    """
-    Punto de equilibrio freemium -> paid:
-    El usuario convierte cuando su volumen supera freemium_ops Y el valor marginal
-    del hybrid NMI+Cosine scorer justifica el precio vs ensamblar DIY.
-    
-    Condicion de conversion: R(P*) >= cost_per_op * freemium_ops
-    Volumen minimo para que el precio optimo cubra el subsidio freemium.
-    """
-    p_star_point = optimal_price(scenario.epsilon, scenario.q_ref_scale)
-    
-    # Ops en las que el revenue cubre el costo del tier gratuito
-    breakeven_ops = cost_per_op_usd * scenario.freemium_ops / p_star_point.price
-    
-    # Fraccion de usuarios free que convierte (modelo logistico empirico dev tools)
-    # Basado en conversion rates de Stripe (3.2%), Twilio (4.1%), Pinecone (2.8%)
-    conversion_rate = 0.034  # media del segmento API infrastructure
-    paying_clients_at_breakeven = breakeven_ops * conversion_rate
-    
+def simulate_scenario(scenario: AdoptionScenario, params: SimilaritySearchDemandParams) -> dict:
+    p_star, q_star, r_star = optimal_price(params, scenario.price_sensitivity)
+    eps = price_elasticity(p_star, params, scenario.price_sensitivity)
+    breakeven_price = freemium_conversion_threshold(scenario, params)
+    monthly_revenue_per_client = p_star * scenario.ops_per_month * scenario.conversion_rate
     return {
-        "optimal_price_usd": round(p_star_point.price, 6),
-        "breakeven_ops_per_client": round(breakeven_ops),
-        "conversion_rate_empirical": conversion_rate,
-        "estimated_paying_clients_per_1000_free": round(paying_clients_at_breakeven, 1),
-        "monthly_revenue_at_breakeven_usd": round(
-            paying_clients_at_breakeven * p_star_point.revenue, 2
-        )
+        "scenario": scenario.name,
+        "corpus_size": scenario.corpus_size,
+        "optimal_price_per_op": round(p_star, 5),
+        "elasticity_at_optimum": round(eps, 3),
+        "market_revenue_monthly": round(r_star, 2),
+        "revenue_per_client_monthly": round(monthly_revenue_per_client, 2),
+        "freemium_breakeven_price": round(breakeven_price, 6),
+        "freemium_viable": breakeven_price < p_star,
     }
 
-
-# EXACTAMENTE 3 escenarios de adopcion para Similarity Search API
-ADOPTION_SCENARIOS = [
+# EXACTAMENTE 3 escenarios de adopcion: early-adopter, growth, scale
+SCENARIOS = [
     AdoptionScenario(
-        label="CI_pipeline_ephemeral",       # Tests de regresion semantica en CI, batch < 5K ops
-        epsilon=-1.4,                         # Menos elastico: el dolor de montar infra es alto
-        q_ref_scale=0.12,                     # 60K ops/mes mediana (PR frequency * batch size)
-        freemium_ops=10_000                   # Tier free: 10K ops/mes suficiente para validar
+        name="early_adopter_small_corpus",
+        corpus_size=10_000,
+        ops_per_month=5_000,
+        price_sensitivity=0.85,    # menos sensible: dolor alto, alternativas caras
+        freemium_ops_free=1_000,
+        conversion_rate=0.12,
     ),
     AdoptionScenario(
-        label="realtime_recommendation_midmarket",  # SaaS con catalogo mixto texto+categorico
-        epsilon=-1.7,                               # Elasticidad base: tiene alternativa Pinecone
-        q_ref_scale=1.0,                            # 500K ops/mes (Q_REF exacto)
-        freemium_ops=50_000                         # Tier free: 50K ops/mes para PoC de 2 semanas
+        name="growth_mid_corpus",
+        corpus_size=150_000,
+        ops_per_month=200_000,
+        price_sensitivity=1.00,    # elasticidad base: mercado competitivo
+        freemium_ops_free=10_000,
+        conversion_rate=0.07,
     ),
     AdoptionScenario(
-        label="batch_dedup_data_platform",    # Deduplicacion de datasets > 1M registros
-        epsilon=-2.1,                          # Mas elastico: volumen alto, sensible al precio
-        q_ref_scale=8.0,                       # 4M ops/mes (corpus grandes, corridas periodicas)
-        freemium_ops=100_000                   # Tier free: 100K ops/mes para benchmark inicial
+        name="scale_large_corpus",
+        corpus_size=480_000,
+        ops_per_month=3_000_000,
+        price_sensitivity=1.30,    # mas sensible: volumen alto, negocian precio
+        freemium_ops_free=50_000,
+        conversion_rate=0.04,
     ),
 ]
 
-
-def simulate_scenario(scenario: AdoptionScenario) -> dict:
-    p_opt = optimal_price(scenario.epsilon, scenario.q_ref_scale)
-    freemium = freemium_conversion_threshold(scenario)
-    
-    # Curva de demanda en 5 puntos representativos del rango de mercado
-    price_grid = np.linspace(P_MIN, P_MAX, 5)
-    demand_curve = [
-        DemandPoint(
-            price=float(p),
-            quantity=demand_quantity(float(p), scenario.epsilon, scenario.q_ref_scale),
-            revenue=revenue(float(p), scenario.epsilon, scenario.q_ref_scale),
-            elasticity=point_elasticity(float(p), scenario.epsilon)
-        )
-        for p in price_grid
-    ]
-    
-    return {
-        "scenario": scenario.label,
-        "epsilon": scenario.epsilon,
-        "optimal_price_usd": round(p_opt.price, 6),
-        "optimal_quantity_ops_month": round(p_opt.quantity),
-        "max_monthly_revenue_usd": round(p_opt.revenue, 2),
-        "freemium_equilibrium": freemium,
-        "demand_curve_sample": [
-            {"price": round(d.price, 4), "ops_month": round(d.quantity), "revenue_usd": round(d.revenue, 2)}
-            for d in demand_curve
-        ]
-    }
-
-
 if __name__ == "__main__":
-    import json
-    results = [simulate_scenario(s) for s in ADOPTION_SCENARIOS]
-    print(json.dumps(results, indent=2))
+    params = SimilaritySearchDemandParams()
+
+    # Validacion de calibracion alpha con entropia sintetica del corpus
+    synthetic_freqs = np.random.dirichlet(np.ones(1000)) * 480_000
+    h_corpus = corpus_entropy(synthetic_freqs)
+    h_max = np.log2(len(synthetic_freqs))
+    alpha = calibrate_alpha(h_corpus, h_max)
+    print(f"alpha calibrado (corpus 480k items): {alpha:.4f}")
+    print(f"H(corpus)={h_corpus:.3f} bits, H_max={h_max:.3f} bits")
+    print()
+
+    for scenario in SCENARIOS:
+        result = simulate_scenario(scenario, params)
+        for k, v in result.items():
+            print(f"  {k}: {v}")
+        print()

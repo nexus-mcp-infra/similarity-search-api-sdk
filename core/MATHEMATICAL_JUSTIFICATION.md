@@ -1,31 +1,25 @@
-# Justificación Matemática — Similarity Search API (Hybrid NMI+Cosine Scorer)
+# Justificación Matemática: Similarity Search API
 
----
+## 1. Máximo 5 Endpoints (Hick's Law)
 
-## 1. Máximo 5 Endpoints — Hick's Law
+El tiempo de decisión de integración sigue $T = b \cdot \log_2(n+1)$. Con $n=5$ endpoints, $T \approx 2.58b$; con $n=10$, $T \approx 3.46b$ — un 34% más de fricción cognitiva sin añadir cobertura funcional. Para esta primitiva, las operaciones atómicas son exactamente cinco: compute similarity, batch similarity, calibrate alpha, introspect entropy, health. Cualquier endpoint adicional colapsa una de estas responsabilidades en ambigüedad, no en potencia.
 
-El tiempo de decisión de un developer al integrar una API sigue $T = b \cdot \log_2(n+1)$, donde $n$ es el número de opciones cognitivas disponibles. Con 5 endpoints, $T \approx b \cdot 2.58$; con 10, $T \approx b \cdot 3.46$ — un 34% más de fricción de integración sin ganancia funcional. Para esta primitiva stateless, la superficie mínima correcta es: `score_hybrid_batch`, `score_hybrid_pair`, `detect_feature_schema`, `calibrate_weights`, `health` — cada uno con responsabilidad no solapada y sin estado compartido entre llamadas.
+## 2. Pricing Per-Call vs Por Asiento (Elasticidad Precio-Demanda)
 
----
+La elasticidad $\varepsilon = \frac{\partial Q / Q}{\partial P / P}$ para infraestructura de búsqueda stateless es alta en el margen: el developer con corpus de 10k documentos no activa una suscripción fija mensual, pero sí paga por 500 llamadas si el costo marginal es menor que el costo de setup alternativo (Pinecone: ~$70/mes mínimo). El modelo per-call captura exactamente el excedente del consumidor en corpora pequeños y medianos — el segmento donde esta primitiva tiene ventaja estructural — sin subsidiar casos de uso de alto volumen con infraestructura propia.
 
-## 2. Pricing Per-Call vs Por Asiento — Elasticidad Precio-Demanda
+## 3. Estructura de Datos y Complejidad Algorítmica
 
-La elasticidad precio-demanda para infraestructura de búsqueda efímera es alta en la dimensión de volumen y baja en la dimensión de asiento: un equipo de 3 devs puede generar $10^5$ llamadas/día o 0, dependiendo del pipeline. El modelo por asiento cobra la media de una distribución bimodal, extrayendo valor subóptimo. Per-call alinea el coste marginal del proveedor ($\approx O(n \cdot d)$ por batch de $n$ items en $d$ dimensiones) con el ingreso marginal, maximizando el excedente del productor sin distorsionar el volumen de uso del comprador.
-
----
-
-## 3. Estructura de Datos — Complejidad Algorítmica
-
-El scorer stateless recibe el corpus como matriz densa $X \in \mathbb{R}^{n \times d_c}$ para features continuas y tabla de frecuencias conjuntas $C \in \mathbb{Z}^{n \times d_k}$ para categóricas. Cosine sobre $X$ tiene complejidad $O(n^2 d_c)$ con producto matricial BLAS; NMI sobre $C$ requiere $O(n^2 k)$ donde $k$ es la cardinalidad media de categorías. Separar los dos espacios de representación antes de fusionar evita el coste de $O(n^2(d_c + k))$ sobre una matriz unificada mal tipada, y permite paralelizar los dos cómputos independientemente antes del merge ponderado.
-
----
+El score compuesto $S = \alpha \cdot \cos(\mathbf{u}, \mathbf{v}) + (1-\alpha) \cdot \text{NMI}(X, Y)$ requiere dos estructuras: vectores densos para cosine ($O(d)$ por par, donde $d$ es dimensión de embedding) y tablas de frecuencia conjunta para NMI ($O(n \log n)$ para construir $H(X,Y)$ via sort-and-count sobre $n$ ítems del corpus entrante). El diseño stateless obliga a que ambas estructuras vivan en memoria de request — lo que fuerza el límite de 500k ítems: más allá, $O(n \log n)$ en RAM de un solo worker supera 2GB con vectores float32 de dimensión 768.
 
 ## 4. Invariante Matemático de Corrección
 
-El score híbrido $S = w_{cat} \cdot \widetilde{NMI} + w_{cont} \cdot \cos\theta$ es correcto si y solo si ambos términos están en el mismo rango $[0,1]$ y los pesos satisfacen $w_{cat} + w_{cont} = 1$, con $w_{cat} = d_k / (d_k + d_c)$ derivado de la proporción de features detectadas. $\widetilde{NMI} = \frac{I(X;Y)}{\sqrt{H(X)H(Y)}} \in [0,1]$ por definición de información mutua normalizada; $\cos\theta \in [-1,1]$ se proyecta a $[0,1]$ via $\frac{1+\cos\theta}{2}$. Este invariante garantiza que $S$ es una media convexa de dos métricas de dependencia estadísticamente compatibles — propiedad que un wrapper naive de sklearn + scipy no preserva sin la normalización cruzada explícita.
-
----
+El invariante es que $\alpha \in (0,1)$ está determinado únicamente por la entropía marginal del corpus: $\alpha = H(X) / (H(X) + H_{\max})$, donde $H_{\max} = \log_2(n)$ es la entropía máxima para $n$ ítems equiprobables. Esto garantiza que $\alpha \to 1$ cuando el corpus es semánticamente disperso (alta $H$, cosine discrimina mejor entre vectores alejados) y $\alpha \to 0$ cuando el corpus está en clusters densos (baja $H$, NMI captura dependencia no-lineal que cosine no puede distinguir por proximidad geométrica). El score es correcto — en el sentido de Bayes-optimal para la distribución observada — porque $\alpha$ es una estadística suficiente de la distribución empírica del corpus.
 
 ## 5. Límites Teóricos del Sistema
 
-La ausencia de índice persistente implica complejidad de búsqueda $O(n)$ exacta, no $O(\log n)$ aproximada de HNSW/IVF. Para $n > 10^4$ items con $d_c > 768$ (embeddings densos), el tiempo de respuesta supera los 200ms en una sola instancia — este diseño es correcto para búsqueda efímera en batches moderados, no para recuperación online sobre corpus de millones de vectores. Adicionalmente, NMI asume que las distribuciones marginales $P(X)$ y $P(Y)$ son estimables con suficiente soporte en el corpus recibido por llamada; con $n < 30$ por categoría, la estimación de entropía tiene sesgo $O(k/n)$ que degrada la fiabilidad del score categórico.
+**Lo que no puede hacer y por qué:**
+
+- **Corpus > 500k ítems**: la complejidad $O(n \log n)$ de construcción de $H(X,Y)$ en RAM stateless excede el presupuesto de latencia de una API síncrona por encima de ese umbral — no es una limitación de implementación sino de la definición de stateless.
+- **Embeddings de dimensión variable entre llamadas**: cosine similarity no es comparable entre espacios métricos distintos; $\cos(\mathbf{u}, \mathbf{v})$ requiere $\mathbf{u}, \mathbf{v} \in \mathbb{R}^d$ con $d$ fijo por corpus — la API rechaza requests mixtos por consistencia algebraica, no por convención.
+- **Dependencias causales**: NMI mide $I(X;Y) = H(X) + H(Y) - H(X,Y)$, que es simétrica. Esta primitiva no puede detectar $X \to Y$ vs $Y \to X$ — para causalidad se requiere el módulo `src/math/causal`, fuera del scope de esta API.
