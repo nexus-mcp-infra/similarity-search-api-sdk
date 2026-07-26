@@ -54,7 +54,18 @@ _NEXUS_X402_ROUTES: dict[str, RouteConfig] = {
     ),
 }
 
-app.add_middleware(PaymentMiddlewareASGI, routes=_NEXUS_X402_ROUTES, server=_nexus_x402_server)
+# --- NEXUS PATCH x402_free_mode_similarity_search ---
+# Experimento freemium (validar demanda antes de decidir mainnet/MPP,
+# ver research 2026-07-26). NEXUS_X402_FREE_MODE=true desactiva el gate
+# de pago x402 SIN tocar el resto (auth por API key, rate limiting,
+# exclusion de billing de Stripe -- ninguno de esos se toca aca). Se
+# lee UNA sola vez al arrancar el proceso -- Railway reinicia el
+# servicio en cada cambio de env var (mismo comportamiento ya
+# documentado para set_variables() en CLAUDE.md SS3.3), asi que
+# alternar el flag en Railway sin pushear codigo nuevo alcanza.
+_NEXUS_X402_FREE_MODE = os.environ.get("NEXUS_X402_FREE_MODE", "").strip().lower() == "true"
+if not _NEXUS_X402_FREE_MODE:
+    app.add_middleware(PaymentMiddlewareASGI, routes=_NEXUS_X402_ROUTES, server=_nexus_x402_server)
 
 # --- NEXUS: x402scan discovery -- x-payment-info en openapi.json ---
 # x402scan (Merit-Systems) no tiene un .well-known/x402 ratificado --
@@ -553,17 +564,26 @@ from x402.schemas.config import ResourceConfig as _NexusX402ResourceConfig
 # server.build_payment_requirements(). Requiere que el server este
 # inicializado (fetch de "supported" contra el facilitator); se garantiza
 # una sola vez sin duplicar la llamada si algo mas ya lo inicializo antes.
-if not getattr(_nexus_x402_server, "_initialized", False):
-    _nexus_x402_server.initialize()
+# --- NEXUS PATCH x402_free_mode_similarity_search (MCP surface) ---
+# Mismo flag que el gate REST (_NEXUS_X402_FREE_MODE, definido mas
+# arriba junto a PaymentMiddlewareASGI). En modo libre, el wrapper es
+# un decorator identity -- no se inicializa el server contra el
+# facilitator ni se construyen PaymentRequirements, evitando un
+# roundtrip de red innecesario mientras el experimento esta activo.
+if _NEXUS_X402_FREE_MODE:
+    _nexus_mcp_x402_wrapper = lambda fn: fn
+else:
+    if not getattr(_nexus_x402_server, "_initialized", False):
+        _nexus_x402_server.initialize()
 
-_NEXUS_MCP_X402_RESOURCE_CONFIG = _NexusX402ResourceConfig(
-    scheme="exact",
-    pay_to=_NEXUS_X402_EVM_ADDRESS,
-    price=_NEXUS_X402_PRICE,
-    network=_NEXUS_X402_NETWORK,
-)
-_NEXUS_MCP_X402_ACCEPTS = _nexus_x402_server.build_payment_requirements(_NEXUS_MCP_X402_RESOURCE_CONFIG)
-_nexus_mcp_x402_wrapper = _nexus_mcp_x402_wrapper_factory(_nexus_x402_server, accepts=_NEXUS_MCP_X402_ACCEPTS)
+    _NEXUS_MCP_X402_RESOURCE_CONFIG = _NexusX402ResourceConfig(
+        scheme="exact",
+        pay_to=_NEXUS_X402_EVM_ADDRESS,
+        price=_NEXUS_X402_PRICE,
+        network=_NEXUS_X402_NETWORK,
+    )
+    _NEXUS_MCP_X402_ACCEPTS = _nexus_x402_server.build_payment_requirements(_NEXUS_MCP_X402_RESOURCE_CONFIG)
+    _nexus_mcp_x402_wrapper = _nexus_mcp_x402_wrapper_factory(_nexus_x402_server, accepts=_NEXUS_MCP_X402_ACCEPTS)
 
 @_nexus_mcp.tool(name='nexus_similarity_search_api_rank_items_by_nmi_cosine_fusion', description="Ranks a corpus of items against a query vector using a calibrated fusion score (alpha * cosine + (1-alpha) * NMI_normalizado), where alpha is auto-derived from the corpus's marginal entropy unless overridden. Results are identified by their 0-indexed position in corpus_vectors (this tool does not accept explicit item IDs). Use this when you need semantically-calibrated similarity over a stateless corpus of up to 500k items without a vector database. Do NOT use for purely geometric nearest-neighbor search where NMI overhead is unnecessary, nor for corpora larger than 500k items per call. Requires a valid api_key (same as X-API-Key) and an x402 payment.")
 @_nexus_mcp_x402_wrapper
@@ -852,3 +872,44 @@ async def _nexus_rate_limit_middleware(request: _NexusRLRequest, call_next):
         )
     return await call_next(request)
 # --- END NEXUS PATCH rate_limit_similarity_search ---
+
+
+# --- NEXUS PATCH traffic_log_similarity_search ---
+# Instrumentacion minima para el experimento freemium (ver
+# patch_x402_free_mode_similarity_search.py): loguea IP truncada (nunca
+# completa) + method/path/status por request a stdout, capturado por
+# Railway. Cubre REST y el sub-app FastMCP montado en "/" (ambos pasan
+# por el mismo stack ASGI). No escribe a Supabase ni a ningun store
+# externo -- ver docstring del patch para el alcance deliberado.
+def _nexus_traffic_log_truncate_ip(raw_ip):
+    if not raw_ip:
+        return "unknown"
+    if ":" in raw_ip and "." not in raw_ip:
+        segments = [s for s in raw_ip.split(":") if s]
+        head = segments[:4] if len(segments) >= 4 else segments
+        return (":".join(head) + "::/64") if head else "unknown"
+    octets = raw_ip.split(".")
+    if len(octets) == 4 and all(o.isdigit() for o in octets):
+        return f"{octets[0]}.{octets[1]}.{octets[2]}.0/24"
+    return "unknown"
+
+
+@app.middleware("http")
+async def _nexus_traffic_log_middleware(request, call_next):
+    response = await call_next(request)
+    try:
+        forwarded = request.headers.get("x-forwarded-for")
+        if forwarded:
+            raw_ip = forwarded.split(",")[0].strip()
+        else:
+            raw_ip = request.client.host if request.client else None
+        ip_range = _nexus_traffic_log_truncate_ip(raw_ip)
+        print(
+            f"[NEXUS_TRAFFIC] ip_range={ip_range} method={request.method} "
+            f"path={request.url.path} status={response.status_code}",
+            flush=True,
+        )
+    except Exception:
+        pass  # nunca romper la response real por un fallo de logging
+    return response
+# --- END NEXUS PATCH traffic_log_similarity_search ---
