@@ -1,20 +1,33 @@
 # Calibrated Similarity Search API — AGENTS.md
 
-> Generado a partir del código fuente real deployado (`nexus-mcp-infra/similarity-search-api-sdk`,
-> `core/similarity_search_api_api.py`, fetcheado en vivo desde GitHub `main` el 2026-07-17). Cada
-> endpoint, tipo, constraint y tool MCP de este documento existe literal en ese archivo — nada fue
-> inventado. **Sección MCP reescrita el 2026-07-17** tras confirmar que el commit de merge
-> `82292ebc1` (auth + pago x402 en los 3 tools MCP in-process) está efectivamente en producción:
-> Railway (`similarity-search-api`, deployment `3a9befdc`, `SUCCESS`) se redeployó a las
-> `2026-07-16T20:13:09Z`, 22 segundos después del push a `main` — es el deployment vigente, no hubo
-> ninguno posterior.
+> Generado el 2026-07-25 verificando en vivo contra el deployment real
+> (`https://similarity-search-api-production.up.railway.app`) con `curl` — no a partir de
+> `output/similarity_search_api/core/similarity_search_api_api.py`, que es un snapshot desactualizado
+> (generado 2026-07-18, **sin** `_require_api_key`, sin x402, sin rate limiting: expone
+> `/v1/similarity/pairwise-score` y otras rutas que no existen en producción). El código real deployado
+> se reconstruyó cruzando `output/similarity_search_api/openapi.json` (coincide byte a byte con el
+> `/openapi.json` en vivo, confirmado abajo), `github_live_content.py` (snapshot del código fuente real
+> tomado el 2026-07-17, ver `CLAUDE.md §4`) y los 6 patches de la raíz del repo que tocan este asset
+> (`patch_x402_similarity_search.py`, `patch_mcp_tool_grounding_similarity_search.py`,
+> `patch_mcp_tool_grounding_similarity_search_inprocess.py`,
+> `patch_mcp_x402_auth_gate_similarity_search.py`,
+> `patch_stripe_mcp_billing_exclusion_similarity_search.py`, `patch_rate_limit_similarity_search.py`).
+> **Nota de trazabilidad de commits**: solo 2 de esos 6 patches están comiteados en este repo —
+> `patch_x402_similarity_search.py` (commit `47c19b3`, 2026-07-14) y `patch_rate_limit_similarity_search.py`
+> (commit `6d65a56`). Los otros 4 (`mcp_x402_auth_gate`, ambos `mcp_tool_grounding`,
+> `stripe_mcp_billing_exclusion`) aparecen como `??` (untracked) en `git status` — se corrieron a mano
+> contra el repo propio del asset (no contra este orquestador) y nunca se comitearon acá. No se inventa
+> hash para esos cuatro; su efecto se verificó igual, en vivo, contra producción (ver cada sección).
 
 ## Qué hace
 
-Servicio HTTP stateless que calcula similitud entre vectores densos combinando cosine similarity y
-Normalized Mutual Information (NMI), con el peso de fusión (`alpha`) auto-calibrado por la entropía
-del corpus si no se fija manualmente. No requiere base de datos vectorial ni indexado previo — todo
-el corpus se manda inline en cada request.
+Scorer de similitud híbrido stateless: fusiona **NMI normalizada** (Normalized Mutual Information, para
+features/vectores categóricos vía discretización + `normalized_mutual_info_score`) con **cosine
+similarity** (para vectores continuos), en un score compuesto ponderado por `alpha`. `alpha` se
+auto-calibra a partir de la entropía marginal del corpus (`alpha = H(corpus) / (H(corpus) + log2(n_bins))`)
+salvo que se pase `alpha_override`/`alpha` explícito. Sin índice vectorial, sin estado entre llamadas —
+cada request trae su propio corpus inline. Pensado para ranking/scoring de corpus chicos-a-medianos
+(hasta 500k ítems) sin levantar una vector DB.
 
 ## Base URL
 
@@ -22,168 +35,256 @@ el corpus se manda inline en cada request.
 https://similarity-search-api-production.up.railway.app
 ```
 
-(Railway, sin dominio propio configurado todavía.)
+(Railway, sin dominio propio. `GET /` → `404 Not Found` — el mount de FastMCP en `"/"` no responde nada
+en la raíz literal; no confundir con "servicio caído".)
 
 ## Autenticación
 
-Header `X-API-Key: <key>`. Si el servidor no tiene `SIMILARITY_API_KEY` seteada, cualquier request
-devuelve `503 Service Unavailable` ("API authentication not configured on server") — a diferencia del
-otro asset de NEXUS, acá la ausencia de key **no** deja pasar requests sin auth.
+Header `X-API-Key: <key>`. Env var real: `SIMILARITY_API_KEY` — **una sola key** (no una lista;
+`BUYWHERE_API_KEYS` del otro asset sí es lista — ver docstring de `patch_rate_limit_similarity_search.py`).
+
+**A diferencia del otro asset de NEXUS** (`useful-data-source-for-agents`, que hace bypass silencioso si
+`BUYWHERE_API_KEYS` está vacía — ver su `AGENTS.md`), acá `_require_api_key()` responde `503 Service
+Unavailable` ("API authentication not configured on server.") si `SIMILARITY_API_KEY` no está seteada en
+el servidor, **antes** de siquiera mirar la key que mandó el caller (confirmado en el código real,
+`github_live_content.py:31-42`). Es el comportamiento "seguro" que `CLAUDE.md §Autenticación` del otro
+asset usa como contraste. Confirmado indirectamente en vivo: `POST /similarity/calibrate-alpha` con una
+key inválida devolvió `401 {"detail":"Invalid or missing API key."}`, no `503` — es decir,
+`SIMILARITY_API_KEY` **está** configurada en Railway hoy.
+
+**Gotcha real sobre orden de gates**: en las 3 rutas protegidas también por x402 (ver Cobro), el
+middleware de pago corre **antes** que la dependencia de FastAPI que valida la API key — confirmado en
+vivo: `POST /similarity/search` con una key claramente inválida (`X-API-Key: totally-wrong-key`), sin
+pago, devuelve `402`, no `401`. Incluso con body directamente inválido (no-JSON) sigue devolviendo `402`,
+no `422` — el middleware ASGI de x402 se ejecuta antes de que FastAPI llegue a parsear el body o resolver
+dependencias. Un caller no puede ni siquiera saber si su API key es válida en esas 3 rutas sin pagar
+primero.
 
 ## Cobro
 
-Las 3 rutas core (`/similarity/search`, `/similarity/calibrate-alpha/v1`, `/similarity/batch-score`)
-requieren pago vía **x402** (protocolo de pago por request en USDC, red **Base Sepolia — testnet, no
-mainnet**), `$0.01` por llamada, wallet `0x70e9f8057bb50e31b6ee06958bcbbe7de9daa98f`. Un request sin
-pago x402 válido responde `402 Payment Required` con el desafío de pago en el header `payment-required`
-(base64, ver `logs/similarity_search_api_prod_validation_2026-07-17.log` para un ejemplo real
-decodificado). Confirmado en vivo contra producción el 2026-07-17: sin pago → `402`; con un pago
-firmado offline pero de wallet sin fondos → también `402` (`invalid_exact_evm_insufficient_balance` —
-el facilitator valida balance on-chain durante el `verify`, no solo la firma). Estas mismas 3 rutas
-están excluidas del billing de Stripe (para no cobrar dos veces el mismo request).
+Las 3 rutas core (`POST /similarity/search`, `POST /similarity/calibrate-alpha/v1`,
+`POST /similarity/batch-score`) requieren pago **x402** (USDC, red **Base Sepolia — testnet**,
+`eip155:84532`), `$0.01`/llamada, misma wallet que `useful-data-source-for-agents`
+(`0x70e9f8057bb50e31b6ee06958bcbbe7de9daa98f`), facilitator `https://x402.org/facilitator`. Aplicado por
+`patch_x402_similarity_search.py` (commit `47c19b3`, 2026-07-14).
 
-**Mismo gate aplica ahora a la superficie MCP** — ver más abajo.
+Confirmado en vivo — `curl -D-` a `POST /similarity/search` sin pago devuelve:
+
+```
+HTTP/1.1 402 Payment Required
+payment-required: <base64 de {"x402Version":2,"error":"Payment Required","resource":{...},
+  "accepts":[{"scheme":"exact","network":"eip155:84532",
+  "asset":"0x036CbD53842c5426634e7929541eC2318f3dCF7e","amount":"10000",
+  "payTo":"0x70e9f8057bb50e31b6ee06958bcbbe7de9daa98f","maxTimeoutSeconds":300,
+  "extra":{"name":"USDC","version":"2"}}]}>
+Content-Length: 2   (body: "{}")
+```
+
+`amount":"10000"` = 0.01 USDC en unidades de 6 decimales — coincide exacto con el precio configurado en
+el patch.
+
+Excluidas del billing de Stripe (`_NEXUS_BILLING_EXCLUDED_PATHS`) para no cobrar dos veces sobre el mismo
+request. **`/mcp` también está en esa exclusión**, agregado por
+`patch_stripe_mcp_billing_exclusion_similarity_search.py` (untracked, sin commit) — mismo bug de fondo que
+documenta `CLAUDE.md §3` para este asset: `_nexus_usage_middleware` compara contra `request.url.path`, y
+el sub-app FastMCP montado en `"/"` es Starlette puro (nunca setea `scope["route"]`); una request real a
+`/mcp` tiene `request.url.path == "/mcp"`, que **no** matcheaba el `"/"` ya presente en el set (ese `"/"`
+solo cubre la URL raíz literal). Antes del fix, cualquier tráfico de protocolo MCP con status `<400`
+(`initialize`, `tools/list` — ninguno de los dos pasa por gate de auth/pago) disparaba un
+`stripe.billing.MeterEvent.create()` real. Confirmado indirectamente vía Railway
+(`STRIPE_CUSTOMER_ID`/`STRIPE_EVENT_NAME`/`STRIPE_SECRET_KEY` reales, modo test) — no hay forma de
+confirmarlo 100% en vivo desde afuera sin acceso al dashboard de Stripe, mismo límite que documentó el
+patch original.
+
+**Ruta legacy sin cobertura de pago, pero tampoco explotable**: `POST /similarity/calibrate-alpha` (sin
+`/v1`) sigue presente tanto en el OpenAPI en vivo como en el código real, y **no** está en
+`_NEXUS_X402_ROUTES` (esa tabla solo tiene la entrada literal `"POST /similarity/calibrate-alpha/v1"`, que
+no matchea el path sin sufijo). Requiere `X-API-Key` igual que las demás (`401` confirmado en vivo con key
+inválida), pero el handler (`github_live_content.py:281-289`) no calcula nada — devuelve incondicionalmente
+`501 Not Implemented`, `"Use the /similarity/calibrate-alpha/v1 POST endpoint with a JSON body."` No pude
+confirmar el `501` en vivo con una key válida (no hay `SIMILARITY_API_KEY` real disponible en este
+entorno), pero el código no deja ambigüedad: es un stub deprecado, no un bypass real de pago hoy. Si
+alguna vez se "completa" en vez de eliminarse, sí sería un bypass real — vale la pena no reimplementar
+esa ruta sin agregarla también a `_NEXUS_X402_ROUTES`.
+
+## Rate limiting (por caller, confirmado en vivo)
+
+`patch_rate_limit_similarity_search.py` (commit `6d65a56`, 2026-07-17) agrega un limitador en memoria,
+por proceso, sliding-window: **60 requests / 60s por caller** (`NEXUS_RATE_LIMIT_PER_MINUTE` /
+`NEXUS_RATE_LIMIT_WINDOW_SECONDS`, configurable en Railway sin redeploy). Identidad resuelta en orden:
+wallet pagadora x402 (`X-PAYMENT`) > hash de `X-API-Key` > IP. Corre como middleware ASGI, por lo tanto
+cubre también `/mcp` (Starlette puro, no pasaría por un check dentro de cada ruta FastAPI).
+
+**Confirmado en vivo**: 70 requests consecutivas a `POST /similarity/calibrate-alpha` con una API key
+inválida (ruta gratis, sin x402, así que cada llamada solo cuesta un `401` — no hay costo real en probar
+el límite):
+
+| Requests 1–60 | Requests 61–70 |
+|---|---|
+| `401 Invalid or missing API key.` (60 de 60) | `429 Too Many Requests` (10 de 10) |
+
+Respuesta del `429`:
+```json
+{"error":"rate_limited","detail":"Too many requests. Retry after 33s."}
+```
+con header `Retry-After: 33`. Umbral exacto en 60, coincide con el default documentado.
 
 ## Endpoints
 
 ### `POST /similarity/search`
-Búsqueda de similitud sobre un corpus inline, usando el score de fusión NMI+cosine calibrado por
-entropía.
+Búsqueda/ranking real: score compuesto por ítem del corpus contra un vector query, top-k descendente.
 
-Request (`SimilaritySearchRequest`):
-| campo | tipo | constraints |
-|---|---|---|
-| `query` | `CorpusVector` | `{id: string(1-256), vector: number[](2-4096)}` |
-| `corpus` | `CorpusVector[]` | 1 a 500,000 items |
-| `top_k` | integer | default 10, 1–1000 |
-| `nmi_bins` | integer | default 10, 3–50 |
-| `alpha_override` | number\|null | 0.0–1.0. Si se omite, alpha se auto-calibra por entropía del corpus |
+**Usar cuando**: necesitás rankear un corpus (hasta 500k ítems) contra un vector de query con el score
+híbrido NMI+cosine, sin mantener índice.
+**No usar para**: un solo par aislado sin corpus (usar `/similarity/batch-score`), o solo necesitar el
+`alpha` calibrado sin correr el ranking completo (usar `/similarity/calibrate-alpha/v1`).
+
+Body (`SimilaritySearchRequest`): `query` (`CorpusVector{id, vector[2–4096]}`), `corpus`
+(1–500000 `CorpusVector`, todas las dimensiones iguales), `top_k` (1–1000, default 10), `nmi_bins`
+(3–50, default 10), `alpha_override` (0.0–1.0, opcional).
 
 Response (`SimilaritySearchResponse`): `results[]` (`id`, `composite_score`, `cosine_similarity`,
 `nmi_score`, `rank`), `calibrated_alpha`, `corpus_entropy`, `query_id`, `corpus_size`, `latency_ms`,
 `request_fingerprint`.
 
-```bash
-curl -X POST https://similarity-search-api-production.up.railway.app/similarity/search \
-  -H "X-API-Key: $SIMILARITY_API_KEY" -H "Content-Type: application/json" \
-  -d '{"query": {"id": "q1", "vector": [0.1, 0.9, 0.3]},
-       "corpus": [{"id": "c1", "vector": [0.2, 0.8, 0.25]}],
-       "top_k": 5}'
-```
-
-(más el header/flujo de pago x402 — ver sección Cobro; sin él, `402` antes de llegar a la validación
-de la key.)
+Auth: `X-API-Key` + pago x402. Confirmado en vivo: `402` sin pago (con o sin key, con o sin body válido).
 
 ### `POST /similarity/calibrate-alpha/v1`
-Calcula el `alpha` calibrado por entropía para un corpus sin correr la búsqueda completa — útil para
-inspeccionar antes de comprometerse a un `/similarity/search` grande.
+Calcula el `alpha` auto-calibrado para un corpus sin correr la búsqueda completa.
 
-Request (`AlphaCalibrateRequest`): `corpus: CorpusVector[]` (1–500,000), `nmi_bins: integer` (default
-10, 3–50).
-Response (`AlphaCalibrationResponse`): `calibrated_alpha`, `corpus_entropy`, `corpus_size`,
-`vector_dim`, `latency_ms`.
+**Usar cuando**: querés inspeccionar el costo/composición del corpus (entropía, dimensión) antes de
+comprometerte a un `/similarity/search` grande.
+**No usar para**: obtener resultados rankeados (acá no hay ranking, solo el escalar `alpha`).
+
+Body (`AlphaCalibrateRequest`): `corpus` (1–500000 `CorpusVector`), `nmi_bins` (3–50, default 10).
+
+Response (`AlphaCalibrationResponse`): `calibrated_alpha`, `corpus_entropy`, `corpus_size`, `vector_dim`,
+`latency_ms`.
+
+Auth: `X-API-Key` + pago x402. Confirmado en vivo: `402` sin pago.
 
 ### `POST /similarity/batch-score`
-Scorea hasta 10,000 pares de vectores con un `alpha` fijo (sin overhead de corpus).
+Scorea hasta 10.000 pares `(vector_a, vector_b)` independientes con un `alpha` **fijo** (no calibrado por
+par ni por corpus).
 
-Request (`BatchScoreRequest`): `pairs: [number[], number[]][]` (1–10,000 pares, ambos vectores del
-par deben tener igual dimensión), `alpha: number` (default 0.5, 0–1), `nmi_bins: integer` (default 10,
-3–50).
+**Usar cuando**: tenés muchos pares ya definidos y solo necesitás el score de cada uno, sin armar un
+corpus ni pagar el overhead de ranking.
+**No usar para**: ranking contra un corpus completo con `alpha` auto-calibrado (usar `/similarity/search`);
+obtener el `alpha` calibrado en sí (usar `/similarity/calibrate-alpha/v1` — acá `alpha` default es 0.5,
+aplicado tal cual, **no** se deriva de entropía).
+
+Body (`BatchScoreRequest`): `pairs` (1–10000 tuplas `[vector_a, vector_b]`, misma dimensión por par),
+`alpha` (0.0–1.0, default 0.5), `nmi_bins` (3–50, default 10).
+
 Response (`BatchScoreResponse`): `scores[]`, `alpha_used`, `pair_count`, `latency_ms`.
 
+Auth: `X-API-Key` + pago x402. Confirmado en vivo: `402` sin pago.
+
+### `POST /similarity/calibrate-alpha` (legacy, sin `/v1` — deprecado, no usar)
+**No usar para nada** — stub deprecado. Requiere `X-API-Key` válida (`401` si falta/es inválida,
+confirmado en vivo) pero el handler siempre devuelve `501 Not Implemented` señalando usar
+`/similarity/calibrate-alpha/v1`. Ver gotcha en "Cobro" — no está cubierta por x402 (fuera de
+`_NEXUS_X402_ROUTES`), pero tampoco ejecuta lógica real, así que hoy no es una forma gratis de obtener
+cómputo pago.
+
 ### `GET /health`
-Liveness probe, sin autenticación. Devuelve `{"status": "ok", "version": "1.0.0"}`.
+**Usar para**: liveness probes, monitoreo de uptime.
+**No usar para**: nada relacionado a similitud/scoring.
 
-## Endpoint deprecado — no usar
+Response: `{"status": "ok", "version": "1.0.0"}`. Sin autenticación, sin pago. Confirmado en vivo (`200`).
 
-`POST /similarity/calibrate-alpha` (sin `/v1`) existe en el código pero devuelve siempre
-`501 Not Implemented` con el mensaje "Use the /similarity/calibrate-alpha/v1 POST endpoint with a
-JSON body." Queda documentado acá solo para que no se confunda con la ruta real.
+## MCP — servidor in-process en `/mcp`, 3 tools reales, auth+pago confirmados en vivo
 
-## MCP — 2 superficies distintas, no confundir
+Servidor MCP embebido (`FastMCP`, `stateless_http=True`) montado en el mismo proceso Railway vía
+`app.mount("/", ...)` — no hay segundo servicio. `stateless_http=True` confirmado en vivo: la respuesta a
+`initialize` no trae header `mcp-session-id`, y `tools/list` funciona igual en una request HTTP nueva sin
+mandar ninguna sesión previa. `serverInfo.version` reportado por `initialize` es `"1.28.1"` — es la
+versión del SDK `mcp`/`FastMCP` instalado, **no** la versión del asset (que es `"1.0.0"` según
+`info.version` del propio OpenAPI); no confundir ambos números.
 
-### Superficie 1: `/mcp` in-process — la real, la que corre en producción
+`tools/list` en vivo devuelve exactamente 3 tools:
 
-Montada en el mismo proceso FastAPI (`app.mount("/", _nexus_mcp_asgi_app)`), mismo dominio Railway
-que el REST de arriba — no hay un segundo servicio. Expone 3 tools reales:
+| Tool MCP | Lógica real que llama (directo, sin HTTP) | Auth/pago |
+|---|---|---|
+| `nexus_similarity_search_api_rank_items_by_nmi_cosine_fusion` | `search_corpus_by_calibrated_similarity()` | `api_key` (param explícito) + x402 |
+| `nexus_similarity_search_api_estimate_corpus_entropy_profile` | `inspect_corpus_entropy_and_alpha()` | `api_key` + x402 |
+| `nexus_similarity_search_api_score_pair_nmi_cosine` | `score_vector_pairs_with_fixed_alpha()` | `api_key` + x402 |
 
-- **`nexus_similarity_search_api_rank_items_by_nmi_cosine_fusion`** — equivalente a
-  `POST /similarity/search`. Params: `query_vector`, `corpus_vectors`, `top_k` (default 10, 1–1000),
-  `alpha_override` (opcional, 0–1), `n_bins` (default 16, 3–50), `api_key` (string, requerido).
-- **`nexus_similarity_search_api_estimate_corpus_entropy_profile`** — equivalente a
-  `POST /similarity/calibrate-alpha/v1`. Params: `corpus_vectors`, `n_bins` (default 16, 3–50),
-  `api_key` (requerido). Devuelve un `corpus_entropy` agregado — **no** un desglose por dimensión.
-- **`nexus_similarity_search_api_score_pair_nmi_cosine`** — equivalente a `POST /similarity/batch-score`
-  para exactamente 1 par. Params: `vector_a`, `vector_b`, `n_bins` (default 16, 3–50), `alpha`
-  (default 0.5, no auto-calibrado), `api_key` (requerido).
+> **Historia de grounding — 2 rounds de fixes, distintos del `mcp_wrapper/` TS**:
+>
+> **Round 1** (`patch_mcp_tool_grounding_similarity_search_inprocess.py`, untracked, sin commit): el
+> servidor MCP in-process originalmente tenía 5 tools generadas contra rutas ficticias
+> (`/v1/similarity/rank-nmi-cosine`, `/v1/similarity/corpus-entropy-profile`, `/v1/similarity/score-pair`,
+> `/v1/similarity/outliers-nmi-deficit`, `/v1/similarity/calibrate-alpha`) que nunca existieron en el
+> core — mismo root cause que `useful-data-source-for-agents` (fases `_phase_tool_spec()` y la síntesis
+> del `api.py` corren como llamadas a Claude independientes, sin memoria compartida). 2 tools
+> (`find_outlier_vectors_by_nmi_deficit`, `calibrate_alpha_from_query_entropy`) no tenían equivalente real
+> y se eliminaron. Los 3 sobrevivientes originalmente llamaban `_nexus_mcp_call_core()` (ASGI in-process
+> contra las rutas reales) — pero para cuando se corrió este patch, esas mismas 3 rutas ya estaban
+> envueltas por el middleware x402 (agregado después de que el servidor MCP se generó), así que la
+> llamada interna devolvía `402` incluso con ruta y API key correctas. Fix: se eliminó
+> `_nexus_mcp_call_core()` y los 3 tools pasaron a llamar **directo** a las funciones de negocio en
+> Python (`search_corpus_by_calibrated_similarity`, etc.), saltándose ASGI/HTTP/x402 por completo — mismo
+> criterio que ya usa la exclusión de billing de Stripe para tratar esas 3 rutas como internas.
+>
+> **Bug de fondo introducido por el Round 1, cerrado por el Round 2**
+> (`patch_mcp_x402_auth_gate_similarity_search.py`, untracked, sin commit): llamar directo a la lógica de
+> negocio se saltea **tanto** `_require_api_key()` (solo se evalúa cuando FastAPI resuelve la dependencia
+> vía su router — una llamada Python directa nunca pasa por ahí) **como** el middleware x402 (filtrado
+> por path contra 3 rutas REST literales; el mount de FastMCP en `"/"` nunca estuvo en esa lista).
+> Resultado, confirmado como el estado real durante una ventana: las 3 operaciones que en REST exigen key
+> + pago quedaron gratis y sin auth vía `/mcp`. Fix: se agregó un parámetro `api_key` explícito a cada
+> tool + `_require_api_key(key=api_key)` como primera línea del handler, y se decoró cada tool con
+> `x402.mcp.create_payment_wrapper()` (integración MCP de primera clase del propio paquete `x402`),
+> reusando la misma instancia `_nexus_x402_server`/precio/red que las rutas REST.
 
-Cada tool llama **directo** a la función de lógica de negocio (`search_corpus_by_calibrated_similarity`,
-etc.), sin pasar por HTTP/ASGI/ni el middleware x402 de las rutas REST — necesario porque una llamada
-in-process contra esas rutas siempre daría `402` (están gateadas por `PaymentMiddlewareASGI`, sin
-distinguir caller interno de externo). Para no dejar las 3 operaciones gratis y sin auth por ese
-atajo, cada handler aplica **los mismos 2 gates que la REST, pero a mano**:
+**Confirmado en vivo, 2026-07-25** (a diferencia de `useful-data-source-for-agents`, donde este mismo
+tipo de fix **no** está aplicado — ver su `AGENTS.md`, sección MCP):
 
-1. **`api_key`**: parámetro explícito del tool (mismo secreto que `X-API-Key`/`SIMILARITY_API_KEY`),
-   validado con `_require_api_key(key=api_key)` como primera línea del handler. Tiene que venir del
-   *caller* — pasarse la key del propio servidor a sí mismo no autentica nada.
-2. **Pago x402**: decorador `@_nexus_mcp_x402_wrapper` (`x402.mcp.create_payment_wrapper`, integración
-   MCP oficial del SDK x402, no reimplementada a mano) que envuelve el handler con el mismo
-   `_nexus_x402_server`/`PaymentRequirements`/precio que usan las rutas REST. Verifica el pago (via
-   `_meta`) *antes* de correr el handler y liquida (`settle`) *solo* si el handler retorna sin
-   excepción — si `_require_api_key()` rechaza, nunca se llega a cobrar.
+```
+tools/call score_pair_nmi_cosine, api_key="fake-key-test", sin X-PAYMENT
+→ isError: true, content: {"x402Version":2, "error":"Payment Required",
+   "accepts":[{"scheme":"exact","network":"eip155:84532", "amount":"10000",
+   "payTo":"0x70e9f...aa98f", ...}], "resource":{"url":"mcp://tool/score_pair_nmi_cosine", ...}}
 
-**Gotcha histórico, ya arreglado, queda documentado**: la versión anterior de estos 3 tools llamaba
-directo a la lógica de negocio para esquivar el `402` de la llamada ASGI interna, pero ese mismo
-atajo también saltaba `_require_api_key()` (solo se evalúa vía `Security()`/DI de FastAPI, nunca en
-una llamada Python directa) *y* el middleware x402 (el mount de FastMCP en `/` nunca estuvo en
-`_NEXUS_X402_ROUTES`) — las 3 operaciones quedaron gratis y sin auth por MCP mientras seguían
-protegidas por REST. Corregido por `patch_mcp_x402_auth_gate_similarity_search.py`
-(commit `6ae57e63d` + merge `82292ebc1`), confirmado en el deployment vigente de Railway (ver nota al
-inicio de este documento).
+tools/call score_pair_nmi_cosine, SIN api_key
+→ isError: true, "Field required [type=missing] ... api_key"  (falla en validación de schema MCP,
+   antes de llegar al wrapper de pago)
+```
 
-**No validado end-to-end con un pago real liquidado.** Requiere un cliente MCP capaz de streamable
-HTTP + firmar un pago x402 "exact" scheme sobre Base Sepolia con una wallet de testnet fondeada —
-pendiente compartido con la REST, no específico de esta superficie (ver memoria de proyecto
-`x402-funded-wallet-pending`; el código para construir el payment payload offline con el SDK x402
-local ya existe, solo falta el fondeo).
+**Orden de gates confirmado**: con un `api_key` presente pero falso, la respuesta es el challenge de pago
+x402 (`Payment Required`), **no** un rechazo de auth — el decorator `@_nexus_mcp_x402_wrapper` envuelve la
+función más cerca de la definición que `@_nexus_mcp.tool(...)`, así que su chequeo corre antes de que el
+cuerpo del handler llegue a ejecutar `_require_api_key(key=api_key)` (que es la primera línea *dentro* del
+handler). Mismo orden que en REST: pago antes que key. Los 3 tools están correctamente protegidos hoy, con
+ambos gates activos y verificables en vivo.
 
-### Superficie 2: `mcp_wrapper/` (TS) — local, nunca deployada, no descubrible
-
-Directorio separado en el mismo repo (`mcp_wrapper/`), pensado originalmente como un microservicio
-Node.js aparte del core Python. **Nunca corrió como servicio propio**: el `Procfile` de Railway
-lanza únicamente `uvicorn core.similarity_search_api_api:app` (la superficie 1 de arriba) — no hay
-ningún proceso Node en producción para este asset. Confirmado en vivo (2026-07-16):
-
-- `GET https://registry.npmjs.org/@nexus-mcp/similarity-search-api` → `404 Not Found`. El paquete
-  npm (`@nexus-mcp/similarity-search-api`, bin `similarity-search-api-mcp-server`) nunca se publicó
-  de verdad — `NPM_TOKEN` no está seteado, la publicación cayó a modo simulado.
-- `registry.modelcontextprotocol.io/v0/servers?search=...` → `{"servers":[],"metadata":{"count":0}}`.
-  Tampoco está en el Registro Oficial MCP (requiere un `remote_url` de un deploy real que nunca
-  existió).
-
-Única forma de usarlo hoy: clonar `nexus-mcp-infra/similarity-search-api-sdk`, `cd mcp_wrapper`,
-`npm install`, `cp .env.example .env` y **corregir** `NEXUS_CORE_BASE_URL` a mano — el `.env.example`
-trae `https://similarity-search-api.railway.app`, que no es el dominio real
-(`similarity-search-api-production.up.railway.app`). Luego `npm run dev` (stdio) o
-`TRANSPORT=http npm run start:http`.
-
-1 tool: **`nexus_similarity_search_api_rank_embeddings_by_nmi_cosine`** — llama por HTTP real
-(`coreClient.ts`) a `POST /similarity/search`. Params: `query_vector`, `corpus_vectors`, `corpus_ids`
-(array de IDs, separado en vez de venir embebido en cada `CorpusVector` como en la REST/superficie 1),
-`top_k` (default 10, 1–1000), `nmi_bins` (default 10, 3–50), `alpha_override` (opcional, 0–1).
-
-**Gotcha real, no arreglado**: `coreClient.ts` solo reenvía el header `x-api-key` (usa
-`NEXUS_CORE_API_KEY`) — no tiene ninguna noción de x402. Desde que `/similarity/search` quedó
-protegida por `PaymentMiddlewareASGI` (que corre a nivel de middleware ASGI, antes de que la request
-llegue a la ruta/dependencia de FastAPI), **cualquier llamada de este wrapper devuelve `402 Payment
-Required`, sin importar si la API key es válida**. Este wrapper no se tocó desde el commit `e7427b357`
-(el que agregó x402) salvo por el fix de grounding de tools (`10ee34375`, que solo corrigió cuál tool
-sobrevive y sus parámetros, no auth/pago) — está roto contra producción hoy tal cual está, y necesita
-el mismo flujo de pago x402 que ya tiene la superficie 1 para volver a funcionar.
+Distinto de todo lo anterior: **`mcp_wrapper/`** (paquete TypeScript separado, no corre en Railway, se
+instala local apuntando a `NEXUS_CORE_BASE_URL` — en `output/similarity_search_api/mcp_wrapper/` solo
+queda `manifest.json`, sin `src/`, igual que en `useful-data-source-for-agents`). Ese wrapper tuvo su
+propio bug de grounding, corregido por `patch_mcp_tool_grounding_similarity_search.py` (untracked, sin
+commit): de 5 tools originales (`rank_embeddings_by_nmi_cosine`, `estimate_pairwise_nmi_matrix`,
+`score_candidate_pair_significance`, `detect_embedding_dimension_redundancy`,
+`calibrate_nmi_cosine_weight_for_corpus`) solo `rank_embeddings_by_nmi_cosine` tenía equivalente real
+(remapeado a `POST /similarity/search`, parámetros corregidos); los otros 4 describían features nunca
+implementadas (matriz NxN, detección de redundancia de dimensiones, calibración por triplets con
+AUC-ROC) y se eliminaron. Además, `coreClient.ts` mandaba `Authorization: Bearer <key>` — la API real
+espera `X-API-Key`; corregido en el mismo patch (sin esto, incluso con la ruta correcta la llamada hubiera
+fallado con `401`, no `404`).
 
 ## Errores
 
-`401` — API key inválida o ausente (REST y MCP superficie 1, vía `_require_api_key`). `422` —
-validación de request (ej. dimensión de `query` no coincide con `corpus`, vector con NaN/Inf, o norma
-cero). `402` — falta pago x402 válido en una ruta protegida (REST, y ahora también MCP superficie 1 y
-2 — ver arriba). `503` — servidor sin `SIMILARITY_API_KEY` configurada.
+`401` — `X-API-Key` inválida o ausente (confirmado en vivo en la ruta legacy
+`/similarity/calibrate-alpha`; en las 3 rutas pagas nunca se llega a ver porque x402 corta antes con
+`402`, ver gotcha de orden de gates). `402` — falta pago x402 válido, en las 3 rutas REST protegidas y en
+los 3 tools MCP protegidos; corre **antes** que la validación de auth/body (confirmado con key inválida,
+body inválido, y `api_key` MCP falso, siempre `402`/`Payment Required`). `404` — ruta inexistente,
+incluida la raíz literal `GET /` (texto plano `"Not Found"`, confirmado en vivo). `422` — validación de
+Pydantic (dimensión de vectores inconsistente, corpus vacío, NaN/Inf en un vector, etc. — ver
+`field_validator`s en `github_live_content.py`); no se pudo disparar en vivo sin pasar primero el gate de
+pago, confirmado solo por lectura de código real. `429` — rate limit por caller excedido (60 req/60s
+default, confirmado en vivo con 70 requests consecutivas: 60× `401`, luego 10× `429` con
+`Retry-After`). `501` — ruta legacy `/similarity/calibrate-alpha` (sin `/v1`), siempre, una vez pasado el
+gate de auth — confirmado por código real, no se pudo probar en vivo (sin `SIMILARITY_API_KEY` real
+disponible en este entorno). `503` — `SIMILARITY_API_KEY` no configurada en el servidor (no es el estado
+actual: confirmado que la key SÍ está seteada, porque una key inválida da `401`, no `503`).
