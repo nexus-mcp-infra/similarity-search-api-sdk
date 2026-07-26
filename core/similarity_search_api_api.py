@@ -55,6 +55,52 @@ _NEXUS_X402_ROUTES: dict[str, RouteConfig] = {
 
 app.add_middleware(PaymentMiddlewareASGI, routes=_NEXUS_X402_ROUTES, server=_nexus_x402_server)
 
+# --- NEXUS: x402scan discovery -- x-payment-info en openapi.json ---
+# x402scan (Merit-Systems) no tiene un .well-known/x402 ratificado --
+# confirmado 2026-07-26 cruzando x402-foundation/x402 (sin mencion),
+# x402scan-skills (deprecado, sin schema) y la spec vigente en
+# agentcash.dev/discovery (mismo equipo detras de x402scan): el
+# mecanismo real es leer /openapi.json buscando la extension
+# "x-payment-info" por operacion. Sin esto, x402scan reporta "no
+# discovery document found" pese a que /openapi.json ya se sirve.
+# Las 3 operaciones y el precio salen de _NEXUS_X402_ROUTES /
+# _NEXUS_X402_PRICE ya definidos arriba -- nada nuevo se inventa aca.
+_NEXUS_X402_OPENAPI_OPERATIONS = [
+    ("post", "/similarity/search"),
+    ("post", "/similarity/calibrate-alpha/v1"),
+    ("post", "/similarity/batch-score"),
+]
+
+
+def _nexus_x402_openapi_with_payment_info():
+    if app.openapi_schema:
+        return app.openapi_schema
+    from fastapi.openapi.utils import get_openapi as _nexus_get_openapi
+    schema = _nexus_get_openapi(
+        title=app.title,
+        version=app.version,
+        description=app.description,
+        routes=app.routes,
+    )
+    for _nexus_method, _nexus_path in _NEXUS_X402_OPENAPI_OPERATIONS:
+        _nexus_operation = schema.get("paths", {}).get(_nexus_path, {}).get(_nexus_method)
+        if _nexus_operation is None:
+            continue
+        _nexus_operation["x-payment-info"] = {
+            "price": {
+                "mode": "fixed",
+                "currency": "USD",
+                "amount": _NEXUS_X402_PRICE.lstrip("$"),
+            },
+            "protocols": [{"x402": {}}],
+        }
+        _nexus_operation.setdefault("responses", {})["402"] = {"description": "Payment Required"}
+    app.openapi_schema = schema
+    return app.openapi_schema
+
+
+app.openapi = _nexus_x402_openapi_with_payment_info
+
 API_KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=True)
 _VALID_API_KEY = os.environ.get("SIMILARITY_API_KEY", "")
 
@@ -583,6 +629,76 @@ async def _nexus_mcp_shutdown():
 # Exponia todas las variables RAILWAY_* sin auth en un endpoint publico
 # -- fuga de informacion real, no solo cruft de diagnostico temporal.
 
+# --- NEXUS: A2A Agent Card (spec v0.3.0/v1.0) para discovery ---
+# Ruta correcta del spec vigente -- NO /agent.json (deprecado en
+# v0.1.0), NO /v1/agent-card.json ni /v2/agent-card.json (no son parte
+# del spec real, un crawler las prueba igual sin encontrar nada). Debe
+# registrarse ANTES del app.mount("/", ...) de mas abajo: Starlette
+# matchea rutas en el orden en que se agregan a app.routes, y un Mount
+# en "/" intercepta cualquier path si se agrega primero.
+@app.get("/.well-known/agent-card.json", include_in_schema=False)
+async def _nexus_a2a_agent_card() -> dict:
+    return {
+        "name": "Calibrated Similarity Search API",
+        "description": "Stateless NMI + cosine fusion with entropy-driven alpha calibration",
+        "url": "https://similarity-search-api-production.up.railway.app",
+        "version": "1.0.0",
+        "documentationUrl": "https://similarity-search-api-production.up.railway.app/docs",
+        "provider": {
+            "organization": "nexus-mcp-infra",
+            "url": "https://github.com/nexus-mcp-infra/similarity-search-api-sdk",
+        },
+        "capabilities": {
+            "streaming": False,
+            "pushNotifications": False,
+            "stateTransitionHistory": False,
+        },
+        "defaultInputModes": ["application/json"],
+        "defaultOutputModes": ["application/json"],
+        "additionalInterfaces": [
+            {"url": "https://similarity-search-api-production.up.railway.app/mcp", "transport": "MCP"},
+        ],
+        "securitySchemes": {
+            "apiKeyHeader": {"type": "apiKey", "in": "header", "name": "X-API-Key"},
+            "x402Payment": {
+                "type": "apiKey",
+                "in": "header",
+                "name": "X-PAYMENT",
+                "description": "x402 payment proof (USDC, Base Sepolia testnet) required on paid operations -- not a classic auth scheme.",
+            },
+        },
+        "security": [{"apiKeyHeader": [], "x402Payment": []}],
+        "skills": [
+            {
+                "id": "nexus_similarity_search_api_rank_items_by_nmi_cosine_fusion",
+                "name": "NMI-Cosine Fused Similarity Ranking",
+                "description": "Ranks a corpus of items against a query vector using a calibrated fusion score (alpha * cosine + (1-alpha) * NMI_normalizado), where alpha is auto-derived from the corpus's marginal entropy unless overridden. Results are identified by their 0-indexed position in corpus_vectors (this tool does not accept explicit item IDs). Requires a valid api_key (same as X-API-Key) and an x402 payment.",
+                "tags": ["similarity-search", "embeddings", "nmi", "cosine-similarity"],
+            },
+            {
+                "id": "nexus_similarity_search_api_estimate_corpus_entropy_profile",
+                "name": "Corpus Entropy and Calibrated Alpha Estimator",
+                "description": "Computes the aggregate entropy-calibrated alpha for a corpus without running a full search -- useful to inspect before committing to a large rank_items_by_nmi_cosine_fusion call. Returns a single aggregate corpus_entropy value, not a per-dimension breakdown. Requires a valid api_key (same as X-API-Key) and an x402 payment.",
+                "tags": ["entropy", "calibration"],
+            },
+            {
+                "id": "nexus_similarity_search_api_score_pair_nmi_cosine",
+                "name": "Single-Pair NMI-Cosine Scorer",
+                "description": "Computes the NMI-cosine fusion score for exactly one (query, target) vector pair at a fixed alpha. Use for explainability, debugging, or unit-level validation of fusion scores before running full corpus ranking. Requires a valid api_key (same as X-API-Key) and an x402 payment.",
+                "tags": ["similarity-search", "debugging"],
+            },
+        ],
+        "metadata": {
+            "protocol_note": (
+                "This service implements the Model Context Protocol (MCP) at /mcp, "
+                "not A2A's own JSONRPC/gRPC/HTTP+JSON task methods (message/send, "
+                "tasks/get, etc.). This Agent Card is provided for discovery/indexing "
+                "purposes; A2A-conformant task orchestration is not implemented."
+            ),
+        },
+    }
+
+
 app.mount("/", _nexus_mcp_asgi_app)
 
 # --- NEXUS: reporte de uso real a Stripe (inyectado por forge_output_saver_v6) ---
@@ -596,7 +712,7 @@ app.mount("/", _nexus_mcp_asgi_app)
 # (initialize, tools/list -- ninguno pasa por gate de auth/pago) se
 # facturaba igual que una operacion de negocio real. Confirmado en Railway:
 # STRIPE_CUSTOMER_ID/STRIPE_EVENT_NAME/STRIPE_SECRET_KEY reales, modo test.
-_NEXUS_BILLING_EXCLUDED_PATHS = {"/health", "/", "/docs", "/openapi.json", "/redoc", "/favicon.ico", "/mcp", "/similarity/search", "/similarity/calibrate-alpha/v1", "/similarity/batch-score"}  # x402 cubre estas 3 -- Stripe no debe cobrarlas de nuevo
+_NEXUS_BILLING_EXCLUDED_PATHS = {"/health", "/", "/docs", "/openapi.json", "/redoc", "/favicon.ico", "/mcp", "/similarity/search", "/similarity/calibrate-alpha/v1", "/similarity/batch-score", "/.well-known/agent-card.json"}  # x402 cubre estas 3 -- Stripe no debe cobrarlas de nuevo; agent-card.json es discovery, no negocio
 @app.middleware("http")
 async def _nexus_usage_middleware(request, call_next):
     response = await call_next(request)
@@ -645,7 +761,7 @@ from fastapi.responses import JSONResponse as _NexusRLJSONResponse
 _NEXUS_RATE_LIMIT_MAX_REQUESTS = int(_nexus_rl_os.environ.get("NEXUS_RATE_LIMIT_PER_MINUTE", "60"))
 _NEXUS_RATE_LIMIT_WINDOW_SECONDS = float(_nexus_rl_os.environ.get("NEXUS_RATE_LIMIT_WINDOW_SECONDS", "60"))
 _NEXUS_RATE_LIMIT_MAX_TRACKED = int(_nexus_rl_os.environ.get("NEXUS_RATE_LIMIT_MAX_TRACKED", "10000"))
-_NEXUS_RATE_LIMIT_EXEMPT_PATHS = {"/health", "/", "/docs", "/openapi.json", "/redoc", "/favicon.ico"}
+_NEXUS_RATE_LIMIT_EXEMPT_PATHS = {"/health", "/", "/docs", "/openapi.json", "/redoc", "/favicon.ico", "/.well-known/agent-card.json"}
 
 _nexus_rate_limit_lock = _nexus_rl_threading.Lock()
 _nexus_rate_limit_state = _NexusRLOrderedDict()
