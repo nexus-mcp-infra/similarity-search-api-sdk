@@ -458,14 +458,62 @@ def score_vector_pairs_with_fixed_alpha(
     )
 
 
-# --- NEXUS PATCH health_openapi_security_override ---
+# --- NEXUS PATCH health_real_core_computation ---
+# GET /health devolvia {"status": "ok"} hardcodeado siempre (bug real,
+# ver CLAUDE.md SS9.8/9.12/9.13) -- este asset no tiene upstream externo
+# (confirmado), asi que la unica senal honesta disponible es correr de
+# verdad el computo central (cosine + NMI + composite score) contra un
+# par de vectores dummy fijos y deterministas, y confirmar que sklearn/
+# numpy siguen funcionando -- no solo que el proceso responde. El
+# contador del rate limiter se reporta aparte, explicitamente NO ligado
+# a status: llegar a _NEXUS_RATE_LIMIT_MAX_TRACKED solo evict al caller
+# mas viejo (LRU, ver PATCH rate_limit_similarity_search mas abajo en
+# este mismo archivo), no degrada el servicio -- inflar status con eso
+# seria el mismo tipo de bug ya corregido en BuyWhere.
+_NEXUS_HEALTH_CHECK_VECTOR_A = [0.10, 0.85, 0.32, 0.67, 0.05, 0.94]
+_NEXUS_HEALTH_CHECK_VECTOR_B = [0.92, 0.15, 0.60, 0.28, 0.77, 0.03]
+
+
 @app.get(
     "/health",
     summary="Liveness probe — no auth required",
     openapi_extra={"security": []},
 )
 def liveness_probe() -> dict:
-    return {"status": "ok", "version": "1.0.0"}
+    try:
+        _a = np.asarray(_NEXUS_HEALTH_CHECK_VECTOR_A, dtype=np.float64)
+        _b = np.asarray(_NEXUS_HEALTH_CHECK_VECTOR_B, dtype=np.float64)
+        _cos = _cosine_similarity(_a, _b)
+        _nmi = _nmi_between_vectors(_a, _b, NMI_BINS_MIN)
+        _composite = _composite_score(_cos, _nmi, 0.5)
+        _core_ok = bool(
+            np.isfinite(_cos) and -1.0 <= _cos <= 1.0
+            and np.isfinite(_nmi) and 0.0 <= _nmi <= 1.0
+            and np.isfinite(_composite) and 0.0 <= _composite <= 1.0
+        )
+    except Exception:
+        _cos = _nmi = _composite = None
+        _core_ok = False
+
+    return {
+        "status": "ok" if _core_ok else "degraded",
+        "core_computation": {
+            "ok": _core_ok,
+            "sample_cosine_similarity": _cos,
+            "sample_nmi": _nmi,
+            "sample_composite_score": _composite,
+        },
+        "rate_limiter": {
+            "note": (
+                "Informational only -- NOT part of status. Hitting "
+                "max_tracked_callers evicts the oldest tracked caller "
+                "(LRU); it does not degrade the service."
+            ),
+            "tracked_callers": len(_nexus_rate_limit_state),
+            "max_tracked_callers": _NEXUS_RATE_LIMIT_MAX_TRACKED,
+        },
+        "version": "1.0.0",
+    }
 
 # --- NEXUS: servidor MCP real montado en el mismo proceso (inyectado por forge_agent) ---
 # Reemplaza el wrapper Node/TypeScript separado -- un solo deploy, sin
