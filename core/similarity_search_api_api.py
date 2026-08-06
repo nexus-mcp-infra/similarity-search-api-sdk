@@ -1013,6 +1013,24 @@ def _nexus_traffic_log_truncate_ip(raw_ip):
     return "unknown"
 
 
+# --- PATCH traffic_events_hook ---
+# Cierra CLAUDE.md SS9.59: persiste [NEXUS_TRAFFIC] tambien a
+# Supabase, aditivo -- ver _nexus_traffic_log_middleware mas abajo,
+# que llama a esta funcion JUNTO al print() existente, nunca en su
+# lugar. Misma primitiva ya agregada al generador (patch_traffic_events_hook.py).
+async def _nexus_log_traffic_event(ip_range, method, path, status) -> None:
+    try:
+        await _nexus_supabase_insert("traffic_events", {
+            "asset_name": _NEXUS_ASSET_NAME,
+            "ip_range": ip_range,
+            "method": method,
+            "path": path,
+            "status": status,
+        })
+    except Exception:
+        pass
+
+
 @app.middleware("http")
 async def _nexus_traffic_log_middleware(request, call_next):
     response = await call_next(request)
@@ -1028,6 +1046,7 @@ async def _nexus_traffic_log_middleware(request, call_next):
             f"path={request.url.path} status={response.status_code}",
             flush=True,
         )
+        await _nexus_log_traffic_event(ip_range, request.method, request.url.path, response.status_code)
     except Exception:
         pass  # nunca romper la response real por un fallo de logging
     return response
