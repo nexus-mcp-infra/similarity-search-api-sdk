@@ -1,8 +1,46 @@
+# --- PATCH sdk_route_grounding_manual_backfill ---
+# similarity-search-api-sdk, sdk_wrappers/similarity_search_api_sdk.py
+#
+# Regrounded contra el codigo real deployado (core/similarity_search_api_api.py
+# / https://similarity-search-api-production.up.railway.app/openapi.json),
+# mismo principio que sdk_route_grounding en el repo NEXUS principal
+# (CLAUDE.md SS9.43) -- esta build en particular es anterior a ese fix
+# (deployada 2026-07-18) y nunca lo recibio (CLAUDE.md SS9.53).
+#
+# 3 bugs reales encontrados, los 3 corregidos aca:
+#   1. SIMILARITY_SEARCH_BASE_URL apuntaba a un dominio que nunca existio
+#      (NXDOMAIN, confirmado con nslookup antes de este patch).
+#   2. Las 3 rutas de negocio eran inventadas ("/search", "/alpha",
+#      "/score") -- las reales son "/similarity/search",
+#      "/similarity/calibrate-alpha/v1", "/similarity/batch-score".
+#   3. Header de auth incorrecto ("Authorization: Bearer") -- el server
+#      real exige "X-API-Key" (confirmado contra
+#      core/similarity_search_api_api.py: APIKeyHeader(name="X-API-Key"),
+#      y contra components.securitySchemes del openapi.json real).
+#
+# Ademas de rutas/dominio/auth, los payloads de los 3 metodos de negocio
+# nunca fueron groundeados contra los modelos Pydantic reales (mismo tipo
+# de gap que sdk_field_mismatch/readme_field_mismatch shadow-mode en el
+# repo principal, CLAUDE.md SS9.15/9.42 -- aca no hay gate que lo
+# hubiera atrapado porque este repo no vive en output/cycle_archive, es
+# un repo GitHub aparte). search()/score_pair() aceptaban 'query'/
+# 'item_a'/'item_b' como str (busqueda semantica por texto) -- esa
+# capacidad no existe en el servidor real, que SOLO acepta vectores ya
+# calculados con un id de etiqueta (CorpusVector{id, vector}). Reescritos
+# para reflejar exactamente lo que el servidor real puede hacer, en vez
+# de solo cambiar las URLs y dejar cada llamada real fallando con 422 en
+# lugar de 404/timeout.
+#
+# Sin esto, el 100% de los metodos de negocio del SDK fallaban con
+# cualquier config default -- confirmado, no solo sospechado (CLAUDE.md
+# SS9.53). Mitigante ya vigente: nunca se publico a PyPI (404 confirmado
+# en pypi.org), asi que este bug nunca llego a un consumidor real.
+
 import httpx
 import time
 from typing import Any
 
-SIMILARITY_SEARCH_BASE_URL = "https://api.similaritysearch.nexus/v1"
+SIMILARITY_SEARCH_BASE_URL = "https://similarity-search-api-production.up.railway.app"
 SIMILARITY_SEARCH_DEFAULT_TIMEOUT = 30.0
 SIMILARITY_SEARCH_MAX_RETRIES = 3
 SIMILARITY_SEARCH_RETRY_BACKOFF = 1.5
@@ -40,6 +78,27 @@ def _validate_corpus_items(items: list[Any], param_name: str) -> None:
         raise SimilaritySearchValidationError(
             f"'{param_name}' exceeds the 500,000-item corpus limit (got {len(items)})"
         )
+    for i, item in enumerate(items):
+        if not isinstance(item, tuple) or len(item) != 2:
+            raise SimilaritySearchValidationError(
+                f"'{param_name}[{i}]' must be an (id, vector) tuple, got {type(item).__name__}"
+            )
+        item_id, vector = item
+        if not isinstance(item_id, str) or not item_id:
+            raise SimilaritySearchValidationError(
+                f"'{param_name}[{i}][0]' (id) must be a non-empty string"
+            )
+        if not isinstance(vector, list) or not vector:
+            raise SimilaritySearchValidationError(
+                f"'{param_name}[{i}][1]' (vector) must be a non-empty list of floats"
+            )
+
+
+def _validate_vector(vector: list[float], param_name: str) -> None:
+    if not isinstance(vector, list) or not vector:
+        raise SimilaritySearchValidationError(
+            f"'{param_name}' must be a non-empty list of floats"
+        )
 
 
 def _validate_top_k(top_k: int) -> None:
@@ -53,16 +112,16 @@ def _validate_top_k(top_k: int) -> None:
         )
 
 
-def _validate_alpha_override(alpha: float | None) -> None:
+def _validate_alpha(alpha: float | None) -> None:
     if alpha is None:
         return
     if not isinstance(alpha, (int, float)):
         raise SimilaritySearchValidationError(
-            f"'alpha_override' must be a float between 0.0 and 1.0, got {type(alpha).__name__}"
+            f"'alpha' must be a float between 0.0 and 1.0, got {type(alpha).__name__}"
         )
     if not (0.0 <= float(alpha) <= 1.0):
         raise SimilaritySearchValidationError(
-            f"'alpha_override' must be between 0.0 and 1.0 (got {alpha})"
+            f"'alpha' must be between 0.0 and 1.0 (got {alpha})"
         )
 
 
@@ -84,7 +143,10 @@ class Client:
         self._max_retries = max_retries
         self._http = httpx.Client(
             headers={
-                "Authorization": f"Bearer {self._api_key}",
+                # --- PATCH sdk_route_grounding_manual_backfill ---
+                # El server real exige X-API-Key (APIKeyHeader), no
+                # Authorization: Bearer -- ver core/similarity_search_api_api.py.
+                "X-API-Key": self._api_key,
                 "Content-Type": "application/json",
                 "Accept": "application/json",
                 "User-Agent": "similarity-search-sdk-python/1.0.0",
@@ -157,88 +219,119 @@ class Client:
         if not isinstance(data, dict):
             raise SimilaritySearchValidationError(
                 f"'data' must be a dict, got {type(data).__name__}. "
-                "Use search(), rank_corpus_by_nmi_cosine_fusion(), or compute_calibrated_alpha() for typed calls."
+                "Use search(), compute_calibrated_alpha(), or score_pair() for typed calls."
             )
-        return self._post_with_retry("/search", data)
+        return self._post_with_retry("/similarity/search", data)
 
     def search(
         self,
-        query: str | list[float],
-        corpus: list[str | list[float]],
+        query_vector: list[float],
+        corpus: list[tuple[str, list[float]]],
+        query_id: str = "query",
         top_k: int = 10,
+        nmi_bins: int | None = None,
         alpha_override: float | None = None,
     ) -> dict[str, Any]:
-        if query is None:
-            raise SimilaritySearchValidationError("'query' must not be None")
-        if not isinstance(query, (str, list)):
-            raise SimilaritySearchValidationError(
-                f"'query' must be a string or a list of floats, got {type(query).__name__}"
-            )
-        if isinstance(query, str) and len(query.strip()) == 0:
-            raise SimilaritySearchValidationError("'query' string must not be empty or whitespace")
+        """
+        query_vector: the vector to search with.
+        corpus: list of (id, vector) tuples to search over -- the real
+            server has no text-embedding step, every item (query
+            included) must already be a numeric vector.
+        """
+        _validate_vector(query_vector, "query_vector")
         _validate_corpus_items(corpus, "corpus")
         _validate_top_k(top_k)
-        _validate_alpha_override(alpha_override)
+        _validate_alpha(alpha_override)
 
         payload: dict[str, Any] = {
-            "query": query,
-            "corpus": corpus,
+            "query": {"id": query_id, "vector": query_vector},
+            "corpus": [{"id": cid, "vector": vec} for cid, vec in corpus],
             "top_k": top_k,
         }
+        if nmi_bins is not None:
+            payload["nmi_bins"] = nmi_bins
         if alpha_override is not None:
             payload["alpha_override"] = float(alpha_override)
 
-        return self._post_with_retry("/search", payload)
+        return self._post_with_retry("/similarity/search", payload)
 
     def rank_corpus_by_nmi_cosine_fusion(
         self,
-        query: str | list[float],
-        corpus: list[str | list[float]],
+        query_vector: list[float],
+        corpus: list[tuple[str, list[float]]],
+        query_id: str = "query",
         top_k: int = 10,
+        nmi_bins: int | None = None,
         alpha_override: float | None = None,
     ) -> list[dict[str, Any]]:
         response = self.search(
-            query=query,
+            query_vector=query_vector,
             corpus=corpus,
+            query_id=query_id,
             top_k=top_k,
+            nmi_bins=nmi_bins,
             alpha_override=alpha_override,
         )
         results = response.get("results")
         if not isinstance(results, list):
             raise SimilaritySearchAPIError(
-                f"Unexpected response shape from /search: missing 'results' list. Got keys: {list(response.keys())}"
+                f"Unexpected response shape from /similarity/search: missing 'results' list. Got keys: {list(response.keys())}"
             )
         return results
 
     def compute_calibrated_alpha(
         self,
-        corpus: list[str | list[float]],
+        corpus: list[tuple[str, list[float]]],
+        nmi_bins: int | None = None,
     ) -> dict[str, Any]:
+        """
+        Calls /similarity/calibrate-alpha/v1 -- the unversioned
+        /similarity/calibrate-alpha always returns 501 on the real
+        server (see core/similarity_search_api_api.py), the /v1 path
+        is the only usable one.
+        """
         _validate_corpus_items(corpus, "corpus")
-        return self._post_with_retry("/alpha", {"corpus": corpus})
+        payload: dict[str, Any] = {
+            "corpus": [{"id": cid, "vector": vec} for cid, vec in corpus],
+        }
+        if nmi_bins is not None:
+            payload["nmi_bins"] = nmi_bins
+        return self._post_with_retry("/similarity/calibrate-alpha/v1", payload)
 
     def score_pair(
         self,
-        item_a: str | list[float],
-        item_b: str | list[float],
-        alpha_override: float | None = None,
+        vector_a: list[float],
+        vector_b: list[float],
+        alpha: float = 0.5,
+        nmi_bins: int | None = None,
     ) -> dict[str, Any]:
-        if item_a is None or item_b is None:
-            raise SimilaritySearchValidationError("'item_a' and 'item_b' must not be None")
-        for name, item in (("item_a", item_a), ("item_b", item_b)):
-            if not isinstance(item, (str, list)):
-                raise SimilaritySearchValidationError(
-                    f"'{name}' must be a string or a list of floats, got {type(item).__name__}"
-                )
-            if isinstance(item, str) and len(item.strip()) == 0:
-                raise SimilaritySearchValidationError(f"'{name}' string must not be empty or whitespace")
-        _validate_alpha_override(alpha_override)
+        """
+        The real server has no single-pair scoring endpoint -- this
+        calls /similarity/batch-score with a single pair and unwraps
+        the one score, which is the only real equivalent available.
+        """
+        _validate_vector(vector_a, "vector_a")
+        _validate_vector(vector_b, "vector_b")
+        _validate_alpha(alpha)
 
-        payload: dict[str, Any] = {"item_a": item_a, "item_b": item_b}
-        if alpha_override is not None:
-            payload["alpha_override"] = float(alpha_override)
+        payload: dict[str, Any] = {
+            "pairs": [[vector_a, vector_b]],
+            "alpha": float(alpha),
+        }
+        if nmi_bins is not None:
+            payload["nmi_bins"] = nmi_bins
 
-        return self._post_with_retry("/score", payload)
+        response = self._post_with_retry("/similarity/batch-score", payload)
+        scores = response.get("scores")
+        if not isinstance(scores, list) or not scores:
+            raise SimilaritySearchAPIError(
+                f"Unexpected response shape from /similarity/batch-score: missing 'scores' list. Got keys: {list(response.keys())}"
+            )
+        return {
+            "score": scores[0],
+            "alpha_used": response.get("alpha_used"),
+            "latency_ms": response.get("latency_ms"),
+        }
 
     def close(self) -> None:
         self._http.close()

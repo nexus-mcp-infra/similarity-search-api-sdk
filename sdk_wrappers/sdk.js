@@ -1,8 +1,30 @@
+// --- PATCH sdk_route_grounding_manual_backfill ---
+// similarity-search-api-sdk, sdk_wrappers/sdk.js
+//
+// Regrounded contra el codigo real deployado (core/similarity_search_api_api.py
+// / https://similarity-search-api-production.up.railway.app/openapi.json),
+// transliterado desde sdk_wrappers/similarity_search_api_sdk.py ya
+// corregido en este mismo patch -- mismo principio que CLAUDE.md SS9.43
+// (sdk.js debe reflejar el sdk.py real, no reinventar su propio esquema).
+//
+// Esta version de sdk.js nunca fue transliterada de nada real -- las 4
+// rutas que llamaba (/similarity/nmi-cosine, /similarity/nmi-cosine/batch,
+// /similarity/entropy-calibration, /similarity/pairwise-rank) no
+// corresponden a NINGUNA ruta real del servidor, y el dominio tambien
+// era fabricado (api.similarity-search.nexus, distinto incluso del
+// dominio fabricado que tenia sdk.py -- confirma que los dos SDKs se
+// generaron sin verse entre si). Auth header tambien incorrecto
+// (Authorization: Bearer en vez de X-API-Key). Reescrito para exponer
+// los mismos 3 metodos reales que sdk.py (search/computeCalibratedAlpha/
+// scorePair) -- batchComputeNmiCosineScores/inspectEntropyCalibration/
+// rankPairwiseNmiCosine no tenian contraparte real en el servidor y se
+// eliminan en vez de dejarlos apuntando a endpoints inventados.
+
 const axios = require('axios');
 
-const BASE_URL = process.env.SIMILARITY_API_URL || 'https://api.similarity-search.nexus/v1';
+const BASE_URL = process.env.SIMILARITY_API_URL || 'https://similarity-search-api-production.up.railway.app';
 const DEFAULT_TIMEOUT_MS = 30000;
-const MAX_ITEMS_PER_REQUEST = 500000;
+const MAX_CORPUS_ITEMS = 500000;
 const MIN_ALPHA = 0.0;
 const MAX_ALPHA = 1.0;
 
@@ -50,7 +72,10 @@ function buildAxiosInstance(apiKey, timeoutMs) {
     baseURL: BASE_URL,
     timeout: timeoutMs || DEFAULT_TIMEOUT_MS,
     headers: {
-      'Authorization': `Bearer ${apiKey}`,
+      // --- PATCH sdk_route_grounding_manual_backfill ---
+      // El server real exige X-API-Key (APIKeyHeader), no
+      // Authorization: Bearer -- ver core/similarity_search_api_api.py.
+      'X-API-Key': apiKey,
       'Content-Type': 'application/json',
       'Accept': 'application/json',
       'X-Client': 'similarity-search-sdk-js/1.0.0'
@@ -80,11 +105,8 @@ function wrapAxiosError(err) {
 }
 
 function validateVector(vec, label) {
-  if (!Array.isArray(vec)) {
-    throw new ValidationError(`${label} must be an array of numbers.`);
-  }
-  if (vec.length === 0) {
-    throw new ValidationError(`${label} must not be empty.`);
+  if (!Array.isArray(vec) || vec.length === 0) {
+    throw new ValidationError(`${label} must be a non-empty array of numbers.`);
   }
   for (let i = 0; i < vec.length; i++) {
     if (typeof vec[i] !== 'number' || !isFinite(vec[i])) {
@@ -93,47 +115,53 @@ function validateVector(vec, label) {
   }
 }
 
+// corpus: array of [id, vector] pairs -- mirrors sdk.py's
+// list[tuple[str, list[float]]]. The real server has no text-embedding
+// step, every corpus item (and the query) must already be a numeric
+// vector with an id label (CorpusVector{id, vector}).
 function validateCorpusItems(items) {
-  if (!Array.isArray(items)) {
-    throw new ValidationError('corpus must be an array of item objects.');
+  if (!Array.isArray(items) || items.length === 0) {
+    throw new ValidationError('corpus must be a non-empty array of [id, vector] pairs.');
   }
-  if (items.length === 0) {
-    throw new ValidationError('corpus must contain at least one item.');
-  }
-  if (items.length > MAX_ITEMS_PER_REQUEST) {
+  if (items.length > MAX_CORPUS_ITEMS) {
     throw new ValidationError(
-      `corpus exceeds maximum of ${MAX_ITEMS_PER_REQUEST} items per request. Received: ${items.length}.`
+      `corpus exceeds maximum of ${MAX_CORPUS_ITEMS} items per request. Received: ${items.length}.`
     );
   }
   for (let i = 0; i < items.length; i++) {
     const item = items[i];
-    if (!item || typeof item !== 'object') {
-      throw new ValidationError(`corpus[${i}] must be an object with 'id' and 'vector' fields.`);
+    if (!Array.isArray(item) || item.length !== 2) {
+      throw new ValidationError(`corpus[${i}] must be an [id, vector] pair.`);
     }
-    if (item.id === undefined || item.id === null) {
-      throw new ValidationError(`corpus[${i}].id is required and must not be null.`);
+    const [id, vector] = item;
+    if (typeof id !== 'string' || id.length === 0) {
+      throw new ValidationError(`corpus[${i}][0] (id) must be a non-empty string.`);
     }
-    validateVector(item.vector, `corpus[${i}].vector`);
+    validateVector(vector, `corpus[${i}][1]`);
   }
 }
 
-function validateAlphaOverride(alpha) {
+function validateAlpha(alpha) {
   if (alpha === undefined || alpha === null) return;
   if (typeof alpha !== 'number' || !isFinite(alpha)) {
-    throw new ValidationError('alphaOverride must be a finite number between 0.0 and 1.0.');
+    throw new ValidationError('alpha must be a finite number between 0.0 and 1.0.');
   }
   if (alpha < MIN_ALPHA || alpha > MAX_ALPHA) {
     throw new ValidationError(
-      `alphaOverride must be between ${MIN_ALPHA} and ${MAX_ALPHA}. Received: ${alpha}.`
+      `alpha must be between ${MIN_ALPHA} and ${MAX_ALPHA}. Received: ${alpha}.`
     );
   }
 }
 
 function validateTopK(topK) {
   if (topK === undefined || topK === null) return;
-  if (!Number.isInteger(topK) || topK < 1 || topK > 10000) {
-    throw new ValidationError('topK must be an integer between 1 and 10000.');
+  if (!Number.isInteger(topK) || topK < 1 || topK > 1000) {
+    throw new ValidationError('topK must be an integer between 1 and 1000.');
   }
+}
+
+function corpusToPayload(corpus) {
+  return corpus.map(([id, vector]) => ({ id, vector }));
 }
 
 class SimilaritySearchClient {
@@ -145,141 +173,98 @@ class SimilaritySearchClient {
     );
   }
 
-  async computeNmiCosineScore(queryVector, corpus, options) {
+  async search(queryVector, corpus, options) {
     if (queryVector === undefined || queryVector === null) {
       throw new ValidationError('queryVector is required and must not be null or undefined.');
     }
     validateVector(queryVector, 'queryVector');
     validateCorpusItems(corpus);
 
+    const queryId = (options && options.queryId) || 'query';
     const topK = (options && options.topK) !== undefined ? options.topK : 10;
+    const nmiBins = options && options.nmiBins;
     const alphaOverride = options && options.alphaOverride;
     validateTopK(topK);
-    validateAlphaOverride(alphaOverride);
+    validateAlpha(alphaOverride);
 
     const payload = {
-      query_vector: queryVector,
-      corpus: corpus.map(item => ({ id: item.id, vector: item.vector })),
+      query: { id: queryId, vector: queryVector },
+      corpus: corpusToPayload(corpus),
       top_k: topK
     };
+    if (nmiBins !== undefined && nmiBins !== null) {
+      payload.nmi_bins = nmiBins;
+    }
     if (alphaOverride !== undefined && alphaOverride !== null) {
       payload.alpha_override = alphaOverride;
     }
 
     try {
-      const response = await this._http.post('/similarity/nmi-cosine', payload);
+      const response = await this._http.post('/similarity/search', payload);
       return response.data;
     } catch (err) {
       throw wrapAxiosError(err);
     }
   }
 
-  async batchComputeNmiCosineScores(queries, corpus, options) {
-    if (!Array.isArray(queries)) {
-      throw new ValidationError('queries must be an array of query objects.');
-    }
-    if (queries.length === 0) {
-      throw new ValidationError('queries must contain at least one query.');
-    }
-    if (queries.length > 100) {
-      throw new ValidationError(
-        `Maximum 100 queries per batch request. Received: ${queries.length}.`
-      );
-    }
-    for (let i = 0; i < queries.length; i++) {
-      const q = queries[i];
-      if (!q || typeof q !== 'object') {
-        throw new ValidationError(`queries[${i}] must be an object with 'queryId' and 'vector' fields.`);
-      }
-      if (q.queryId === undefined || q.queryId === null) {
-        throw new ValidationError(`queries[${i}].queryId is required.`);
-      }
-      validateVector(q.vector, `queries[${i}].vector`);
-    }
+  // Calls /similarity/calibrate-alpha/v1 -- the unversioned
+  // /similarity/calibrate-alpha always returns 501 on the real server
+  // (see core/similarity_search_api_api.py), the /v1 path is the only
+  // usable one.
+  async computeCalibratedAlpha(corpus, options) {
     validateCorpusItems(corpus);
-
-    const topK = (options && options.topK) !== undefined ? options.topK : 10;
-    const alphaOverride = options && options.alphaOverride;
-    validateTopK(topK);
-    validateAlphaOverride(alphaOverride);
+    const nmiBins = options && options.nmiBins;
 
     const payload = {
-      queries: queries.map(q => ({ query_id: q.queryId, vector: q.vector })),
-      corpus: corpus.map(item => ({ id: item.id, vector: item.vector })),
-      top_k: topK
+      corpus: corpusToPayload(corpus)
     };
-    if (alphaOverride !== undefined && alphaOverride !== null) {
-      payload.alpha_override = alphaOverride;
+    if (nmiBins !== undefined && nmiBins !== null) {
+      payload.nmi_bins = nmiBins;
     }
 
     try {
-      const response = await this._http.post('/similarity/nmi-cosine/batch', payload);
+      const response = await this._http.post('/similarity/calibrate-alpha/v1', payload);
       return response.data;
     } catch (err) {
       throw wrapAxiosError(err);
     }
   }
 
-  async inspectEntropyCalibration(corpus) {
-    validateCorpusItems(corpus);
+  // The real server has no single-pair scoring endpoint -- this calls
+  // /similarity/batch-score with a single pair and unwraps the one
+  // score, which is the only real equivalent available.
+  async scorePair(vectorA, vectorB, options) {
+    validateVector(vectorA, 'vectorA');
+    validateVector(vectorB, 'vectorB');
+    const alpha = (options && options.alpha) !== undefined ? options.alpha : 0.5;
+    const nmiBins = options && options.nmiBins;
+    validateAlpha(alpha);
 
     const payload = {
-      corpus: corpus.map(item => ({ id: item.id, vector: item.vector }))
+      pairs: [[vectorA, vectorB]],
+      alpha
     };
+    if (nmiBins !== undefined && nmiBins !== null) {
+      payload.nmi_bins = nmiBins;
+    }
 
     try {
-      const response = await this._http.post('/similarity/entropy-calibration', payload);
-      return response.data;
-    } catch (err) {
-      throw wrapAxiosError(err);
-    }
-  }
-
-  async rankPairwiseNmiCosine(itemPairs, options) {
-    if (!Array.isArray(itemPairs)) {
-      throw new ValidationError('itemPairs must be an array of pair objects.');
-    }
-    if (itemPairs.length === 0) {
-      throw new ValidationError('itemPairs must contain at least one pair.');
-    }
-    if (itemPairs.length > 50000) {
-      throw new ValidationError(
-        `Maximum 50000 pairs per request. Received: ${itemPairs.length}.`
-      );
-    }
-    for (let i = 0; i < itemPairs.length; i++) {
-      const pair = itemPairs[i];
-      if (!pair || typeof pair !== 'object') {
-        throw new ValidationError(`itemPairs[${i}] must be an object with 'a' and 'b' vector arrays.`);
-      }
-      validateVector(pair.a, `itemPairs[${i}].a`);
-      validateVector(pair.b, `itemPairs[${i}].b`);
-      if (pair.a.length !== pair.b.length) {
-        throw new ValidationError(
-          `itemPairs[${i}]: vectors 'a' and 'b' must have equal dimensionality. ` +
-          `Got a.length=${pair.a.length}, b.length=${pair.b.length}.`
+      const response = await this._http.post('/similarity/batch-score', payload);
+      const scores = response.data && response.data.scores;
+      if (!Array.isArray(scores) || scores.length === 0) {
+        throw new SimilaritySearchError(
+          `Unexpected response shape from /similarity/batch-score: missing 'scores' array.`,
+          response.status,
+          response.data
         );
       }
-    }
-
-    const alphaOverride = options && options.alphaOverride;
-    validateAlphaOverride(alphaOverride);
-
-    const payload = {
-      pairs: itemPairs.map((pair, i) => ({
-        pair_id: pair.pairId !== undefined ? pair.pairId : i,
-        a: pair.a,
-        b: pair.b
-      }))
-    };
-    if (alphaOverride !== undefined && alphaOverride !== null) {
-      payload.alpha_override = alphaOverride;
-    }
-
-    try {
-      const response = await this._http.post('/similarity/pairwise-rank', payload);
-      return response.data;
+      return {
+        score: scores[0],
+        alphaUsed: response.data.alpha_used,
+        latencyMs: response.data.latency_ms
+      };
     } catch (err) {
+      if (err instanceof SimilaritySearchError) throw err;
       throw wrapAxiosError(err);
     }
   }
@@ -300,14 +285,11 @@ const _defaultClient = {
 };
 
 async function mainMethod(data) {
-  if (data === undefined || data === null) {
-    throw new ValidationError('data must be a non-null object with queryVector and corpus fields.');
-  }
-  if (typeof data !== 'object' || Array.isArray(data)) {
+  if (data === undefined || data === null || typeof data !== 'object' || Array.isArray(data)) {
     throw new ValidationError('data must be a plain object with queryVector and corpus fields.');
   }
   const client = _defaultClient._getInstance();
-  return client.computeNmiCosineScore(data.queryVector, data.corpus, data.options);
+  return client.search(data.queryVector, data.corpus, data.options);
 }
 
 module.exports = {
