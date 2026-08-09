@@ -64,6 +64,14 @@ jobs:
           region: ${{ inputs.region }}
           project_id: ${{ secrets.GCP_PROJECT_ID }}
           source: "./"
+          # --- PATCH cloud_run_workflow_allow_unauth ---
+          # Sin esto, Cloud Run deja el servicio privado por default
+          # (403 "Forbidden" de Google Frontend, nunca llega al
+          # contenedor -- confirmado en vivo contra el primer deploy
+          # real del piloto, 2026-08-09). El asset real equivalente en
+          # Railway ya es publico -- esto solo iguala el nivel de
+          # acceso del piloto, no expone nada nuevo.
+          flags: --allow-unauthenticated
           # env_vars: pendiente -- CloudRunDeployer.trigger_deploy() no
           # las pasa todavía como input del workflow_dispatch (ver
           # docstring de trigger_deploy(), limitación documentada a
