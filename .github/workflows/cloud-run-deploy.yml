@@ -1,0 +1,77 @@
+name: Cloud Run Deploy (piloto)
+
+# CLAUDE.md Tarea 1 (Cloud Run), Fase 1 -- 2026-08-09.
+#
+# Cloud Run no tiene el webhook nativo que Railway sí tiene (push a un
+# repo conectado -> build+deploy automático), así que ese rol lo cumple
+# este workflow: CloudRunDeployer.trigger_deploy()
+# (src/integrations/cloud_run_client.py) lo dispara vía la API de
+# GitHub (workflow_dispatch), no bloqueante, y CloudRunDeployer.
+# reconcile_deployment() confirma el resultado después hablando directo
+# contra la Cloud Run Admin API v2 -- no contra este workflow.
+#
+# NO APLICADO A NINGÚN REPO REAL TODAVÍA. Vive en el repo orquestador
+# (nexus) como plantilla de referencia -- adoptarlo de verdad significa
+# copiarlo (o su equivalente) al repo real del asset (hoy
+# nexus-mcp-infra/similarity-search-api-sdk) y configurar los secrets
+# de abajo, decisión explícita que corresponde al stop point de Fase 1
+# (ver CLAUDE.md Tarea 1), no algo que este workflow haga por sí solo
+# con solo existir acá.
+#
+# Requiere (ninguno configurado hoy, ver plan de corte):
+#   - Un proyecto GCP real con Cloud Run + Cloud Build APIs habilitadas.
+#   - Workload Identity Federation (preferido sobre una service account
+#     key de larga duración) con un pool/provider que confíe en el repo
+#     real del asset -- secrets GCP_WORKLOAD_IDENTITY_PROVIDER y
+#     GCP_SERVICE_ACCOUNT en ese repo.
+#   - GCP_PROJECT_ID como variable/secret del repo.
+
+on:
+  workflow_dispatch:
+    inputs:
+      service_id:
+        description: "Nombre del servicio Cloud Run (DNS-1035: minúsculas/números/guiones, máx 63 chars, ya slugificado por el caller)"
+        required: true
+        type: string
+      region:
+        description: "Región de Cloud Run"
+        required: false
+        type: string
+        default: "us-central1"
+
+permissions:
+  contents: read
+  id-token: write  # requerido por Workload Identity Federation (auth@v3)
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Autenticar contra GCP (Workload Identity Federation)
+        uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Deploy a Cloud Run desde source (build vía Cloud Build implícito)
+        id: deploy
+        uses: google-github-actions/deploy-cloudrun@v3
+        with:
+          service: ${{ inputs.service_id }}
+          region: ${{ inputs.region }}
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+          source: "./"
+          # env_vars: pendiente -- CloudRunDeployer.trigger_deploy() no
+          # las pasa todavía como input del workflow_dispatch (ver
+          # docstring de trigger_deploy(), limitación documentada a
+          # propósito, no bug). Por ahora las variables reales del
+          # asset (SUPABASE_URL, etc., mismo patrón que
+          # run_autonomous_cycle_v3.py:806-831 ya usa para Railway)
+          # requerirían agregarse acá antes de un piloto con un asset
+          # real que las necesite.
+
+      - name: URL del servicio deployado
+        run: echo "Deployed to ${{ steps.deploy.outputs.url }}"
