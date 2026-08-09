@@ -860,6 +860,18 @@ async def _nexus_favicon():
     return Response(content=_NEXUS_FAVICON_ICO, media_type="image/x-icon")
 
 
+# --- PATCH llms_txt_similarity_search ---
+# Sirve llms_txt/similarity-search-api.llms.txt real (CLAUDE.md SS9.71) --
+# grounded contra el openapi.json/README reales del deploy, no generado en runtime.
+_NEXUS_LLMS_TXT_CONTENT = '# Calibrated Similarity Search API\n\n> Stateless NMI (normalized mutual information) + cosine fusion similarity search over pre-computed numeric vectors, with an entropy-calibrated blending weight (alpha) computed per request. Operates on vectors only — no text embedding is performed server-side; embed upstream before calling.\n\nThe API is stateless: every request carries its own corpus/vectors, there is no persistent index or session. Base URL: https://similarity-search-api-production.up.railway.app\n\nPricing: pay-per-call via the x402 protocol (USDC on Base Sepolia, $0.01 per call, no API key required) on the three business endpoints below, or Stripe metered billing for provisioned accounts. As of 2026-08-09 the x402 charge is temporarily suspended under a freemium promotional period (`NEXUS_X402_FREE_MODE`, through ~2026-08-16) — calls succeed without payment during that window; check `/openapi.json` for the current `x-payment-info` extension on each operation before assuming a price is enforced.\n\n## Endpoints\n\n- [POST /similarity/search](https://similarity-search-api-production.up.railway.app/similarity/search): Stateless NMI + cosine fusion search over an inline corpus.\n- [POST /similarity/calibrate-alpha](https://similarity-search-api-production.up.railway.app/similarity/calibrate-alpha): Computes the entropy-calibrated alpha for a corpus without executing a query.\n- [POST /similarity/calibrate-alpha/v1](https://similarity-search-api-production.up.railway.app/similarity/calibrate-alpha/v1): Inspects the entropy-calibrated alpha for a corpus before committing to a search — priced, x402-gated variant of the endpoint above.\n- [POST /similarity/batch-score](https://similarity-search-api-production.up.railway.app/similarity/batch-score): Scores up to 10,000 vector pairs with a fixed alpha, no corpus overhead.\n- [GET /health](https://similarity-search-api-production.up.railway.app/health): Liveness probe, no authentication required.\n\n## MCP\n\n- [MCP endpoint](https://similarity-search-api-production.up.railway.app/mcp): Same three business operations exposed as MCP tools over streamable HTTP, for agent clients that speak MCP instead of raw REST.\n- [Agent Card](https://similarity-search-api-production.up.railway.app/.well-known/agent-card.json): A2A-style agent card describing the exposed skills.\n\n## Optional\n\n- [OpenAPI spec](https://similarity-search-api-production.up.railway.app/openapi.json): Full machine-readable schema, including per-operation `x-payment-info`.\n- [Source (SDK repo)](https://github.com/nexus-mcp-infra/similarity-search-api-sdk): README with request/response examples and HTTP usage.\n'
+
+
+@app.get("/llms.txt", include_in_schema=False)
+async def _nexus_llms_txt():
+    from fastapi.responses import PlainTextResponse
+    return PlainTextResponse(content=_NEXUS_LLMS_TXT_CONTENT, media_type="text/plain; charset=utf-8")
+
+
 app.mount("/", _nexus_mcp_asgi_app)
 
 # --- NEXUS: reporte de uso real a Stripe (inyectado por forge_output_saver_v6) ---
@@ -873,7 +885,7 @@ app.mount("/", _nexus_mcp_asgi_app)
 # (initialize, tools/list -- ninguno pasa por gate de auth/pago) se
 # facturaba igual que una operacion de negocio real. Confirmado en Railway:
 # STRIPE_CUSTOMER_ID/STRIPE_EVENT_NAME/STRIPE_SECRET_KEY reales, modo test.
-_NEXUS_BILLING_EXCLUDED_PATHS = {"/health", "/", "/docs", "/openapi.json", "/redoc", "/favicon.ico", "/mcp", "/similarity/search", "/similarity/calibrate-alpha/v1", "/similarity/batch-score", "/.well-known/agent-card.json"}  # x402 cubre estas 3 -- Stripe no debe cobrarlas de nuevo; agent-card.json es discovery, no negocio
+_NEXUS_BILLING_EXCLUDED_PATHS = {"/health", "/", "/docs", "/openapi.json", "/redoc", "/favicon.ico", "/llms.txt", "/mcp", "/similarity/search", "/similarity/calibrate-alpha/v1", "/similarity/batch-score", "/.well-known/agent-card.json"}  # x402 cubre estas 3 -- Stripe no debe cobrarlas de nuevo; agent-card.json es discovery, no negocio
 @app.middleware("http")
 async def _nexus_usage_middleware(request, call_next):
     response = await call_next(request)
@@ -922,7 +934,7 @@ from fastapi.responses import JSONResponse as _NexusRLJSONResponse
 _NEXUS_RATE_LIMIT_MAX_REQUESTS = int(_nexus_rl_os.environ.get("NEXUS_RATE_LIMIT_PER_MINUTE", "60"))
 _NEXUS_RATE_LIMIT_WINDOW_SECONDS = float(_nexus_rl_os.environ.get("NEXUS_RATE_LIMIT_WINDOW_SECONDS", "60"))
 _NEXUS_RATE_LIMIT_MAX_TRACKED = int(_nexus_rl_os.environ.get("NEXUS_RATE_LIMIT_MAX_TRACKED", "10000"))
-_NEXUS_RATE_LIMIT_EXEMPT_PATHS = {"/health", "/", "/docs", "/openapi.json", "/redoc", "/favicon.ico", "/.well-known/agent-card.json"}
+_NEXUS_RATE_LIMIT_EXEMPT_PATHS = {"/health", "/", "/docs", "/openapi.json", "/redoc", "/favicon.ico", "/llms.txt", "/.well-known/agent-card.json"}
 
 _nexus_rate_limit_lock = _nexus_rl_threading.Lock()
 _nexus_rate_limit_state = _NexusRLOrderedDict()
