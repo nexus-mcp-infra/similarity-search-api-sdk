@@ -872,6 +872,50 @@ async def _nexus_llms_txt():
     return PlainTextResponse(content=_NEXUS_LLMS_TXT_CONTENT, media_type="text/plain; charset=utf-8")
 
 
+# --- NEXUS: receptor real de webhooks de Stripe (inyectado por forge_output_saver_v6) ---
+from fastapi import Request as _NexusStripeRequest
+from fastapi.responses import JSONResponse as _NexusStripeJSONResponse
+
+@app.post("/stripe/webhook")
+async def _nexus_stripe_webhook(request: _NexusStripeRequest):
+    import os as _nexus_os
+    import stripe as _nexus_stripe
+    _webhook_secret = _nexus_os.environ.get("STRIPE_WEBHOOK_SECRET")
+    if not _webhook_secret:
+        return _NexusStripeJSONResponse(
+            status_code=404,
+            content={"error": "stripe webhook not configured"},
+        )
+    _secret_key = _nexus_os.environ.get("STRIPE_SECRET_KEY")
+    if _secret_key:
+        _nexus_stripe.api_key = _secret_key
+    _payload = await request.body()
+    _sig_header = request.headers.get("stripe-signature", "")
+    try:
+        _event = _nexus_stripe.Webhook.construct_event(
+            _payload, _sig_header, _webhook_secret
+        )
+    except ValueError:
+        return _NexusStripeJSONResponse(
+            status_code=400, content={"error": "invalid payload"}
+        )
+    except _nexus_stripe.error.SignatureVerificationError:
+        return _NexusStripeJSONResponse(
+            status_code=400, content={"error": "invalid signature"}
+        )
+    # NEXUS: solo verificacion + ack real -- el gate de
+    # autorizacion por estado de suscripcion y la politica de
+    # dunning/downgrade son decisiones de producto pendientes,
+    # no implementadas a proposito (ver CLAUDE.md).
+    print(
+        f"[NEXUS_STRIPE_WEBHOOK] type={_event['type']} "
+        f"id={_event['id']}"
+    )
+    return _NexusStripeJSONResponse(
+        status_code=200, content={"received": True}
+    )
+
+
 app.mount("/", _nexus_mcp_asgi_app)
 
 # --- NEXUS: reporte de uso real a Stripe (inyectado por forge_output_saver_v6) ---
@@ -885,7 +929,7 @@ app.mount("/", _nexus_mcp_asgi_app)
 # (initialize, tools/list -- ninguno pasa por gate de auth/pago) se
 # facturaba igual que una operacion de negocio real. Confirmado en Railway:
 # STRIPE_CUSTOMER_ID/STRIPE_EVENT_NAME/STRIPE_SECRET_KEY reales, modo test.
-_NEXUS_BILLING_EXCLUDED_PATHS = {"/health", "/", "/docs", "/openapi.json", "/redoc", "/favicon.ico", "/llms.txt", "/mcp", "/similarity/search", "/similarity/calibrate-alpha/v1", "/similarity/batch-score", "/.well-known/agent-card.json"}  # x402 cubre estas 3 -- Stripe no debe cobrarlas de nuevo; agent-card.json es discovery, no negocio
+_NEXUS_BILLING_EXCLUDED_PATHS = {"/health", "/", "/docs", "/openapi.json", "/redoc", "/favicon.ico", "/llms.txt", "/mcp", "/similarity/search", "/similarity/calibrate-alpha/v1", "/similarity/batch-score", "/.well-known/agent-card.json", "/stripe/webhook"}  # x402 cubre estas 3 -- Stripe no debe cobrarlas de nuevo; agent-card.json es discovery, no negocio
 @app.middleware("http")
 async def _nexus_usage_middleware(request, call_next):
     response = await call_next(request)
