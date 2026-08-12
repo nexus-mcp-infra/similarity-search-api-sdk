@@ -70,6 +70,81 @@ async def _nexus_supabase_insert(table, payload):
         pass  # nunca romper el flujo real por un fallo de telemetria
 
 
+# --- PATCH mcp_call_events_retrofit ---
+# Retrofit de mcp_call_events (proxy de uso/latencia) -- portado del
+# template real del generador (mcp_wrapper_generator.py). Divergencia
+# deliberada: no porta extraccion de wallet pagadora (no la usa este
+# insert). Ver patch_mcp_call_events_retrofit_similarity_search.py.
+_NEXUS_SECTOR = "uncategorized"
+
+
+def _nexus_truncate_ip(raw_ip):
+    """Trunca a /24 (IPv4) o /64 (IPv6); nunca devuelve la IP completa."""
+    if not raw_ip:
+        return None
+    if ":" in raw_ip and "." not in raw_ip:
+        segments = [s for s in raw_ip.split(":") if s]
+        head = segments[:4] if len(segments) >= 4 else segments
+        return (":".join(head) + "::/64") if head else None
+    octets = raw_ip.split(".")
+    if len(octets) == 4 and all(o.isdigit() for o in octets):
+        return f"{octets[0]}.{octets[1]}.{octets[2]}.0/24"
+    return None
+
+
+def _nexus_call_context(ctx):
+    """Best-effort: ctx.request_context.request es un starlette.Request
+    real incluso con stateless_http=True (poblado por request HTTP
+    individual, ver mcp/server/streamable_http.py en mcp==1.28.1)."""
+    ip_range = None
+    agent_framework = None
+    try:
+        request = ctx.request_context.request if ctx is not None else None
+        if request is not None:
+            forwarded = request.headers.get("x-forwarded-for")
+            raw_ip = forwarded.split(",")[0].strip() if forwarded else (
+                request.client.host if request.client else None
+            )
+            ip_range = _nexus_truncate_ip(raw_ip)
+            ua = request.headers.get("user-agent")
+            agent_framework = ua[:255] if ua else None
+    except Exception:
+        pass
+    return ip_range, agent_framework
+
+
+async def _nexus_log_mcp_call_event(tool_id, success, latency_ms, ctx, route_key=None):
+    """Escribe mcp_call_events (proxy de uso/latencia) siempre que haya
+    credenciales -- dispara en el finally de cada tool MCP, antes de
+    cualquier intento de settlement x402 real para esa llamada.
+    price_charged: "cuanto hubiera cobrado esta llamada si el pago
+    hubiera settleado", no una afirmacion de que settleo -- mismo
+    criterio del generador."""
+    ip_range, agent_framework = _nexus_call_context(ctx)
+    price_charged = None
+    x402_routes = globals().get("_NEXUS_X402_ROUTES") or {}
+    is_paid_route = route_key is not None and route_key in x402_routes
+    if is_paid_route:
+        raw_price = globals().get("_NEXUS_X402_PRICE")
+        if raw_price:
+            try:
+                price_charged = float(str(raw_price).lstrip("$"))
+            except Exception:
+                price_charged = None
+    await _nexus_supabase_insert("mcp_call_events", {
+        "agent_framework": agent_framework,
+        "tool_id": tool_id,
+        "sector": _NEXUS_SECTOR,
+        "asset_name": _NEXUS_ASSET_NAME,
+        "token_input": None,
+        "token_output": None,
+        "success": success,
+        "latency_ms": latency_ms,
+        "client_ip_range": ip_range,
+        "price_charged": price_charged,
+    })
+
+
 async def _nexus_log_x402_revenue_event(ctx) -> None:
     """
     AfterSettleHook real -- dispara SOLO cuando x402ResourceServer
@@ -594,6 +669,7 @@ def liveness_probe() -> dict:
 
 from typing import Annotated, Any, Literal
 from contextlib import AsyncExitStack as _NexusMcpExitStack
+import asyncio
 import os
 import httpx
 from pydantic import Field
@@ -708,39 +784,81 @@ else:
 @_nexus_mcp_x402_wrapper
 async def rank_items_by_nmi_cosine_fusion(query_vector: Annotated[list[float], Field(..., description='Dense numeric vector representing the query item. Must have the same dimensionality as all corpus_vectors entries.', min_length=2, max_length=4096)], corpus_vectors: Annotated[list[list[float]], Field(..., description='List of dense numeric vectors forming the corpus to rank against. Each inner array must match query_vector dimensionality. Maximum 500000 entries.', min_length=1, max_length=500000)], top_k: Annotated[float, Field(10, description='Number of top-ranked results to return, ordered by descending fusion score. Capped at 1000 by the core service regardless of corpus size.', ge=1, le=1000)], alpha_override: Annotated[float, Field(None, description='Fixed alpha weight for cosine component in [0.0, 1.0]. If omitted, alpha is auto-calibrated from corpus entropy. Set to 1.0 to use pure cosine; 0.0 for pure NMI.', ge=0.0, le=1.0)], n_bins: Annotated[float, Field(16, description='Number of histogram bins used to discretize continuous dimensions when estimating NMI. Must be between 3 and 50.', ge=3, le=50)], api_key: Annotated[str, Field(..., description='API key required for this paid operation -- same secret configured as X-API-Key on the REST endpoints (SIMILARITY_API_KEY). Payment (x402) alone is not sufficient; both gates must pass.')]) -> dict[str, Any]:
     """NMI-Cosine Fused Similarity Ranking"""
-    _require_api_key(key=api_key)
-    corpus_ids = [str(i) for i in range(len(corpus_vectors))]
-    request_obj = SimilaritySearchRequest(
-        query=CorpusVector(id="query", vector=query_vector),
-        corpus=[CorpusVector(id=cid, vector=vec) for cid, vec in zip(corpus_ids, corpus_vectors)],
-        top_k=int(top_k),
-        nmi_bins=int(n_bins),
-        alpha_override=alpha_override,
-    )
-    response = search_corpus_by_calibrated_similarity(request_obj, _key=_VALID_API_KEY)
-    return response.model_dump()
+    # --- PATCH mcp_call_events_retrofit ---
+    _nexus_call_t0 = time.monotonic()
+    _nexus_call_success = True
+    try:
+        _require_api_key(key=api_key)
+        corpus_ids = [str(i) for i in range(len(corpus_vectors))]
+        request_obj = SimilaritySearchRequest(
+            query=CorpusVector(id="query", vector=query_vector),
+            corpus=[CorpusVector(id=cid, vector=vec) for cid, vec in zip(corpus_ids, corpus_vectors)],
+            top_k=int(top_k),
+            nmi_bins=int(n_bins),
+            alpha_override=alpha_override,
+        )
+        response = search_corpus_by_calibrated_similarity(request_obj, _key=_VALID_API_KEY)
+        return response.model_dump()
+    except Exception:
+        _nexus_call_success = False
+        raise
+    finally:
+        _nexus_call_latency_ms = int((time.monotonic() - _nexus_call_t0) * 1000)
+        _nexus_call_ctx = _nexus_mcp.get_context()
+        asyncio.create_task(_nexus_log_mcp_call_event(
+            'nexus_similarity_search_api_rank_items_by_nmi_cosine_fusion', _nexus_call_success, _nexus_call_latency_ms, _nexus_call_ctx,
+            route_key='POST /similarity/search',
+        ))
 
 @_nexus_mcp.tool(name='nexus_similarity_search_api_estimate_corpus_entropy_profile', description="Computes the aggregate entropy-calibrated alpha for a corpus without running a full search -- useful to inspect before committing to a large rank_items_by_nmi_cosine_fusion call. Returns a single aggregate corpus_entropy value, NOT a per-dimension breakdown -- the real logic only exposes the mean marginal entropy across dimensions, not H(X_d) per individual dimension. Do NOT use expecting per-dimension granularity. Requires a valid api_key (same as X-API-Key) and an x402 payment.")
 @_nexus_mcp_x402_wrapper
 async def estimate_corpus_entropy_profile(corpus_vectors: Annotated[list[list[float]], Field(..., description='List of dense numeric vectors for which to compute the aggregate entropy and calibrated alpha. Each inner array must be the same length. Maximum 500000 entries.', min_length=1, max_length=500000)], n_bins: Annotated[float, Field(16, description='Number of histogram bins for entropy discretization. Must be between 3 and 50; should match the n_bins used in rank_items_by_nmi_cosine_fusion for the profile to be consistent.', ge=3, le=50)], api_key: Annotated[str, Field(..., description='API key required for this paid operation -- same secret configured as X-API-Key on the REST endpoints (SIMILARITY_API_KEY). Payment (x402) alone is not sufficient; both gates must pass.')]) -> dict[str, Any]:
     """Corpus Entropy and Calibrated Alpha Estimator"""
-    _require_api_key(key=api_key)
-    corpus_ids = [str(i) for i in range(len(corpus_vectors))]
-    request_obj = AlphaCalibrateRequest(
-        corpus=[CorpusVector(id=cid, vector=vec) for cid, vec in zip(corpus_ids, corpus_vectors)],
-        nmi_bins=int(n_bins),
-    )
-    response = inspect_corpus_entropy_and_alpha(request_obj, _key=_VALID_API_KEY)
-    return response.model_dump()
+    # --- PATCH mcp_call_events_retrofit ---
+    _nexus_call_t0 = time.monotonic()
+    _nexus_call_success = True
+    try:
+        _require_api_key(key=api_key)
+        corpus_ids = [str(i) for i in range(len(corpus_vectors))]
+        request_obj = AlphaCalibrateRequest(
+            corpus=[CorpusVector(id=cid, vector=vec) for cid, vec in zip(corpus_ids, corpus_vectors)],
+            nmi_bins=int(n_bins),
+        )
+        response = inspect_corpus_entropy_and_alpha(request_obj, _key=_VALID_API_KEY)
+        return response.model_dump()
+    except Exception:
+        _nexus_call_success = False
+        raise
+    finally:
+        _nexus_call_latency_ms = int((time.monotonic() - _nexus_call_t0) * 1000)
+        _nexus_call_ctx = _nexus_mcp.get_context()
+        asyncio.create_task(_nexus_log_mcp_call_event(
+            'nexus_similarity_search_api_estimate_corpus_entropy_profile', _nexus_call_success, _nexus_call_latency_ms, _nexus_call_ctx,
+            route_key='POST /similarity/calibrate-alpha/v1',
+        ))
 
 @_nexus_mcp.tool(name='nexus_similarity_search_api_score_pair_nmi_cosine', description="Computes the NMI-cosine fusion score for exactly one (query, target) vector pair at a fixed alpha. Use for explainability, debugging, or unit-level validation of fusion scores before running full corpus ranking. Unlike corpus-level ranking, alpha is NOT auto-calibrated for a single pair -- the real logic requires a fixed alpha (default 0.5); pass alpha explicitly for a specific blend. Do NOT use in a loop to score many pairs; batch them into rank_items_by_nmi_cosine_fusion instead. Requires a valid api_key (same as X-API-Key) and an x402 payment.")
 @_nexus_mcp_x402_wrapper
 async def score_pair_nmi_cosine(vector_a: Annotated[list[float], Field(..., description='First dense numeric vector of the pair. Must have the same dimensionality as vector_b.', min_length=2, max_length=4096)], vector_b: Annotated[list[float], Field(..., description='Second dense numeric vector of the pair. Must have the same dimensionality as vector_a.', min_length=2, max_length=4096)], n_bins: Annotated[float, Field(16, description='Histogram bins for NMI discretization. Must be between 3 and 50.', ge=3, le=50)], alpha: Annotated[float, Field(0.5, description='Fixed alpha weight for the cosine component in [0.0, 1.0], applied as-is -- not auto-calibrated. Default 0.5 matches the core service default.', ge=0.0, le=1.0)], api_key: Annotated[str, Field(..., description='API key required for this paid operation -- same secret configured as X-API-Key on the REST endpoints (SIMILARITY_API_KEY). Payment (x402) alone is not sufficient; both gates must pass.')]) -> dict[str, Any]:
     """Single-Pair NMI-Cosine Scorer"""
-    _require_api_key(key=api_key)
-    request_obj = BatchScoreRequest(pairs=[(vector_a, vector_b)], alpha=alpha, nmi_bins=int(n_bins))
-    response = score_vector_pairs_with_fixed_alpha(request_obj, _key=_VALID_API_KEY)
-    return response.model_dump()
+    # --- PATCH mcp_call_events_retrofit ---
+    _nexus_call_t0 = time.monotonic()
+    _nexus_call_success = True
+    try:
+        _require_api_key(key=api_key)
+        request_obj = BatchScoreRequest(pairs=[(vector_a, vector_b)], alpha=alpha, nmi_bins=int(n_bins))
+        response = score_vector_pairs_with_fixed_alpha(request_obj, _key=_VALID_API_KEY)
+        return response.model_dump()
+    except Exception:
+        _nexus_call_success = False
+        raise
+    finally:
+        _nexus_call_latency_ms = int((time.monotonic() - _nexus_call_t0) * 1000)
+        _nexus_call_ctx = _nexus_mcp.get_context()
+        asyncio.create_task(_nexus_log_mcp_call_event(
+            'nexus_similarity_search_api_score_pair_nmi_cosine', _nexus_call_success, _nexus_call_latency_ms, _nexus_call_ctx,
+            route_key='POST /similarity/batch-score',
+        ))
 
 
 # Crea el sub-app ASGI de streamable HTTP -- DEBE llamarse antes de
