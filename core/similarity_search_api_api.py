@@ -1054,6 +1054,22 @@ async def _nexus_stripe_webhook(request: _NexusStripeRequest):
     )
 
 
+# --- NEXUS: 402index.io domain claim verification file ---
+# POST /api/v1/claim (domain=similarity-search-api-production.up.railway.app,
+# 2026-08-22) pide este archivo estatico con el hash exacto, sin espacios
+# ni saltos de linea extra. No es DNS TXT -- es un archivo servido por la
+# propia app. Debe registrarse ANTES del app.mount("/", ...) de mas abajo,
+# mismo motivo que favicon.ico/agent-card.json/llms.txt: Starlette matchea
+# rutas en el orden en que se agregan a app.routes.
+_NEXUS_402INDEX_VERIFY_HASH = "4c21f5238e0ffe31aa6ae1c4cc6555a1c05b0055a987e9fe9f8e3cc4d2529e5c"
+
+
+@app.get("/.well-known/402index-verify.txt", include_in_schema=False)
+async def _nexus_402index_verify():
+    from fastapi.responses import PlainTextResponse
+    return PlainTextResponse(content=_NEXUS_402INDEX_VERIFY_HASH)
+
+
 app.mount("/", _nexus_mcp_asgi_app)
 
 # --- NEXUS: reporte de uso real a Stripe (inyectado por forge_output_saver_v6) ---
@@ -1067,7 +1083,7 @@ app.mount("/", _nexus_mcp_asgi_app)
 # (initialize, tools/list -- ninguno pasa por gate de auth/pago) se
 # facturaba igual que una operacion de negocio real. Confirmado en Railway:
 # STRIPE_CUSTOMER_ID/STRIPE_EVENT_NAME/STRIPE_SECRET_KEY reales, modo test.
-_NEXUS_BILLING_EXCLUDED_PATHS = {"/health", "/", "/docs", "/openapi.json", "/redoc", "/favicon.ico", "/llms.txt", "/mcp", "/similarity/search", "/similarity/calibrate-alpha/v1", "/similarity/batch-score", "/.well-known/agent-card.json", "/stripe/webhook"}  # x402 cubre estas 3 -- Stripe no debe cobrarlas de nuevo; agent-card.json es discovery, no negocio
+_NEXUS_BILLING_EXCLUDED_PATHS = {"/health", "/", "/docs", "/openapi.json", "/redoc", "/favicon.ico", "/llms.txt", "/mcp", "/similarity/search", "/similarity/calibrate-alpha/v1", "/similarity/batch-score", "/.well-known/agent-card.json", "/stripe/webhook", "/.well-known/402index-verify.txt"}  # x402 cubre estas 3 -- Stripe no debe cobrarlas de nuevo; agent-card.json/402index-verify.txt son discovery/verificacion, no negocio
 @app.middleware("http")
 async def _nexus_usage_middleware(request, call_next):
     response = await call_next(request)
@@ -1116,7 +1132,7 @@ from fastapi.responses import JSONResponse as _NexusRLJSONResponse
 _NEXUS_RATE_LIMIT_MAX_REQUESTS = int(_nexus_rl_os.environ.get("NEXUS_RATE_LIMIT_PER_MINUTE", "60"))
 _NEXUS_RATE_LIMIT_WINDOW_SECONDS = float(_nexus_rl_os.environ.get("NEXUS_RATE_LIMIT_WINDOW_SECONDS", "60"))
 _NEXUS_RATE_LIMIT_MAX_TRACKED = int(_nexus_rl_os.environ.get("NEXUS_RATE_LIMIT_MAX_TRACKED", "10000"))
-_NEXUS_RATE_LIMIT_EXEMPT_PATHS = {"/health", "/", "/docs", "/openapi.json", "/redoc", "/favicon.ico", "/llms.txt", "/.well-known/agent-card.json"}
+_NEXUS_RATE_LIMIT_EXEMPT_PATHS = {"/health", "/", "/docs", "/openapi.json", "/redoc", "/favicon.ico", "/llms.txt", "/.well-known/agent-card.json", "/.well-known/402index-verify.txt"}
 
 _nexus_rate_limit_lock = _nexus_rl_threading.Lock()
 _nexus_rate_limit_state = _NexusRLOrderedDict()
