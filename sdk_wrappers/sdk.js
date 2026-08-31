@@ -60,26 +60,35 @@ class RateLimitError extends SimilaritySearchError {
 }
 
 function resolveApiKey(options) {
+  // --- PATCH sdk_x402_only_auth_regrounding ---
+  // Optional as of repo commit 4e09c52 (2026-08-25): the server dropped the
+  // X-API-Key gate on search()/computeCalibratedAlpha()/scorePair(), x402
+  // payment alone is sufficient now, and Stripe metered billing explicitly
+  // excludes these 3 routes (_NEXUS_BILLING_EXCLUDED_PATHS in
+  // core/similarity_search_api_api.py). No longer throws when absent.
   const key = (options && options.apiKey) || process.env.SIMILARITY_API_KEY;
   if (!key || typeof key !== 'string' || key.trim().length === 0) {
-    throw new AuthenticationError();
+    return null;
   }
   return key.trim();
 }
 
 function buildAxiosInstance(apiKey, timeoutMs) {
+  const headers = {
+    'Content-Type': 'application/json',
+    'Accept': 'application/json',
+    'X-Client': 'similarity-search-sdk-js/1.0.0'
+  };
+  if (apiKey) {
+    // Still sent when the caller does pass one, for forward-compat with any
+    // future re-gating (e.g. the deprecated /similarity/calibrate-alpha stub,
+    // which kept its gate) -- see resolveApiKey() above.
+    headers['X-API-Key'] = apiKey;
+  }
   return axios.create({
     baseURL: BASE_URL,
     timeout: timeoutMs || DEFAULT_TIMEOUT_MS,
-    headers: {
-      // --- PATCH sdk_route_grounding_manual_backfill ---
-      // El server real exige X-API-Key (APIKeyHeader), no
-      // Authorization: Bearer -- ver core/similarity_search_api_api.py.
-      'X-API-Key': apiKey,
-      'Content-Type': 'application/json',
-      'Accept': 'application/json',
-      'X-Client': 'similarity-search-sdk-js/1.0.0'
-    }
+    headers
   });
 }
 

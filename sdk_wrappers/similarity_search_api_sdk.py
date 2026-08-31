@@ -128,31 +128,32 @@ def _validate_alpha(alpha: float | None) -> None:
 class Client:
     def __init__(
         self,
-        api_key: str,
+        api_key: str | None = None,
         base_url: str = SIMILARITY_SEARCH_BASE_URL,
         timeout: float = SIMILARITY_SEARCH_DEFAULT_TIMEOUT,
         max_retries: int = SIMILARITY_SEARCH_MAX_RETRIES,
     ):
-        if not api_key or not isinstance(api_key, str):
-            raise SimilaritySearchAuthError(
-                "A non-empty 'api_key' string is required to initialize the Client"
-            )
+        # --- PATCH sdk_x402_only_auth_regrounding ---
+        # api_key is optional as of repo commit 4e09c52 (2026-08-25): the
+        # server dropped the X-API-Key gate on search()/compute_calibrated_alpha()/
+        # score_pair(), x402 payment alone is sufficient now, and Stripe metered
+        # billing explicitly excludes these 3 routes
+        # (_NEXUS_BILLING_EXCLUDED_PATHS in core/similarity_search_api_api.py).
+        # Still sent when the caller does pass one, for forward-compat with any
+        # future re-gating (e.g. the deprecated /similarity/calibrate-alpha stub,
+        # which kept its gate).
         self._api_key = api_key
         self._base_url = base_url.rstrip("/")
         self._timeout = timeout
         self._max_retries = max_retries
-        self._http = httpx.Client(
-            headers={
-                # --- PATCH sdk_route_grounding_manual_backfill ---
-                # El server real exige X-API-Key (APIKeyHeader), no
-                # Authorization: Bearer -- ver core/similarity_search_api_api.py.
-                "X-API-Key": self._api_key,
-                "Content-Type": "application/json",
-                "Accept": "application/json",
-                "User-Agent": "similarity-search-sdk-python/1.0.0",
-            },
-            timeout=self._timeout,
-        )
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": "similarity-search-sdk-python/1.0.0",
+        }
+        if api_key:
+            headers["X-API-Key"] = api_key
+        self._http = httpx.Client(headers=headers, timeout=self._timeout)
 
     def _post_with_retry(self, endpoint: str, payload: dict[str, Any]) -> dict[str, Any]:
         url = f"{self._base_url}{endpoint}"

@@ -17,8 +17,14 @@ https://similarity-search-api-production.up.railway.app
 
 ## Authentication
 
-All business endpoints require an `X-API-Key` header:
-X-API-Key: <your key>
+<!-- PATCH sdk_x402_only_auth_regrounding -->
+The 3 business endpoints (`/similarity/search`, `/similarity/calibrate-alpha/v1`,
+`/similarity/batch-score`) require **no API key** -- only a valid x402 payment
+(see "Pricing" below). The `X-API-Key` gate was dropped from these routes
+2026-08-25; Stripe metered billing explicitly excludes them too, so passing a
+key does nothing on these 3 routes today. The deprecated, unpriced
+`/similarity/calibrate-alpha` (no `/v1` suffix) still requires `X-API-Key` and
+always 501s regardless.
 
 `/health` requires no authentication.
 
