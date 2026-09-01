@@ -19,20 +19,28 @@ app = FastAPI(
     contact={"email": "dasaanrod@gmail.com"},
 )
 
-# --- NEXUS: x402 (pago por llamada en USDC, Base Sepolia testnet) ---
+# --- NEXUS: x402 (pago por llamada en USDC, Base mainnet) ---
 from x402.http import FacilitatorConfig, HTTPFacilitatorClient, PaymentOption
 from x402.http.middleware.fastapi import PaymentMiddlewareASGI
 from x402.http.types import RouteConfig
 from x402.mechanisms.evm.exact import ExactEvmServerScheme
 from x402.schemas import Network
 from x402.server import x402ResourceServer
+# --- NEXUS PATCH x402_mainnet_cdp_payto_env ---
+from cdp.x402 import create_facilitator_config as _nexus_cdp_create_facilitator_config
 
-_NEXUS_X402_EVM_ADDRESS = "0x70e9f8057bb50e31b6ee06958bcbbe7de9daa98f"
-_NEXUS_X402_NETWORK: Network = "eip155:84532"  # Base Sepolia (testnet) -- cambiar a eip155:8453 + facilitator mainnet para produccion
+# payTo (Wallet A) sale de env var, no hardcodeado -- no exponer la direccion
+# en el historial de git, permite rotarla sin redeploy. Debe estar seteada en
+# Railway antes de este deploy; sin ella el proceso no arranca (fail-fast).
+_NEXUS_X402_EVM_ADDRESS = os.environ["NEXUS_X402_PAYTO_ADDRESS"]
+_NEXUS_X402_NETWORK: Network = "eip155:8453"  # Base mainnet
 _NEXUS_X402_PRICE = "$0.01"
 
+# CDP Facilitator en vez de x402.org -- create_facilitator_config() lee
+# CDP_API_KEY_ID/CDP_API_KEY_SECRET del entorno (deben estar seteadas en
+# Railway antes de este deploy, mismo criterio que "ws").
 _nexus_x402_facilitator = HTTPFacilitatorClient(
-    FacilitatorConfig(url="https://x402.org/facilitator")
+    _nexus_cdp_create_facilitator_config()
 )
 _nexus_x402_server = x402ResourceServer(_nexus_x402_facilitator)
 _nexus_x402_server.register(_NEXUS_X402_NETWORK, ExactEvmServerScheme())
