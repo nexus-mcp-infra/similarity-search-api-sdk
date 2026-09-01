@@ -19,20 +19,30 @@ app = FastAPI(
     contact={"email": "dasaanrod@gmail.com"},
 )
 
-# --- NEXUS: x402 (pago por llamada en USDC, Base Sepolia testnet) ---
+# --- NEXUS: x402 (pago por llamada en USDC, Base MAINNET real -- ver NEXUS PATCH mainnet_cutover_similarity_search) ---
 from x402.http import FacilitatorConfig, HTTPFacilitatorClient, PaymentOption
 from x402.http.middleware.fastapi import PaymentMiddlewareASGI
 from x402.http.types import RouteConfig
 from x402.mechanisms.evm.exact import ExactEvmServerScheme
 from x402.schemas import Network
 from x402.server import x402ResourceServer
+# --- NEXUS PATCH mainnet_cutover_similarity_search ---
+from cdp.x402 import create_facilitator_config as _nexus_cdp_create_facilitator_config
 
-_NEXUS_X402_EVM_ADDRESS = "0x70e9f8057bb50e31b6ee06958bcbbe7de9daa98f"
-_NEXUS_X402_NETWORK: Network = "eip155:84532"  # Base Sepolia (testnet) -- cambiar a eip155:8453 + facilitator mainnet para produccion
+# payTo (Wallet A) leido de env var -- nunca hardcodeado para mainnet real, para poder
+# crear/rotar la wallet sin tocar codigo. Falla explicito al boot (KeyError) si
+# NEXUS_X402_PAYTO_ADDRESS no esta seteada en Railway -- nunca debe caer en silencio
+# al string viejo de testnet.
+_NEXUS_X402_EVM_ADDRESS = os.environ["NEXUS_X402_PAYTO_ADDRESS"]
+_NEXUS_X402_NETWORK: Network = "eip155:8453"  # Base mainnet (real) -- cutover desde Base Sepolia testnet
 _NEXUS_X402_PRICE = "$0.01"
 
+# x402.org/facilitator es solo testnet -- el CDP Facilitator es el que liquida pagos
+# reales en Base mainnet. create_facilitator_config() sin argumentos lee
+# CDP_API_KEY_ID/CDP_API_KEY_SECRET del entorno (Railway) -- deben estar seteadas
+# ANTES de este deploy, o el primer verify/settle real falla con 401 de CDP.
 _nexus_x402_facilitator = HTTPFacilitatorClient(
-    FacilitatorConfig(url="https://x402.org/facilitator")
+    _nexus_cdp_create_facilitator_config()
 )
 _nexus_x402_server = x402ResourceServer(_nexus_x402_facilitator)
 _nexus_x402_server.register(_NEXUS_X402_NETWORK, ExactEvmServerScheme())

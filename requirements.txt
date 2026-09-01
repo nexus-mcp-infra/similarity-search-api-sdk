@@ -8,3 +8,4 @@ scipy
 stripe
 uvicorn
 x402[evm,fastapi,mcp]==2.15.0
+cdp-sdk==1.47.1
